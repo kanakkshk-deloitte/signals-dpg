@@ -58,6 +58,9 @@ The technical shape (how identities are organised, what roles and permission-sco
 **4.3 When (if ever) does authority transfer fully to the participant — e.g. once they log in themselves?**
 *Why it matters:* defines the hand-off and whether the aggregator's access should then shrink.
 
+**4.4 Can a single participant be onboarded by / tagged to more than one aggregator, or is it strictly 1:1?**
+*Why it matters:* in **shared instances**, two aggregators can onboard the same person (the onboarding path already detects this — it returns `already_registered` / `owned_elsewhere`). Product must choose: **1:1** (the first aggregator owns the participant; others may only reference), **many** (multi-tagged, shared authority), or **claim/transfer** (ownership can move). This decides who may act on / see the PII of that participant, and how two aggregators editing the same participant resolve conflicts. Currently undecided behind those flags.
+
 ## 5. PII visibility & sharing
 
 **5.1 Who can see a participant's PII, and at what moment?**
@@ -85,6 +88,9 @@ The technical shape (how identities are organised, what roles and permission-sco
 **7.2 Please confirm what each item lifecycle state permits** (e.g. draft = editable/not discoverable; live = discoverable + actionable; paused = hidden).
 *Why it matters:* the access layer enforces these; we need the authoritative meaning of each state.
 
+**7.3 If a user is unverified or hasn't agreed to terms, can *others* still discover or act on their item — or only the user's own actions are gated?**
+*Why it matters:* the consent design so far gates the *user's own* writes. We need product to say whether a non-consented/unverified user's item should also be **hidden from discovery and un-actionable by counterparties**. Different answers produce very different visibility behaviour.
+
 ## 8. External agents (voice bots & other services)
 
 **8.1 What exactly should an external agent (e.g. Raya voice bot) be allowed to do — and on whose behalf?**
@@ -93,12 +99,40 @@ The technical shape (how identities are organised, what roles and permission-sco
 **8.2 Should each external service get its own narrowly-scoped credentials, or share one?**
 *Why it matters:* "minimal-scope, limited access" implies per-service scoped credentials; confirm so we can revoke/limit one service without affecting others.
 
+**8.3 For a minor, does the guardian get their own identity/account and the right to act on the minor's behalf?**
+*Why it matters:* the consent design treats the guardian as a *contact*. If the guardian should also be able to *act* for the minor (manage items, perform/answer actions), they become a real principal with delegated authority — a different IAM construct than a stored contact.
+
+## 9. Account integrity & recovery
+
+**9.1 How does a user recover access if they lose their phone/email — especially phone-only users?**
+*Why it matters:* the base is largely phone-only. Without a defined recovery path, users get permanently locked out; with a loose one, recovery becomes an account-takeover vector. We need to know who may initiate recovery (self, aggregator-assisted, network admin).
+
+**9.2 How should we handle recycled / reassigned phone numbers (a new person inheriting a number tied to an existing identity)?**
+*Why it matters:* telcos recycle numbers, and phone-as-identity means a recycled number could expose a prior person's data or silently merge two people. Needs a re-verification / disassociation policy — significant for both login and the voice channel (where the phone *is* the identity).
+
+**9.3 Should we actively prevent duplicate accounts for the same person, or allow them (e.g. separate seeker & provider identities)?**
+*Why it matters:* ties to §2.3. Decides whether "one human = one identity (one `sub`)" holds — which the consent and cross-instance designs assume — or whether one person can legitimately hold several accounts.
+
+## 10. Administration, audit & offboarding
+
+**10.1 What can the network admin (super-admin) do, and what must they be barred from?**
+*Why it matters:* candidates include approving orgs, reading all PII, impersonating users, and deleting data. Super-admin scope must be **bounded** for DPDP — "can the network admin read everyone's PII / act as any user" is a policy decision, not a default. Also: is there a break-glass procedure, and is it audited?
+
+**10.2 When a service or aggregator acts on a user's behalf, whose identity is recorded as the actor — the user, or the service-acting-for-the-user?**
+*Why it matters:* non-repudiation and audit. The consent ledger and action records need a **truthful actor + on-behalf-of**, so accountability is clear after the fact.
+
+**10.3 When an org user is removed, or an aggregator is offboarded entirely, what happens to the participants and items they created on behalf?**
+*Why it matters:* avoids orphaned records. Decides whether those are reassigned, retained read-only, or deleted — and whether the participants' own access is affected.
+
+**10.4 What is the rotation / expiry / revocation policy for service credentials (voice bot, aggregator)?**
+*Why it matters:* compromise response and least-privilege. Per-service scoped credentials let us revoke or limit one service without breaking others.
+
 ---
 
 ## How answers feed the design
 
-- §1, §6 → **where identities live** (one network-wide store vs per-instance) and whether IAM is centralised.
+- §1, §6, §9 → **where identities live & identity integrity** (one network-wide store vs per-instance; one-human-one-identity; recovery & recycled numbers).
 - §2, §3 → the **role & permission catalogue** (what roles exist, what each can do).
-- §4, §5, §7, §8 → the **access rules** (on-behalf authority, PII visibility, status/lifecycle gates, external-agent scopes).
+- §4, §5, §7, §8, §10 → the **access rules** (on-behalf authority, participant↔aggregator ownership, PII visibility, status/lifecycle gates, external-agent & guardian scopes, admin powers, audit & offboarding).
 
 Even partial answers unblock us. Where product is undecided, tell us whether to **design-for-future-flexibility** (costs more now) or **lock-the-simple-rule** (cheaper, harder to change later) — that choice is itself useful.
