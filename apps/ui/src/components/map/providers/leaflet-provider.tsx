@@ -1,16 +1,17 @@
 import * as React from 'react';
 import {
   MapContainer,
-  TileLayer,
   Marker,
   Popup,
   useMap,
 } from 'react-leaflet';
 import MarkerClusterGroup from 'react-leaflet-cluster';
 import L from 'leaflet';
+import { extendLeaflet } from '@india-boundary-corrector/leaflet-layer';
 import { renderToStaticMarkup } from 'react-dom/server';
 import type { MapMarker, MapProviderProps } from '@/engine/types';
 import { registerMapProvider } from '@/engine/map/map-registry';
+import { getRuntimeEnv } from '@/lib/runtime-env';
 import { getIconForDomain } from '../domain-icons';
 import { tallyDomains } from '../cluster-breakdown';
 import { FitBounds } from '../fit-bounds';
@@ -19,6 +20,88 @@ import { MarkerPopupCard } from '../marker-popup-card';
 import 'leaflet/dist/leaflet.css';
 import 'react-leaflet-cluster/dist/assets/MarkerCluster.css';
 import 'react-leaflet-cluster/dist/assets/MarkerCluster.Default.css';
+
+const DEFAULT_LEAFLET_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const DEFAULT_LEAFLET_ATTRIBUTION =
+  '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
+const DEFAULT_BOUNDARY_PMTILES_URL =
+  'https://cdn.jsdelivr.net/npm/@india-boundary-corrector/data@0.2.2/india_boundary_corrections.pmtiles';
+
+function getLeafletTileConfig() {
+  const tileUrl =
+    getRuntimeEnv('VITE_LEAFLET_TILE_URL')?.toString().trim() ||
+    DEFAULT_LEAFLET_TILE_URL;
+  const attribution =
+    getRuntimeEnv('VITE_LEAFLET_TILE_ATTRIBUTION')?.toString().trim() ||
+    DEFAULT_LEAFLET_ATTRIBUTION;
+
+  const subdomainsRaw =
+    getRuntimeEnv('VITE_LEAFLET_TILE_SUBDOMAINS')?.toString().trim() ||
+    'abc';
+  const subdomains = subdomainsRaw.includes(',')
+    ? subdomainsRaw
+      .split(',')
+      .map((s: string) => s.trim())
+      .filter(Boolean)
+    : subdomainsRaw;
+
+  return { tileUrl, attribution, subdomains };
+}
+
+// Adds L.tileLayer.indiaBoundaryCorrected(...) on the Leaflet namespace.
+extendLeaflet(L);
+
+function CorrectedTileLayer({
+  url,
+  attribution,
+  subdomains,
+}: {
+  url: string;
+  attribution: string;
+  subdomains: string | string[];
+}) {
+  const map = useMap();
+
+  React.useEffect(() => {
+    const pmtilesUrl =
+      getRuntimeEnv('VITE_INDIA_BOUNDARY_PMTILES_URL')?.toString().trim() ||
+      DEFAULT_BOUNDARY_PMTILES_URL;
+    const layerConfig = /openstreetmap\.org/i.test(url) ? 'osm-carto' : undefined;
+    const layer = L.tileLayer.indiaBoundaryCorrected(url, {
+      attribution,
+      subdomains,
+      layerConfig,
+      pmtilesUrl,
+    });
+
+    const onCorrectionError = (event: unknown) => {
+      const error =
+        typeof event === 'object' && event !== null && 'error' in event
+          ? (event as { error?: unknown }).error
+          : undefined;
+
+      // Expected during dev remount/teardown (e.g. React StrictMode). Ignore noise.
+      const isAbortError =
+        error instanceof Error &&
+        (error.name === 'AbortError' || /aborted/i.test(error.message));
+
+      if (!isAbortError) {
+        console.warn('India boundary correction failed; using original tile', event);
+      }
+    };
+
+    layer.on('correctionerror', onCorrectionError);
+
+    layer.addTo(map);
+
+    return () => {
+      layer.off('correctionerror', onCorrectionError);
+      map.removeLayer(layer);
+    };
+  }, [map, url, attribution, subdomains]);
+
+  return null;
+}
 
 /**
  * Module-level WeakMap: L.Marker instance → domain string.
@@ -255,6 +338,8 @@ export function LeafletMapProvider({
   renderPopup,
   resolveIcon,
 }: MapProviderProps) {
+  const { tileUrl, attribution, subdomains } = getLeafletTileConfig();
+
   return (
     <MapContainer
       center={center}
@@ -262,10 +347,7 @@ export function LeafletMapProvider({
       className="h-full w-full rounded-lg"
       scrollWheelZoom
     >
-      <TileLayer
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-      />
+      <CorrectedTileLayer url={tileUrl} attribution={attribution} subdomains={subdomains} />
       <FitBounds markers={markers} skip={initialViewSet} />
       {initialViewSet && <SetView center={center} zoom={zoom} />}
       {/*

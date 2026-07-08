@@ -18,4 +18,6 @@ export default defineConfig({
   dbCredentials: {
     url: pgUrl,
   },
+  // Keep extension-owned objects and db:init-managed table out of drizzle diffs.
+  tablesFilter: ['!spatial_ref_sys', '!geography_columns', '!geometry_columns', '!item_search'],
 });

@@ -133,6 +133,14 @@ Or use `SCHEMA_REGISTRY_URL` with either:
 docker compose up -d db redis
 ```
 
+Optional (analytics UI):
+
+```bash
+docker compose up -d db redis metabase
+```
+
+Metabase runs at `http://localhost:3030` by default (`METABASE_PORT` in `.env`).
+
 ### 4. Set up the database (first time only)
 
 ```bash

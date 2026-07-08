@@ -84,6 +84,15 @@ the API and UI run on the host.
 docker compose up -d db redis
 ```
 
+Optional: start Metabase too (for charts/dashboards over Signals data):
+
+```bash
+docker compose up -d db redis metabase
+```
+
+Metabase will be available at **http://localhost:3030** (or your `METABASE_PORT`
+value from `.env`).
+
 Check both say `healthy`:
 
 ```bash
@@ -91,6 +100,14 @@ docker compose ps        # dpg-db and dpg-redis should be (healthy)
 ```
 
 (Redis is the cache. Docker sets it up for you — nothing else to do.)
+
+For Metabase setup, create an admin user, then add a PostgreSQL data source with:
+
+- **Host**: `db`
+- **Port**: `5432`
+- **Database**: value of `POSTGRES_DB` from `.env`
+- **Username**: value of `POSTGRES_USER` from `.env`
+- **Password**: value of `POSTGRES_PASSWORD` from `.env`
 
 ## Step 4 — Set up the database (first time only)
 
