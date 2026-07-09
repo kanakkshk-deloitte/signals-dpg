@@ -23,12 +23,14 @@ jobs:
           - name: api
             context: .
             dockerfile: apps/api/Dockerfile
+          - name: match-score
+            context: .
+            dockerfile: apps/match-score/Dockerfile
           - name: ui
             context: .
             dockerfile: apps/ui/Dockerfile
           # signal-processor: Plan 3 territory, added once that ships.
-          # match-score, notification-service: packages today, no Dockerfiles
-          # in this repo. Add to the matrix once their Dockerfiles land.
+          # notification-service: package today, no Dockerfile in this repo.
     steps:
       - uses: actions/checkout@v4
       - name: Verify Dockerfile exists

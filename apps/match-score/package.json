@@ -1,0 +1,33 @@
+{
+    "name": "match-score",
+    "version": "1.0.0",
+    "description": "Bedrock-backed match score service",
+    "type": "module",
+    "main": "server.js",
+    "scripts": {
+        "dev": "tsx watch src/server.ts",
+        "build": "tsup",
+        "preview": "node dist/server.js",
+        "start": "node dist/server.js",
+        "test": "vitest run --passWithNoTests"
+    },
+    "keywords": [],
+    "author": "",
+    "license": "ISC",
+    "packageManager": "pnpm@11.1.2",
+    "devDependencies": {
+        "tsx": "^4.22.1",
+        "vitest": "^4.1.7"
+    },
+    "dependencies": {
+        "@aws-sdk/client-bedrock-runtime": "^3.922.0",
+        "@fastify/swagger": "^9.6.1",
+        "@scalar/fastify-api-reference": "^1.57.2",
+        "dotenv": "^17.4.2",
+        "fastify": "^5.8.5",
+        "fastify-type-provider-zod": "^6.1.0",
+        "match_score": "workspace:*",
+        "pg": "^8.17.2",
+        "schemas": "workspace:*"
+    }
+}

@@ -6,6 +6,10 @@
     "ASTRO_*"
   ],
   "globalPassThroughEnv": [
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_SESSION_TOKEN",
+    "AWS_REGION",
     "ALLOWED_ORIGINS",
     "ALLOW_EXTRA_SCHEMA_DATA",
     "BULK_MAX_ITEMS",
@@ -22,6 +26,8 @@
     "INSTANCE_NAME",
     "INGEST_STREAM",
     "MATCH_SCORE_PROVIDER",
+    "BEDROCK_*",
+    "MATCH_SCORE_SERVICE_PORT",
     "CONSENT_CONFIG_*",
     "NETWORK_CONFIG_*",
     "NOTIFICATION_*",

@@ -157,11 +157,25 @@ See `SETUP.md` for the full walkthrough and the aggregator integration steps.
 pnpm dev:api
 ```
 
+### 6. Start Match Score Service (Amazon Bedrock)
+
+```bash
+pnpm docker:match-score
+```
+
+The API calls this service through `DPG_SCORING_ENDPOINT` (default `http://127.0.0.1:5103`).
+
 To run the API itself as a container against the Compose PostgreSQL and Redis services:
 
 ```bash
 docker compose up -d db redis
 DOCKER_NETWORK=dpg_internal pnpm docker:api
+```
+
+To run the match-score service as a container:
+
+```bash
+DOCKER_NETWORK=dpg_internal pnpm docker:match-score
 ```
 
 To run the UI app:
@@ -183,6 +197,11 @@ VITE_MAP_PROVIDER="leaflet"
 - `pnpm build:api`
 - `pnpm preview:api`
 - `pnpm start:api`
+- `pnpm dev:match-score` — docker-only alias to `pnpm docker:match-score`
+- `pnpm build:match-score`
+- `pnpm preview:match-score` — docker-only alias to `pnpm docker:match-score`
+- `pnpm start:match-score` — docker-only alias to `pnpm docker:match-score`
+- `pnpm docker:match-score`
 - `pnpm db:generate:api`
 - `pnpm db:migrate:api`
 - `pnpm db:push:api`

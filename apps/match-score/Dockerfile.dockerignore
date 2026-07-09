@@ -1,0 +1,35 @@
+# VCS
+.git
+.gitignore
+
+# Dependencies and package-manager state
+node_modules
+.pnpm-store
+
+# Build output and caches
+.turbo
+dist
+coverage
+.cache
+
+# Local environment files
+.env
+.env.*
+!.env.example
+.DS_Store
+
+# Editor / tooling
+.idea
+.vscode
+
+# Repo metadata not needed for the Docker build context
+.agents
+.cursor
+AGENTS.md
+
+# Existing app/package artifacts
+apps/*/dist
+apps/*/.astro
+apps/*/.vite
+apps/*/coverage
+packages/*/dist

@@ -66,6 +66,23 @@ services:
       retries: 20
     networks:
       - dpg_internal
+
+  match-score:
+    build:
+      context: .
+      dockerfile: apps/match-score/Dockerfile
+    image: dpg-match-score-local
+    container_name: dpg-match-score
+    restart: always
+    ports:
+      - '${MATCH_SCORE_SERVICE_PORT:-5103}:5103'
+    env_file:
+      - .env
+    environment:
+      MATCH_SCORE_SERVICE_PORT: 5103
+      BEDROCK_REGION: ${BEDROCK_REGION:-${AWS_REGION:-ap-south-1}}
+    networks:
+      - dpg_internal
 networks:
   dpg_internal:
     name: dpg_internal

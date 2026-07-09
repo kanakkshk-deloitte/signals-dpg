@@ -4,6 +4,8 @@ import {
   Building2,
   Accessibility,
   HandHeart,
+  Handshake,
+  Landmark,
   Search,
   Briefcase,
   Box,
@@ -22,6 +24,11 @@ export const domainIcons: Record<string, LucideIcon> = {
   'blue_dot:provider': Briefcase,
 
   // ── purple_dot / disability services network ────────────────────────
+  'purple_dot:person_with_disability': Accessibility,
+  'purple_dot:service_provider': HandHeart,
+  'purple_dot:employer': Briefcase,
+  'purple_dot:ngo': Handshake,
+  'purple_dot:government': Landmark,
   'purple_dot:seeker': Accessibility,
   'purple_dot:provider': HandHeart,
 
@@ -38,6 +45,11 @@ export const domainIcons: Record<string, LucideIcon> = {
   // we don't imply disability for networks that aren't about that.
   seeker: Search,
   provider: Briefcase,
+  person_with_disability: Accessibility,
+  service_provider: HandHeart,
+  employer: Briefcase,
+  ngo: Handshake,
+  government: Landmark,
 };
 
 export function getDomainIcon(

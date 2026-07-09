@@ -14,7 +14,10 @@
 
 import {
   User,
+  Accessibility,
+  HandHeart,
   Building2,
+  Landmark,
   GraduationCap,
   Handshake,
   Briefcase,
@@ -28,19 +31,24 @@ import {
  * Order matters: first match wins.
  */
 const DOMAIN_ICON_RULES: Array<{ key: string; icon: LucideIcon }> = [
-  { key: 'seeker',    icon: User },
-  { key: 'learner',   icon: GraduationCap },
-  { key: 'student',   icon: GraduationCap },
-  { key: 'provider',  icon: Building2 },
-  { key: 'tutor',     icon: Briefcase },
-  { key: 'coach',     icon: Briefcase },
+  { key: 'person_with_disability', icon: Accessibility },
+  { key: 'service_provider', icon: HandHeart },
+  { key: 'employer', icon: Briefcase },
+  { key: 'ngo', icon: Handshake },
+  { key: 'government', icon: Landmark },
+  { key: 'seeker', icon: User },
+  { key: 'learner', icon: GraduationCap },
+  { key: 'student', icon: GraduationCap },
+  { key: 'provider', icon: Building2 },
+  { key: 'tutor', icon: Briefcase },
+  { key: 'coach', icon: Briefcase },
   { key: 'counsellor', icon: Briefcase },
   { key: 'counselor', icon: Briefcase },
-  { key: 'partner',   icon: Handshake },
-  { key: 'center',    icon: Building2 },
-  { key: 'centre',    icon: Building2 },
-  { key: 'school',    icon: Building2 },
-  { key: 'college',   icon: Building2 },
+  { key: 'partner', icon: Handshake },
+  { key: 'center', icon: Building2 },
+  { key: 'centre', icon: Building2 },
+  { key: 'school', icon: Building2 },
+  { key: 'college', icon: Building2 },
   { key: 'institute', icon: Building2 },
 ];
 
