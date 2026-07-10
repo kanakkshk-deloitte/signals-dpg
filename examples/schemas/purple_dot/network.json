@@ -84,7 +84,7 @@
             "mobile_number": {
               "type": "string",
               "title": "Mobile",
-              "pattern": "^[0-9]{10}$",
+              "pattern": "^(?:\\+91[-\\s]?)?[0-9]{10}$",
               "private": true
             },
             "email": {
@@ -372,7 +372,7 @@
             "contact_phone": {
               "type": "string",
               "title": "Phone",
-              "pattern": "^[0-9]{10}$",
+              "pattern": "^(?:\\+91[-\\s]?)?[0-9]{10}$",
               "private": true
             },
             "contact_email": {
@@ -630,7 +630,7 @@
             "contact_phone": {
               "type": "string",
               "title": "Phone",
-              "pattern": "^[0-9]{10}$",
+              "pattern": "^(?:\\+91[-\\s]?)?[0-9]{10}$",
               "private": true
             },
             "contact_email": {
@@ -821,7 +821,7 @@
             "contact_phone": {
               "type": "string",
               "title": "Phone",
-              "pattern": "^[0-9]{10}$",
+              "pattern": "^(?:\\+91[-\\s]?)?[0-9]{10}$",
               "private": true
             },
             "contact_email": {
@@ -1017,7 +1017,7 @@
             "nodal_officer_phone": {
               "type": "string",
               "title": "Nodal Officer Phone",
-              "pattern": "^[0-9]{10}$",
+              "pattern": "^(?:\\+91[-\\s]?)?[0-9]{10}$",
               "private": true
             },
             "nodal_officer_email": {

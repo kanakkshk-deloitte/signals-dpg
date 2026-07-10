@@ -24,6 +24,7 @@ services:
       retries: 20
     networks:
       - dpg_internal
+      - shared-net
 
   metabase:
     image: metabase/metabase:v0.56.1
@@ -40,6 +41,7 @@ services:
         condition: service_healthy
     networks:
       - dpg_internal
+      - shared-net
 
   redis:
     image: redis:7.2-alpine
@@ -66,6 +68,7 @@ services:
       retries: 20
     networks:
       - dpg_internal
+      - shared-net
 
   match-score:
     build:
@@ -83,9 +86,13 @@ services:
       BEDROCK_REGION: ${BEDROCK_REGION:-${AWS_REGION:-ap-south-1}}
     networks:
       - dpg_internal
+      - shared-net
 networks:
   dpg_internal:
     name: dpg_internal
+    internal: false
+  shared-net:
+    name: shared-net
     internal: false
 volumes:
   dpg-postgresdb:
