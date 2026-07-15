@@ -53,12 +53,12 @@ function brandThemePlugin(): Plugin {
     const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
     const m = l - c / 2;
     let rp = 0, gp = 0, bp = 0;
-    if (h < 60)       [rp, gp, bp] = [c, x, 0];
+    if (h < 60) [rp, gp, bp] = [c, x, 0];
     else if (h < 120) [rp, gp, bp] = [x, c, 0];
     else if (h < 180) [rp, gp, bp] = [0, c, x];
     else if (h < 240) [rp, gp, bp] = [0, x, c];
     else if (h < 300) [rp, gp, bp] = [x, 0, c];
-    else              [rp, gp, bp] = [c, 0, x];
+    else[rp, gp, bp] = [c, 0, x];
     const toHex = (v: number) =>
       Math.round((v + m) * 255).toString(16).padStart(2, '0');
     return `#${toHex(rp)}${toHex(gp)}${toHex(bp)}`;
@@ -110,7 +110,7 @@ function brandThemePlugin(): Plugin {
     const primary = pickShade(
       ['500', '600', '400'],
       primarySw.find((s) => !NEUTRALS.has((s.name ?? '').toLowerCase()))?.hex ??
-        primarySw[0]?.hex ?? '#000000',
+      primarySw[0]?.hex ?? '#000000',
     );
     const heroFrom = pickShade(['900', '800', '700'], adjustL(primary, 0.12));
     const heroToShade = ['700', '600']
@@ -304,6 +304,13 @@ function brandThemePlugin(): Plugin {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const isTourist = env.VITE_APP === 'tourist';
+  const normalizeBasePath = (raw: string | undefined) => {
+    const value = (raw ?? '').trim();
+    if (!value || value === '/') return '/';
+    const withLeading = value.startsWith('/') ? value : `/${value}`;
+    return withLeading.endsWith('/') ? withLeading : `${withLeading}/`;
+  };
+  const basePath = normalizeBasePath(env.VITE_BASE_PATH);
   const touristEntry = path.resolve(__dirname, 'index.tourist.html');
   const defaultNetworkTheme =
     env.VITE_DEFAULT_NETWORK_THEME ||
@@ -313,32 +320,33 @@ export default defineConfig(({ mode }) => {
   const uiPort = Number(env.VITE_UI_PORT) || 5173;
 
   return {
+    base: basePath,
     plugins: [
       react(),
       tailwindcss(),
       brandThemePlugin(),
       ...(isTourist
         ? [
-            {
-              name: 'tourist-root-entry',
-              configureServer(server) {
-                server.middlewares.use((req, _res, next) => {
-                  const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
-                  if (pathname === '/' || pathname === '/index.html') req.url = '/index.tourist.html';
-                  next();
-                });
-              },
-              // The build emits dist/index.tourist.html (Rollup keeps the source
-              // filename); rename it to index.html so the tourist build is servable
-              // at / by a static host. No-op in dev (closeBundle doesn't run there,
-              // and the guard covers it anyway).
-              closeBundle() {
-                const built = path.resolve(__dirname, 'dist/tourist/index.tourist.html');
-                const target = path.resolve(__dirname, 'dist/tourist/index.html');
-                if (existsSync(built)) renameSync(built, target);
-              },
-            } as Plugin,
-          ]
+          {
+            name: 'tourist-root-entry',
+            configureServer(server) {
+              server.middlewares.use((req, _res, next) => {
+                const pathname = new URL(req.url ?? '/', 'http://localhost').pathname;
+                if (pathname === '/' || pathname === '/index.html') req.url = '/index.tourist.html';
+                next();
+              });
+            },
+            // The build emits dist/index.tourist.html (Rollup keeps the source
+            // filename); rename it to index.html so the tourist build is servable
+            // at / by a static host. No-op in dev (closeBundle doesn't run there,
+            // and the guard covers it anyway).
+            closeBundle() {
+              const built = path.resolve(__dirname, 'dist/tourist/index.tourist.html');
+              const target = path.resolve(__dirname, 'dist/tourist/index.html');
+              if (existsSync(built)) renameSync(built, target);
+            },
+          } as Plugin,
+        ]
         : []),
     ],
     resolve: {
@@ -366,6 +374,7 @@ export default defineConfig(({ mode }) => {
       ],
     },
     define: {
+      __APP_BASE_PATH__: JSON.stringify(basePath),
       __DEFAULT_NETWORK_THEME__: JSON.stringify(defaultNetworkTheme),
       __DEFAULT_BRAND__: JSON.stringify(defaultBrand),
     },

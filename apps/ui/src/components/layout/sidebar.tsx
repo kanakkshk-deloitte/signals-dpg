@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useNavigate, useLocation } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import type { RJSFSchema } from '@rjsf/utils';
 import type { DotNetworkDomain, DotNetworkSchema } from '@/engine/types';
@@ -18,7 +18,7 @@ import {
   SidebarSeparator,
 } from '@/components/ui/sidebar';
 import { PortalHeader } from './portal-header';
-import { LayoutGrid, Plus, Pencil, Network, ChevronRight, Activity } from 'lucide-react';
+import { LayoutGrid, Plus, Pencil, Network, ChevronRight, Activity, LayoutDashboard } from 'lucide-react';
 import { usePendingActionsCount } from '@/hooks/use-actions';
 
 interface AppSidebarProps {
@@ -76,6 +76,7 @@ export function AppSidebar({
   userSchemas,
 }: AppSidebarProps) {
   const navigate = useNavigate();
+  const location = useLocation();
   const { t } = useTranslation();
 
   // Group profiles by domain
@@ -127,6 +128,22 @@ export function AppSidebar({
         <PortalHeader />
       </SidebarHeader>
       <SidebarContent>
+        <SidebarGroup>
+          <SidebarGroupContent>
+            <SidebarMenu>
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  isActive={location.pathname.startsWith('/dashboard')}
+                  onClick={() => navigate('/dashboard')}
+                >
+                  <LayoutDashboard className="h-4 w-4" />
+                  <span>{t('nav.dashboard')}</span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+            </SidebarMenu>
+          </SidebarGroupContent>
+        </SidebarGroup>
+        <SidebarSeparator />
         {showNetworkSelector && (
           <SidebarGroup>
             <SidebarGroupLabel>{t('nav.networks_group')}</SidebarGroupLabel>
@@ -308,7 +325,10 @@ export function AppSidebar({
           <SidebarGroupContent>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton onClick={() => navigate('/my-actions')}>
+                <SidebarMenuButton
+                  isActive={location.pathname.startsWith('/my-actions')}
+                  onClick={() => navigate('/my-actions')}
+                >
                   <Activity className="h-4 w-4" />
                   <span>{t('nav.my_actions')}</span>
                   <PendingActionsBadge />

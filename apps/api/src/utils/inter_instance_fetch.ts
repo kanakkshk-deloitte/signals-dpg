@@ -159,7 +159,7 @@ async function getInstanceCount(input: {
 
   const count =
     input.instanceUrl === getCurrentApiBaseUrl() &&
-    isServedDomainBinding(input.filters.item_network, input.filters.item_domain)
+      isServedDomainBinding(input.filters.item_network, input.filters.item_domain)
       ? await countLocalItems(countFilters)
       : await fetchRemoteCount(input.instanceUrl, countFilters);
 
@@ -186,16 +186,13 @@ async function fetchRemoteCount(
   instanceUrl: string,
   filters: Omit<ItemFetchFilters, 'limit' | 'offset'>
 ) {
-  const response = await fetch(
-    new URL('/api/v1/network/item/count_local', instanceUrl),
-    {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(filters),
-    }
-  );
+  const response = await fetch(buildInstanceApiUrl(instanceUrl, '/api/v1/network/item/count_local'), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(filters),
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -208,16 +205,13 @@ async function fetchRemoteCount(
 }
 
 async function fetchRemotePage(instanceUrl: string, filters: ItemFetchFilters) {
-  const response = await fetch(
-    new URL('/api/v1/network/item/fetch_local', instanceUrl),
-    {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-      },
-      body: JSON.stringify(filters),
-    }
-  );
+  const response = await fetch(buildInstanceApiUrl(instanceUrl, '/api/v1/network/item/fetch_local'), {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify(filters),
+  });
 
   if (!response.ok) {
     throw new Error(
@@ -277,6 +271,14 @@ function normalizeFetchItemsResponse(
     ...response,
     items: response.items.map(normalizeFetchItemsResponseItem),
   };
+}
+
+function buildInstanceApiUrl(instanceUrl: string, path: string): URL {
+  const base = new URL(instanceUrl);
+  const normalizedBasePath = base.pathname.replace(/\/$/, '');
+  const normalizedTargetPath = path.startsWith('/') ? path : `/${path}`;
+  base.pathname = `${normalizedBasePath}${normalizedTargetPath}`;
+  return base;
 }
 
 function normalizeFetchItemsResponseItem(

@@ -39,8 +39,10 @@ COPY examples/schemas/ /app/examples/schemas/
 COPY tsconfig.base.json tsconfig.json /app/
 ARG VITE_API_URL
 ARG VITE_NETWORK_NAME
+ARG VITE_BASE_PATH
 ENV VITE_API_URL=$VITE_API_URL
 ENV VITE_NETWORK_NAME=$VITE_NETWORK_NAME
+ENV VITE_BASE_PATH=$VITE_BASE_PATH
 # Build BOTH UI variants into one image:
 #   - signals (default `build`)        -> apps/ui/dist            (served at /)
 #   - orange tourist (`build:tourist`) -> apps/ui/dist/tourist    (served at /tourist)

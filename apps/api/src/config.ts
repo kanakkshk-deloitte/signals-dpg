@@ -59,7 +59,18 @@ export const matchScoreConfig = {
 export function getCurrentApiBaseUrl(): string {
   const parsedUrl = new URL(api.API_DOMAIN);
 
-  if (instance.INSTANCE_ENV === 'development' && !parsedUrl.port) {
+  const isLocalHost =
+    parsedUrl.hostname === 'localhost' ||
+    parsedUrl.hostname === '127.0.0.1' ||
+    parsedUrl.hostname === '::1';
+  const hasCustomPath = parsedUrl.pathname && parsedUrl.pathname !== '/';
+
+  if (
+    instance.INSTANCE_ENV === 'development' &&
+    !parsedUrl.port &&
+    isLocalHost &&
+    !hasCustomPath
+  ) {
     parsedUrl.port = String(api.API_PORT);
   }
 

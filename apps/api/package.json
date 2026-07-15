@@ -26,6 +26,7 @@
   "license": "ISC",
   "packageManager": "pnpm@11.1.2",
   "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.10",
     "@types/pg": "^8.15.5",
     "drizzle-kit": "^0.31.8",
     "tsx": "^4.22.1",
@@ -44,6 +45,7 @@
     "fastify-qs": "^5.0.0",
     "fastify-type-provider-zod": "^6.1.0",
     "ioredis": "^5.9.2",
+    "jsonwebtoken": "^9.0.3",
     "match_score": "workspace:*",
     "notification": "workspace:*",
     "pg": "^8.17.2",

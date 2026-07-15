@@ -23,6 +23,10 @@ docker compose ps             # wait for signals-api
 
 UI → http://localhost:5173 · API → http://localhost:2742 (`/reference` for Swagger)
 
+Dashboard embed note: set `METABASE_SITE_URL`, `METABASE_SECRET_KEY`, and
+`METABASE_DASHBOARD_ID` in `.env` to enable signed Metabase dashboard embeds in
+the UI Dashboard page.
+
 ## Contents
 
 | File | Purpose |

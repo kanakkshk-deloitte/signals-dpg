@@ -26,14 +26,18 @@ interface ImportMetaEnv {
   readonly VITE_AGENT_URL: string;
   readonly VITE_AGENT_TOKEN: string;
   readonly VITE_ENABLED_LANGUAGES: string;
+  readonly VITE_METABASE_URL?: string;
   /** Browser tab title override for the tourist app. Falls back to the resolved brand title, else "Signals". */
   readonly VITE_TOURIST_APP_TITLE?: string;
+  /** Public base path for subpath deployments (e.g. "/purpledot/"). Defaults to "/". */
+  readonly VITE_BASE_PATH?: string;
   /** Dev/preview server port. Falls back to 5173. */
   readonly VITE_UI_PORT?: string;
 }
 
 declare const __DEFAULT_NETWORK_THEME__: string;
 declare const __DEFAULT_BRAND__: string;
+declare const __APP_BASE_PATH__: string;
 declare const __BRAND_REGISTRY__: Record<string, {
   faviconType?: 'png' | 'svg';
   logoShape?: 'square' | 'wordmark';

@@ -28,6 +28,13 @@ import { runBulk, BulkItemFailure } from '@/utils/bulk_runner';
 
 const BulkPerformActionBodySchema = z.array(z.unknown());
 
+function buildNetworkActionPerformUrl(instanceUrl: string): URL {
+  const base = new URL(instanceUrl);
+  const normalizedBasePath = base.pathname.replace(/\/$/, '');
+  base.pathname = `${normalizedBasePath}/api/v1/network/action/perform`;
+  return base;
+}
+
 export const perform_action: FastifyPluginAsyncZod = async function (fastify) {
   fastify.route({
     url: '/perform',
@@ -120,7 +127,7 @@ export const perform_action_handler = async (
           (instance) =>
             instance.domain_id === targetItem.item_domain &&
             normalizeInstanceUrl(instance.instance_url) ===
-              normalizeInstanceUrl(targetItem.item_instance_url),
+            normalizeInstanceUrl(targetItem.item_instance_url),
         );
 
         if (!allowedInstance) {
@@ -192,7 +199,7 @@ export const perform_action_handler = async (
       let responseBody: Record<string, unknown>;
       try {
         const response = await fetch(
-          new URL('/api/v1/network/action/perform', targetItem.item_instance_url),
+          buildNetworkActionPerformUrl(targetItem.item_instance_url),
           {
             method: 'POST',
             headers: { 'content-type': 'application/json' },

@@ -51,7 +51,7 @@ services:
     volumes:
       - signals-postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgresdb}"]
+      test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgresdb}" ]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -61,7 +61,7 @@ services:
     image: redis:7.2-alpine
     container_name: signals-redis
     restart: unless-stopped
-    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    command: [ "sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\"" ]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set in .env}
     ports:
@@ -70,7 +70,7 @@ services:
     volumes:
       - signals-redis-data:/data
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      test: [ "CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG" ]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -94,19 +94,21 @@ services:
       - -lc
       - |
         set -e
-        echo "signals-bootstrap: applying schema (drizzle-kit push --force)…"
-        pnpm --filter api exec drizzle-kit push --force
+        # Disabled intentionally: this force-push can reset/drop DB state.
+        # echo "signals-bootstrap: applying schema (drizzle-kit push --force)…"
+        # pnpm --filter api exec drizzle-kit push --force
         echo "signals-bootstrap: initialising extensions + item/action/event tables (db:init)…"
         pnpm --filter api db:init
         echo "signals-bootstrap: DONE."
     environment: &signals-env
       INSTANCE_NAME: ${INSTANCE_NAME:-signals-local}
       INSTANCE_ENV: development
-      API_DOMAIN: http://localhost
+      API_DOMAIN: ${API_DOMAIN:-http://localhost}
       API_PORT: "2742"
       AUTH_SECRET: ${AUTH_SECRET:?AUTH_SECRET must be set in .env}
       AUTH_MIDDLEWARE_ENABLED: "true"
       CREATE_TEST_OTP: "true"
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:5173,http://localhost:2742}
       SERVED_DOMAINS: ${SERVED_DOMAINS:-blue_dot/seeker,blue_dot/provider}
       NETWORK_CONFIG_SOURCE: local
       # Relative to the container CWD (/app for the built API, /repo for the
@@ -123,6 +125,15 @@ services:
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      MATCH_SCORE_PROVIDER: ${MATCH_SCORE_PROVIDER:-dpg_scoring}
+      # Root-compose match-score container publishes 5103 and joins shared-net.
+      DPG_SCORING_ENDPOINT: ${DPG_SCORING_ENDPOINT:-http://dpg-match-score:5103}
+      DPG_SCORING_KEY_ID: ${DPG_SCORING_KEY_ID:-enter_dpg_scoring_key_id}
+      DPG_SCORING_SECRET: ${DPG_SCORING_SECRET:-enter_dpg_scoring_secret}
+      DPG_SCORING_PATH: ${DPG_SCORING_PATH:-api/v1/scores/match}
+      METABASE_SITE_URL: ${METABASE_SITE_URL:-http://localhost:3030}
+      METABASE_SECRET_KEY: ${METABASE_SECRET_KEY:-change_me_metabase_secret}
+      METABASE_DASHBOARD_ID: ${METABASE_DASHBOARD_ID:-2}
       SIGNALS_PII_KEY: ${SIGNALS_PII_KEY:?SIGNALS_PII_KEY must be a base64-encoded 32-byte key}
     depends_on:
       postgres:
@@ -149,14 +160,18 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    networks:
+      - default
+      - shared-net
 
   signals-ui:
     build:
       context: ..
       dockerfile: apps/ui/Dockerfile
       args:
-        VITE_API_URL: http://localhost:2742
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:2742}
         VITE_NETWORK_NAME: ${SIGNALS_NETWORK:-blue_dot}
+        VITE_BASE_PATH: ${VITE_BASE_PATH:-/}
     image: signals-dpg/ui:local
     container_name: signals-ui
     restart: unless-stopped
@@ -172,3 +187,8 @@ services:
 volumes:
   signals-postgres-data:
   signals-redis-data:
+
+networks:
+  shared-net:
+    external: true
+    name: shared-net

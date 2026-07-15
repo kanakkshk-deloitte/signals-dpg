@@ -43,6 +43,17 @@ function kebab(id: string): string {
   return id.replace(/_/g, '-');
 }
 
+function baseUrlPrefix(): string {
+  const configuredBase =
+    typeof __APP_BASE_PATH__ !== 'undefined' ? __APP_BASE_PATH__ : undefined;
+  const base = ((configuredBase || import.meta.env.BASE_URL || '/') as string).trim();
+  if (!base || base === '/') return '';
+  const withLeading = base.startsWith('/') ? base : `/${base}`;
+  return withLeading.endsWith('/')
+    ? withLeading.slice(0, -1)
+    : withLeading;
+}
+
 function applyFavicon(id: string, brand: string, meta: BrandMeta): void {
   // Drop any existing icons (PNG remnants etc.) before installing the new one.
   document
@@ -58,10 +69,11 @@ function applyFavicon(id: string, brand: string, meta: BrandMeta): void {
     //   non-standard brand: /brand/<network>/<brand>/favicon.png
     //   standard brand:     /brand/<network>/favicon.png
     link.type = 'image/png';
+    const brandBase = `${baseUrlPrefix()}/brand/${kebab(id)}`;
     link.href =
       brand && brand !== 'standard'
-        ? `/brand/${kebab(id)}/${brand}/favicon.png`
-        : `/brand/${kebab(id)}/favicon.png`;
+        ? `${brandBase}/${brand}/favicon.png`
+        : `${brandBase}/favicon.png`;
   } else {
     // brand.json logos are wide wordmarks ("purple dots AI") — useless when
     // downscaled to the tab's 16×16 favicon slot. Generate a square dot-mark

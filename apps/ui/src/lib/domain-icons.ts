@@ -6,6 +6,8 @@ import {
   HandHeart,
   Search,
   Briefcase,
+  Users,
+  Landmark,
   Box,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -24,6 +26,11 @@ export const domainIcons: Record<string, LucideIcon> = {
   // ── purple_dot / disability services network ────────────────────────
   'purple_dot:seeker': Accessibility,
   'purple_dot:provider': HandHeart,
+  'purple_dot:person_with_disability': Accessibility,
+  'purple_dot:service_provider': HandHeart,
+  'purple_dot:employer': Briefcase,
+  'purple_dot:ngo': Users,
+  'purple_dot:government': Landmark,
 
   // ── network-agnostic fallbacks (used when no scoped key matches) ────
   // yellow_dot / education
@@ -38,6 +45,11 @@ export const domainIcons: Record<string, LucideIcon> = {
   // we don't imply disability for networks that aren't about that.
   seeker: Search,
   provider: Briefcase,
+  person_with_disability: Accessibility,
+  service_provider: HandHeart,
+  employer: Briefcase,
+  ngo: Users,
+  government: Landmark,
 };
 
 export function getDomainIcon(

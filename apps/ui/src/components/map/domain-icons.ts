@@ -28,19 +28,26 @@ import {
  * Order matters: first match wins.
  */
 const DOMAIN_ICON_RULES: Array<{ key: string; icon: LucideIcon }> = [
-  { key: 'seeker',    icon: User },
-  { key: 'learner',   icon: GraduationCap },
-  { key: 'student',   icon: GraduationCap },
-  { key: 'provider',  icon: Building2 },
-  { key: 'tutor',     icon: Briefcase },
-  { key: 'coach',     icon: Briefcase },
+  // purple_dot specific domains (kept ahead of generic substring rules)
+  { key: 'person_with_disability', icon: User },
+  { key: 'service_provider', icon: Building2 },
+  { key: 'employer', icon: Handshake },
+  { key: 'ngo', icon: Handshake },
+  { key: 'government', icon: Building2 },
+
+  { key: 'seeker', icon: User },
+  { key: 'learner', icon: GraduationCap },
+  { key: 'student', icon: GraduationCap },
+  { key: 'provider', icon: Building2 },
+  { key: 'tutor', icon: Briefcase },
+  { key: 'coach', icon: Briefcase },
   { key: 'counsellor', icon: Briefcase },
   { key: 'counselor', icon: Briefcase },
-  { key: 'partner',   icon: Handshake },
-  { key: 'center',    icon: Building2 },
-  { key: 'centre',    icon: Building2 },
-  { key: 'school',    icon: Building2 },
-  { key: 'college',   icon: Building2 },
+  { key: 'partner', icon: Handshake },
+  { key: 'center', icon: Building2 },
+  { key: 'centre', icon: Building2 },
+  { key: 'school', icon: Building2 },
+  { key: 'college', icon: Building2 },
   { key: 'institute', icon: Building2 },
 ];
 

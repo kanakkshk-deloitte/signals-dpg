@@ -14,7 +14,10 @@ const AuthRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       try {
-        const url = new URL(request.url, `http://${request.headers.host}`);
+        const incomingUrl = new URL(request.url, `http://${request.headers.host}`);
+        const forwardedUrl = new URL(incomingUrl.origin);
+        forwardedUrl.pathname = incomingUrl.pathname;
+        forwardedUrl.search = incomingUrl.search;
         const headers = new Headers();
 
         for (const [key, value] of Object.entries(request.headers)) {
@@ -23,7 +26,7 @@ const AuthRoutes: FastifyPluginAsyncZod = async (fastify) => {
           }
         }
 
-        const req = new Request(url.toString(), {
+        const req = new Request(forwardedUrl.toString(), {
           method: request.method,
           headers,
           body:

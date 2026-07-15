@@ -27,6 +27,21 @@ const VARIANT_FILE: Record<BrandLogoVariant, string> = {
   onBrand: 'logo-on-brand.png',
 };
 
+function baseUrlPrefix(): string {
+  const configuredBase =
+    typeof __APP_BASE_PATH__ !== 'undefined' ? __APP_BASE_PATH__ : undefined;
+  const base = ((configuredBase || import.meta.env.BASE_URL || '/') as string).trim();
+  if (!base || base === '/') return '';
+  const withLeading = base.startsWith('/') ? base : `/${base}`;
+  return withLeading.endsWith('/')
+    ? withLeading.slice(0, -1)
+    : withLeading;
+}
+
+function brandRoot(networkId: string): string {
+  return `${baseUrlPrefix()}/brand/${kebabFromNetworkId(networkId)}`;
+}
+
 function kebabFromNetworkId(networkId: string): string {
   return networkId.replace(/_/g, '-');
 }
@@ -36,7 +51,7 @@ export function networkLogoUrl(
   variant: BrandLogoVariant = 'default',
 ): string | null {
   if (!networkId) return null;
-  return `/brand/${kebabFromNetworkId(networkId)}/${VARIANT_FILE[variant]}`;
+  return `${brandRoot(networkId)}/${VARIANT_FILE[variant]}`;
 }
 
 export function brandLogoUrl(
@@ -47,7 +62,7 @@ export function brandLogoUrl(
   if (!networkId) return null;
   const slug = (brandSlug ?? '').trim();
   if (slug && slug !== 'standard') {
-    return `/brand/${kebabFromNetworkId(networkId)}/${slug}/${VARIANT_FILE[variant]}`;
+    return `${brandRoot(networkId)}/${slug}/${VARIANT_FILE[variant]}`;
   }
   return networkLogoUrl(networkId, variant);
 }
