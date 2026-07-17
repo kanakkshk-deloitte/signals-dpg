@@ -66,22 +66,43 @@
             "sections": [
               {
                 "title": "Personal Details",
-                "fields": ["beneficiary_name", "age", "gender", "mobile_number", "email"]
+                "fields": [
+                  "beneficiary_name",
+                  "age",
+                  "gender",
+                  "mobile_number",
+                  "email"
+                ]
               },
               {
                 "title": "Disability Profile",
-                "fields": ["disability_type", "disability_percentage", "looking_for", "looking_for_details"]
+                "fields": [
+                  "disability_type",
+                  "disability_percentage",
+                  "looking_for",
+                  "looking_for_details"
+                ]
               },
               {
                 "title": "Location",
-                "fields": ["address"]
+                "fields": [
+                  "address"
+                ]
               },
               {
                 "title": "Documents & Education",
-                "fields": ["documents_available", "highest_qualification"]
+                "fields": [
+                  "documents_available",
+                  "highest_qualification"
+                ]
               }
             ],
-            "twoColumn": ["age", "gender", "mobile_number", "email"]
+            "twoColumn": [
+              "age",
+              "gender",
+              "mobile_number",
+              "email"
+            ]
           },
           "required": [
             "person_name",
@@ -117,8 +138,8 @@
             "age": {
               "type": "integer",
               "title": "Age",
-              "minimum": 0,
-              "maximum": 120
+              "minimum": 1,
+              "maximum": 100
             },
             "gender": {
               "type": "string",
@@ -249,6 +270,7 @@
         }
       },
       "id": "person_with_disability",
+      "guardian_consent_required": true,
       "card": {
         "title_field": "person_name",
         "avatar_from": "person_name",
@@ -376,22 +398,40 @@
             "sections": [
               {
                 "title": "Contact Details",
-                "fields": ["contact_name", "contact_phone", "contact_email"]
+                "fields": [
+                  "contact_name",
+                  "contact_phone",
+                  "contact_email"
+                ]
               },
               {
                 "title": "Organisation",
-                "fields": ["provider_category", "organisation_name", "official_address"]
+                "fields": [
+                  "provider_category",
+                  "organisation_name",
+                  "official_address"
+                ]
               },
               {
                 "title": "Services & Coverage",
-                "fields": ["disabilities_served", "services_offered", "service_cities"]
+                "fields": [
+                  "disabilities_served",
+                  "services_offered",
+                  "service_cities"
+                ]
               },
               {
                 "title": "More Details",
-                "fields": ["service_details", "catalog_url"]
+                "fields": [
+                  "service_details",
+                  "catalog_url"
+                ]
               }
             ],
-            "twoColumn": ["contact_phone", "contact_email"]
+            "twoColumn": [
+              "contact_phone",
+              "contact_email"
+            ]
           },
           "required": [
             "contact_name",
