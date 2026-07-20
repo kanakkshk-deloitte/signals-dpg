@@ -199,6 +199,7 @@
   * {
     @apply border-border;
   }
+
   body {
     @apply bg-background text-foreground;
     /* `--font-sans` is set per-network by the brand-theme Vite plugin from
@@ -211,6 +212,20 @@
 
 .bg-brand-hero {
   background: linear-gradient(135deg, var(--brand-hero-from), var(--brand-hero-to));
+}
+
+.bg-brand-hero-soft {
+  background:
+    radial-gradient(900px 440px at -10% -10%, rgba(196, 168, 255, 0.45) 0%, rgba(196, 168, 255, 0) 68%),
+    radial-gradient(760px 420px at 110% 25%, rgba(168, 123, 239, 0.22) 0%, rgba(168, 123, 239, 0) 62%),
+    linear-gradient(180deg, #f5f1ff 0%, #efe8ff 54%, #e7dcff 100%);
+}
+
+.bg-brand-hero-soft-wave {
+  background:
+    radial-gradient(110% 90% at 50% 100%, rgba(255, 255, 255, 0.52) 0%, rgba(255, 255, 255, 0.18) 45%, rgba(255, 255, 255, 0) 80%),
+    linear-gradient(180deg, rgba(202, 179, 255, 0.26) 0%, rgba(168, 123, 239, 0.30) 100%);
+  clip-path: ellipse(85% 100% at 50% 100%);
 }
 
 .text-brand-hero-highlight {
@@ -241,13 +256,31 @@
 /* ─── Constellation keyframe pulse ─── */
 
 @keyframes constellation-pulse {
-  0%, 100% { opacity: 0.7; r: 3; }
-  50% { opacity: 1; r: 4.5; }
+
+  0%,
+  100% {
+    opacity: 0.7;
+    r: 3;
+  }
+
+  50% {
+    opacity: 1;
+    r: 4.5;
+  }
 }
 
 @keyframes constellation-pulse-slow {
-  0%, 100% { opacity: 0.4; r: 2; }
-  50% { opacity: 0.8; r: 3; }
+
+  0%,
+  100% {
+    opacity: 0.4;
+    r: 2;
+  }
+
+  50% {
+    opacity: 0.8;
+    r: 3;
+  }
 }
 
 .constellation-dot-pulse {
@@ -259,6 +292,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+
   .constellation-dot-pulse,
   .constellation-dot-pulse-slow {
     animation: none;
@@ -298,7 +332,7 @@
  * ugly inside a sliver of width. Widen only the cmdk popover so the
  * dropdown overflows its trigger; surrounding form layout stays put.
  */
-[data-slot="command"] > .relative > .absolute {
+[data-slot="command"]>.relative>.absolute {
   width: max-content;
   min-width: 100%;
   max-width: min(28rem, calc(100vw - 2rem));
@@ -327,6 +361,7 @@
 [data-sonner-toast] {
   align-items: flex-start !important;
 }
+
 [data-sonner-toast] [data-icon] {
   margin-top: 2px;
 }
@@ -361,10 +396,12 @@ input:-webkit-autofill:active {
   max-width: none !important;
   overflow: visible !important;
 }
+
 .gm-style .gm-style-iw-d {
   padding: 0 !important;
   overflow: hidden !important;
 }
+
 /* The pointer tail under the bubble — match the card's bottom so it blends. */
 .gm-style .gm-style-iw-tc::after {
   background: var(--background) !important;
@@ -377,10 +414,12 @@ input:-webkit-autofill:active {
   box-shadow: none !important;
   border-radius: 1rem !important;
 }
+
 .leaflet-popup.dpg-marker-popup .leaflet-popup-content {
   margin: 0 !important;
   width: auto !important;
 }
+
 .leaflet-popup.dpg-marker-popup .leaflet-popup-tip {
   background: var(--background) !important;
 }

@@ -2,22 +2,50 @@ import { useNetworkTheme } from '@/theme/theme-provider';
 import { NetworkConstellation } from './network-constellation';
 
 export function BrandHero() {
-  const { theme } = useNetworkTheme();
+  const { theme, themeId } = useNetworkTheme();
+  const isPurple = themeId === 'purple_dot';
 
   return (
-    <div className="bg-brand-hero relative hidden overflow-hidden lg:flex lg:flex-col lg:justify-between lg:p-12">
+    <div
+      className={`relative hidden overflow-hidden lg:flex lg:flex-col lg:justify-between lg:p-12 ${isPurple ? 'bg-brand-hero-soft' : 'bg-brand-hero'
+        }`}
+    >
       {/* Constellation illustration */}
-      <NetworkConstellation className="pointer-events-none absolute inset-0 h-full w-full object-cover opacity-60" />
+      <NetworkConstellation
+        className={`pointer-events-none absolute inset-0 h-full w-full object-cover ${isPurple ? 'opacity-20' : 'opacity-60'
+          }`}
+      />
+
+      {isPurple && (
+        <>
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-[46%] bg-brand-hero-soft-wave" />
+          <div className="pointer-events-none absolute left-8 top-10 h-16 w-16 rounded-full border border-violet-300/60" />
+          <div className="pointer-events-none absolute right-16 top-36 h-8 w-8 rounded-full border border-violet-300/60" />
+          <div className="pointer-events-none absolute right-24 top-24 h-2 w-2 rounded-full bg-violet-300/70" />
+        </>
+      )}
 
       {/* Content stack */}
-      <div className="relative z-10 flex-1 flex flex-col justify-center py-12">
+      <div className={`relative z-10 flex-1 flex flex-col justify-center py-12 ${isPurple ? 'pt-4' : ''}`}>
         <div className="max-w-md">
-          <h1 className="mb-4 text-4xl font-bold leading-tight text-white xl:text-5xl">
+          <h1
+            className={`mb-4 text-4xl font-bold leading-tight xl:text-5xl ${isPurple ? 'text-violet-950' : 'text-white'
+              }`}
+          >
             {theme.tagline.lead}{' '}
             <span className="text-brand-hero-highlight">{theme.tagline.highlight}</span>{' '}
             {theme.tagline.tail}
           </h1>
-          <p className="text-base leading-relaxed text-white/70">{theme.subline}</p>
+          <p className={`text-base leading-relaxed ${isPurple ? 'text-violet-900/80' : 'text-white/70'}`}>
+            {theme.subline}
+          </p>
+
+          {isPurple && (
+            <div className="mt-6 inline-flex items-center gap-2 rounded-full border border-violet-300/80 bg-white/70 px-3 py-1 text-xs font-medium text-violet-900">
+              <span className="h-2 w-2 rounded-full bg-violet-500" />
+              Inclusive services network
+            </div>
+          )}
         </div>
       </div>
 
