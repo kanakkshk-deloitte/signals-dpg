@@ -12,7 +12,6 @@ import {
   MessageSquare,
   Contact,
   MapPin,
-  Network,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
@@ -74,6 +73,7 @@ function formatRequirementValue(value: unknown): string {
 const titleCase = (s: string) =>
   s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 
+/*
 // Per-network chip colours pulled from each brand.json (colours.primary
 // "<Dot> 500" + accent shades). Add a new entry per network as they ship.
 const NETWORK_CHIP_COLOURS: Record<
@@ -90,6 +90,7 @@ const FALLBACK_CHIP = {
 };
 const networkChipStyle = (networkId: string) =>
   NETWORK_CHIP_COLOURS[networkId] ?? FALLBACK_CHIP;
+*/
 
 export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMode = false }: ActionCardProps) {
   const { t } = useTranslation();
@@ -103,17 +104,17 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
   const otherParty =
     ownershipRole === 'initiated'
       ? {
-          name: action.target_item_name,
-          itemId: action.target_item_id,
-          domain: action.target_item_domain,
-          locations: action.target_item_locations,
-        }
+        name: action.target_item_name,
+        itemId: action.target_item_id,
+        domain: action.target_item_domain,
+        locations: action.target_item_locations,
+      }
       : {
-          name: action.source_item_name,
-          itemId: action.source_item_id,
-          domain: action.source_item_domain,
-          locations: action.source_item_locations,
-        };
+        name: action.source_item_name,
+        itemId: action.source_item_id,
+        domain: action.source_item_domain,
+        locations: action.source_item_locations,
+      };
   const myDomain =
     ownershipRole === 'initiated' ? action.source_item_domain : action.target_item_domain;
 
@@ -164,6 +165,7 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
             {/* Each network's own brand palette (from brand.json) so the chip
                 colour identifies the action's network — purple_dot purple,
                 blue_dot blue — independent of the viewing context. */}
+            {/*
             <span
               className="inline-flex items-center gap-1 rounded-full border px-2 py-1 text-[11px] font-semibold"
               style={networkChipStyle(action.source_item_network)}
@@ -181,6 +183,7 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
             <span className="inline-flex items-center gap-1.5 rounded-full border border-primary/20 bg-gradient-to-b from-background to-primary/5 px-2.5 py-1 text-[11px] font-semibold capitalize text-primary">
               {action.action_type}
             </span>
+            */}
             <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-semibold ${status.cls}`}>
               <span className={`h-1.5 w-1.5 rounded-full ${status.dot}`} />
               {status.labelKey ? t(status.labelKey) : action.action_status}
@@ -283,44 +286,44 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
 
         {/* Actions */}
         {!selectionMode && (
-        <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-          {canRevealContact && (
-            <Button
-              size="sm"
-              variant="outline"
-              className="flex-1"
-              onClick={() => setShowContactDetails(true)}
-            >
-              <Contact className="mr-1.5 h-3.5 w-3.5" />
-              {t('actions.btn_view_contact')}
-            </Button>
-          )}
+          <div className="flex flex-wrap items-center gap-2 border-t pt-3">
+            {canRevealContact && (
+              <Button
+                size="sm"
+                variant="outline"
+                className="flex-1"
+                onClick={() => setShowContactDetails(true)}
+              >
+                <Contact className="mr-1.5 h-3.5 w-3.5" />
+                {t('actions.btn_view_contact')}
+              </Button>
+            )}
 
-          {canAccept && (
-            <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'accepted')}>
-              <Check className="mr-1.5 h-3.5 w-3.5" />
-              {t('actions.btn_accept')}
-            </Button>
-          )}
-          {canReject && (
-            <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'rejected')}>
-              <X className="mr-1.5 h-3.5 w-3.5" />
-              {t('actions.btn_reject')}
-            </Button>
-          )}
-          {canComplete && (
-            <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'completed')}>
-              <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
-              {t('actions.btn_complete')}
-            </Button>
-          )}
-          {canCancel && (
-            <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'cancelled')}>
-              <X className="mr-1.5 h-3.5 w-3.5 text-destructive" />
-              {t('actions.btn_cancel')}
-            </Button>
-          )}
-        </div>
+            {canAccept && (
+              <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'accepted')}>
+                <Check className="mr-1.5 h-3.5 w-3.5" />
+                {t('actions.btn_accept')}
+              </Button>
+            )}
+            {canReject && (
+              <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'rejected')}>
+                <X className="mr-1.5 h-3.5 w-3.5" />
+                {t('actions.btn_reject')}
+              </Button>
+            )}
+            {canComplete && (
+              <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'completed')}>
+                <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
+                {t('actions.btn_complete')}
+              </Button>
+            )}
+            {canCancel && (
+              <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'cancelled')}>
+                <X className="mr-1.5 h-3.5 w-3.5 text-destructive" />
+                {t('actions.btn_cancel')}
+              </Button>
+            )}
+          </div>
         )}
       </div>
 
