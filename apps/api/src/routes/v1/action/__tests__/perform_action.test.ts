@@ -30,7 +30,7 @@ vi.mock('@/config', () => ({
     url: 'http://source.local/api/auth',
     create_test_otp: false,
   },
-  matchScoreConfig: { provider: 'noop', dpg_scoring: {} },
+  matchScoreConfig: { provider: 'noop', signals_search: {} },
   getCurrentApiBaseUrl: () => 'http://source.local',
   instance: { INSTANCE_NAME: 'test', INSTANCE_ENV: 'development' },
   api: { API_DOMAIN: 'http://source.local', API_PORT: 3000 },
@@ -152,6 +152,23 @@ vi.mock('@/network_configs', () => ({
   })),
 }));
 
+// --- mock the U18 guardian gate: this suite is all adult/ungated traffic, so
+// it always resolves `not_required` (matching the real gate's behavior for
+// these fixtures — 'seeker' never appears as a `guardian_consent_required`
+// domain above). Mocked at this seam (not the deeper otp/redis primitives) so
+// this unit test doesn't need a real Redis client, mirroring how the other
+// deps on this route are already mocked above.
+vi.mock('@/services/guardian_action_gate', () => ({
+  guardianActionGate: vi.fn(async () => ({ status: 'not_required' })),
+  // Bulk pre-pass (#393): default resolves an empty map (no gated subset). The
+  // external-channel test asserts it is never called (pre-pass skipped when
+  // request.acting_org is set, #450).
+  guardianBulkActionGate: vi.fn(async () => new Map()),
+  // Defaults to null (adult/ungated proceed); U18 tests override it per-case
+  // with a real BulkItemFailure so runBulk records the per-item error.
+  guardianGateFailure: vi.fn(() => null),
+}));
+
 vi.mock('@dpg/schemas', async () => {
   const actual =
     await vi.importActual<typeof import('@dpg/schemas')>('@dpg/schemas');
@@ -173,6 +190,12 @@ vi.mock('@dpg/schemas', async () => {
 
 // Imported after mocks.
 import { perform_action } from '../perform_action.js';
+import { BulkItemFailure } from '@/utils/bulk_runner';
+import {
+  guardianActionGate,
+  guardianBulkActionGate,
+  guardianGateFailure,
+} from '@/services/guardian_action_gate';
 
 // Valid v4 UUIDs (the "4" in the third group and "8/9/a/b" in the fourth
 // satisfy z.uuid() across zod variants that gate on the variant nibble).
@@ -242,7 +265,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     const app = buildApp(undefined, { id: 'usr_agg_owned' });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [VALID_BODY],
     });
     expect(res.statusCode).toBe(201);
@@ -270,7 +293,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     const app = buildApp(undefined, { id: 'usr_self' });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_target' }],
     });
     expect(res.statusCode).toBe(422);
@@ -286,7 +309,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [VALID_BODY],
     });
     expect(res.statusCode).toBe(422);
@@ -302,7 +325,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_target' }],
     });
     expect(res.statusCode).toBe(422);
@@ -321,7 +344,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_other' }],
     });
     expect(res.statusCode).toBe(422);
@@ -340,7 +363,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_agg_owned' }],
     });
     expect(res.statusCode).toBe(201);
@@ -374,7 +397,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_agg_owned' }],
     });
     expect(res.statusCode).toBe(422);
@@ -388,7 +411,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     const app = buildApp(undefined, { id: 'usr_agg_owned' });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [VALID_BODY],
     });
     expect(res.statusCode).toBe(422);
@@ -407,7 +430,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     const app = buildApp(undefined, { id: 'usr_agg_owned' });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [VALID_BODY],
     });
     expect(res.statusCode).toBe(422);
@@ -419,7 +442,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
     const app = buildApp(undefined, { id: 'usr_agg_owned' });
     const res = await app.inject({
       method: 'POST',
-      url: '/perform',
+      url: '/perform/bulk',
       payload: [{ ...VALID_BODY, target_item: { ...VALID_BODY.target_item, item_instance_url: 'http://not-allowed.local' } }],
     });
     expect(res.statusCode).toBe(422);
@@ -441,7 +464,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [VALID_BODY], // no consent field
       });
       expect(res.statusCode).toBe(422);
@@ -462,7 +485,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [
           {
             ...VALID_BODY,
@@ -493,7 +516,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [VALID_BODY], // no consent field
       });
       expect(res.statusCode).toBe(201);
@@ -520,7 +543,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_voice_owned' }],
       });
       expect(res.statusCode).toBe(201);
@@ -552,7 +575,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_self_reg' }],
       });
       expect(res.statusCode).toBe(201);
@@ -573,11 +596,135 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_missing' }],
       });
       expect(res.statusCode).toBe(422);
       expect(res.json().results[0]).toMatchObject({ status: 'error', error: 'USER_NOT_FOUND' });
+      expect(fetchCalls).toHaveLength(0);
+    });
+  });
+
+  // U18 action channel block (#395): the gate is mocked at its seam (as
+  // everywhere in this suite), so these assert the wiring — perform passes the
+  // correct `channel` and the gate's external_minor_blocked outcome flows
+  // through guardianGateFailure into a per-item error with no relay fetch.
+  describe('U18 action channel block (#395)', () => {
+    it('on-behalf + minor on a gated domain → per-item MINOR_ACTION_CHANNEL_BLOCKED, no relay fetch', async () => {
+      dbState.userRows = [{ id: 'usr_agg_owned', onboardedByOrgId: 'org_agg_1' }];
+      vi.mocked(guardianActionGate).mockResolvedValueOnce({
+        status: 'external_minor_blocked',
+        reason: 'minor',
+      });
+      vi.mocked(guardianGateFailure).mockReturnValueOnce(
+        new BulkItemFailure(
+          'MINOR_ACTION_CHANNEL_BLOCKED',
+          "This participant is a minor; actions for minors must be completed in the app and can't be performed via this channel.",
+        ),
+      );
+      const app = buildApp({
+        org_id: 'org_agg_1',
+        org_type: 'aggregator',
+        service_user_id: 'svc_agg_1',
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/perform/bulk',
+        payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_agg_owned' }],
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json().results[0]).toMatchObject({
+        status: 'error',
+        error: 'MINOR_ACTION_CHANNEL_BLOCKED',
+      });
+      expect(fetchCalls).toHaveLength(0);
+      expect(vi.mocked(guardianActionGate)).toHaveBeenCalledWith(
+        expect.objectContaining({ channel: 'external', wardUserId: 'usr_agg_owned' }),
+      );
+    });
+
+    it('on-behalf + adult → gate resolves not_required, action proceeds (201)', async () => {
+      dbState.userRows = [{ id: 'usr_agg_owned', onboardedByOrgId: 'org_agg_1' }];
+      const app = buildApp({
+        org_id: 'org_agg_1',
+        org_type: 'aggregator',
+        service_user_id: 'svc_agg_1',
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/perform/bulk',
+        payload: [{ ...VALID_BODY, acting_as_user_id: 'usr_agg_owned' }],
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().results[0]).toMatchObject({ status: 'success' });
+      expect(fetchCalls).toHaveLength(1);
+      expect(vi.mocked(guardianActionGate)).toHaveBeenCalledWith(
+        expect.objectContaining({ channel: 'external' }),
+      );
+    });
+
+    it('self-session + minor → guardian-OTP flow unchanged (channel self, GUARDIAN_OTP_REQUIRED, no relay fetch)', async () => {
+      vi.mocked(guardianActionGate).mockResolvedValueOnce({ status: 'challenge_issued' });
+      vi.mocked(guardianGateFailure).mockReturnValueOnce(
+        new BulkItemFailure(
+          'GUARDIAN_OTP_REQUIRED',
+          'Guardian OTP sent; resubmit with guardian_otp to confirm this action.',
+        ),
+      );
+      const app = buildApp(undefined, { id: 'usr_agg_owned' });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/perform/bulk',
+        payload: [VALID_BODY],
+      });
+      expect(res.statusCode).toBe(422);
+      expect(res.json().results[0]).toMatchObject({
+        status: 'error',
+        error: 'GUARDIAN_OTP_REQUIRED',
+      });
+      expect(fetchCalls).toHaveLength(0);
+      expect(vi.mocked(guardianActionGate)).toHaveBeenCalledWith(
+        expect.objectContaining({ channel: 'self' }),
+      );
+    });
+
+    it('external channel + minor ≥2-item bulk → each item MINOR_ACTION_CHANNEL_BLOCKED, batch gate skipped, no OTP (#450/#393)', async () => {
+      dbState.userRows = [{ id: 'usr_agg_owned', onboardedByOrgId: 'org_agg_1' }];
+      // Two items → the per-action gate runs twice (batch pre-pass is skipped on
+      // the external channel), each returning external_minor_blocked.
+      const blocked = new BulkItemFailure(
+        'MINOR_ACTION_CHANNEL_BLOCKED',
+        "This participant is a minor; actions for minors must be completed in the app and can't be performed via this channel.",
+      );
+      vi.mocked(guardianActionGate)
+        .mockResolvedValueOnce({ status: 'external_minor_blocked', reason: 'minor' })
+        .mockResolvedValueOnce({ status: 'external_minor_blocked', reason: 'minor' });
+      vi.mocked(guardianGateFailure).mockReturnValueOnce(blocked).mockReturnValueOnce(blocked);
+      const app = buildApp({
+        org_id: 'org_agg_1',
+        org_type: 'aggregator',
+        service_user_id: 'svc_agg_1',
+      });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/perform/bulk',
+        payload: [
+          { ...VALID_BODY, acting_as_user_id: 'usr_agg_owned' },
+          { ...VALID_BODY, acting_as_user_id: 'usr_agg_owned' },
+        ],
+      });
+      expect(res.statusCode).toBe(422);
+      const results = res.json().results;
+      expect(results).toHaveLength(2);
+      for (const r of results) {
+        expect(r).toMatchObject({ status: 'error', error: 'MINOR_ACTION_CHANNEL_BLOCKED' });
+      }
+      // #450: the one-OTP batch path must NOT run on an external channel — the
+      // per-action gate does the blocking, with channel 'external'.
+      expect(vi.mocked(guardianBulkActionGate)).not.toHaveBeenCalled();
+      expect(vi.mocked(guardianActionGate)).toHaveBeenCalledWith(
+        expect.objectContaining({ channel: 'external', wardUserId: 'usr_agg_owned' }),
+      );
       expect(fetchCalls).toHaveLength(0);
     });
   });
@@ -587,7 +734,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [
           VALID_BODY,
           { ...VALID_BODY, target_item: { ...VALID_BODY.target_item, item_instance_url: 'http://not-allowed.local' } },
@@ -606,7 +753,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [],
       });
       expect(res.statusCode).toBe(400);
@@ -619,7 +766,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const items = Array.from({ length: 101 }, () => VALID_BODY);
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: items,
       });
       expect(res.statusCode).toBe(400);
@@ -634,23 +781,40 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [VALID_BODY],
       });
       expect(res.statusCode).toBe(422);
       expect(res.json().results[0]).toMatchObject({ status: 'error', error: 'DUPLICATE_ACTION' });
     });
 
-    it('422 INVALID_PAYLOAD when item is missing required source_item/target_item/requirements_snapshot', async () => {
+    it('422 INVALID_PAYLOAD when item is missing required source_item/target_item', async () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [{ action_type: 'connect' }],
       });
       expect(res.statusCode).toBe(422);
       expect(res.json().results[0]).toMatchObject({ status: 'error', error: 'INVALID_PAYLOAD' });
       expect(fetchCalls).toHaveLength(0);
+    });
+
+    it('201 when requirements_snapshot is omitted → defaults to {} and forwards it', async () => {
+      // A no-requirements action (e.g. blue_dot seeker→provider) carries an
+      // empty snapshot; external callers that cannot serialise an empty object
+      // omit the field. It must be accepted and forwarded as {}.
+      const { requirements_snapshot: _omitted, ...bodyWithoutSnapshot } = VALID_BODY;
+      const app = buildApp(undefined, { id: 'usr_agg_owned' });
+      const res = await app.inject({
+        method: 'POST',
+        url: '/perform/bulk',
+        payload: [bodyWithoutSnapshot],
+      });
+      expect(res.statusCode).toBe(201);
+      expect(res.json().results[0]).toMatchObject({ status: 'success' });
+      expect(fetchCalls).toHaveLength(1);
+      expect(fetchCalls[0].body.requirements_snapshot).toEqual({});
     });
 
     it('422 TARGET_INSTANCE_UNAVAILABLE when target instance returns a non-JSON body (Fix 1)', async () => {
@@ -668,7 +832,7 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       const app = buildApp(undefined, { id: 'usr_agg_owned' });
       const res = await app.inject({
         method: 'POST',
-        url: '/perform',
+        url: '/perform/bulk',
         payload: [VALID_BODY],
       });
       // Restore normal fetch mock
@@ -676,5 +840,81 @@ describe('POST /api/v1/action/perform — on-behalf-of (bulk)', () => {
       expect(res.statusCode).toBe(422);
       expect(res.json().results[0]).toMatchObject({ status: 'error', error: 'TARGET_INSTANCE_UNAVAILABLE' });
     });
+  });
+});
+
+describe('POST /api/v1/action/perform — single object', () => {
+  beforeEach(() => {
+    dbState.userRows = [];
+    fetchCalls.length = 0;
+    fetchLocalItemSnapshotMock.mockResolvedValue({
+      created_by: 'usr_agg_owned',
+      item_id: 'src_item_1',
+      item_locations: [],
+      private_state: {},
+      lifecycle_status: 'live',
+    });
+    fetchResponse.status = 201;
+    fetchResponse.body = {
+      action_id: '00000000-0000-0000-0000-000000000001',
+      action_type: 'apply',
+      action_status: 'created',
+      update_count: 0,
+      source_item_id: '11111111-1111-4111-8111-111111111111',
+      target_item_id: '22222222-2222-4222-8222-222222222222',
+    };
+  });
+
+  it('201 with a single-object body → { results:[one], summary:{ total:1 } }', async () => {
+    const app = buildApp(undefined, { id: 'usr_agg_owned' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/perform',
+      payload: VALID_BODY,
+    });
+    expect(res.statusCode).toBe(201);
+    const body = res.json();
+    expect(body.summary.total).toBe(1);
+    expect(body.results).toHaveLength(1);
+  });
+
+  it('400 FST_ERR_VALIDATION when the single object body is missing required fields', async () => {
+    // NOTE: /perform validates the body against PerformActionBodySchema at
+    // the Fastify route-schema level (unlike /perform/bulk, whose body is
+    // z.array(z.unknown()) and defers per-item shape validation into
+    // runPerformActions, which reports INVALID_PAYLOAD as a 422 inside the
+    // {results, summary} envelope). A route-schema failure short-circuits
+    // before the handler runs, so Fastify's default validation error
+    // applies here — a plain 400, not the bulk envelope's 422.
+    const app = buildApp(undefined, { id: 'usr_agg_owned' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/perform',
+      payload: { action_type: 'connect' },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toMatchObject({ code: 'FST_ERR_VALIDATION' });
+  });
+
+  it('422 INVALID_TARGET_INSTANCE via single-object /perform when target instance URL is not in the network config', async () => {
+    // Mirrors the bulk "422 INVALID_TARGET_INSTANCE" case above: a
+    // syntactically-valid body (passes PerformActionBodySchema) whose
+    // target_item.item_instance_url fails the business-rule check inside
+    // runPerformActions, surfaced through the single-object /perform path
+    // as the same { results, summary } envelope the bulk route returns.
+    const app = buildApp(undefined, { id: 'usr_agg_owned' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/perform',
+      payload: {
+        ...VALID_BODY,
+        target_item: { ...VALID_BODY.target_item, item_instance_url: 'http://not-allowed.local' },
+      },
+    });
+    expect(res.statusCode).toBe(422);
+    const body = res.json();
+    expect(body.summary.total).toBe(1);
+    expect(body.results[0]).toMatchObject({ status: 'error', error: 'INVALID_TARGET_INSTANCE' });
+    expect(fetchCalls).toHaveLength(0);
   });
 });

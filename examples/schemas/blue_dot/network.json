@@ -2,6 +2,7 @@
   "display_name": "Blue Dot",
   "description": "Jobs and hiring network.",
   "schema_standard": "https://json-schema.org/draft/2020-12/schema",
+  "pause_enabled": true,
   "domains": [
     {
       "description": "People looking for jobs.",
@@ -18,6 +19,52 @@
           "title": "Job Seeker Profile 1.0",
           "type": "object",
           "additionalProperties": false,
+          "x-form-layout": {
+            "sections": [
+              {
+                "title": "Personal Details",
+                "fields": ["name", "age", "gender", "phone", "location"]
+              },
+              {
+                "title": "Work Experience & Preferences",
+                "fields": [
+                  "workExperience",
+                  "workExperienceYearsConditional",
+                  "nameOfLastRoleHeld",
+                  "natureOfJobsInterestedIn",
+                  "nameOfJobRolesInterestedIn",
+                  "languageSpoken",
+                  "otherHelpNeeded"
+                ]
+              },
+              {
+                "title": "Education & Skills",
+                "fields": [
+                  "educationCategory",
+                  "schoolQualification",
+                  "schoolQualificationOther",
+                  "collegeQualification",
+                  "collegeQualificationOther",
+                  "itiTrade",
+                  "itiTradeOther",
+                  "itiInstitute",
+                  "vocationalTrainingOther",
+                  "polytechnicDiploma",
+                  "polytechnicDiplomaOther",
+                  "certificationDetails"
+                ]
+              }
+            ],
+            "twoColumn": [
+              "age",
+              "gender",
+              "phone",
+              "workExperienceYearsConditional",
+              "schoolQualification",
+              "collegeQualification",
+              "itiTrade"
+            ]
+          },
           "required": [
             "name",
             "location",
@@ -127,7 +174,7 @@
               "enum": [
                 "School",
                 "College",
-                "ITI / Other Vocational Trainings",
+                "ITI",
                 "Polytechnic / Diploma",
                 "Certification",
                 "Learned Informally",
@@ -136,7 +183,7 @@
               "enumNames": [
                 "School",
                 "College",
-                "ITI / Other Vocational Trainings",
+                "ITI",
                 "Polytechnic / Diploma",
                 "Certification",
                 "Learned Informally",
@@ -563,7 +610,7 @@
               ],
               "x-show-if": {
                 "educationCategory": [
-                  "ITI / Other Vocational Trainings"
+                  "ITI"
                 ]
               }
             },
@@ -644,18 +691,22 @@
             "itiInstitute": {
               "type": "string",
               "title": "College / Institute Name",
-              "description": "Please specify your college or institute name"
+              "description": "Please specify your college or institute name",
+              "placeholder": "Please specify your college or institute name",
+              "x-reference-source": { "source": "colleges", "subtitle": ["district", "state"] }
             },
             "nameOfLastRoleHeld": {
               "type": "string",
               "title": "Name of last role held",
               "description": "Enter the name of your last role",
+              "placeholder": "Enter the name of your last role",
               "vectorize": true
             },
             "languageSpoken": {
               "type": "array",
               "title": "Language Spoken",
               "description": "Select all the languages you are familiar with",
+              "placeholder": "Select all the languages you are familiar with",
               "uniqueItems": true,
               "items": {
                 "type": "string",
@@ -717,6 +768,7 @@
         }
       },
       "id": "seeker",
+      "guardian_consent_required": true,
       "card": {
         "title_field": "name",
         "avatar_from": "name",
@@ -751,6 +803,51 @@
           "display_name_field": "jobProviderName",
           "type": "object",
           "additionalProperties": false,
+          "x-form-layout": {
+            "sections": [
+              {
+                "title": "Job Details",
+                "fields": ["jobProviderName", "jobProviderLocation", "role", "title", "positions", "natureOfJob"]
+              },
+              {
+                "title": "Hiring Contact",
+                "fields": ["hiringManagerName", "hiringManagerPhoneNumber", "hiringManagerEmail"]
+              },
+              {
+                "title": "Compensation",
+                "fields": ["stipendMin", "stipendMax", "salaryMin", "salaryMax", "taskRateMin", "taskRateMax"]
+              },
+              {
+                "title": "Candidate Requirements",
+                "fields": [
+                  "candidateExperienceType",
+                  "workExperienceYears",
+                  "lastRoleHeld",
+                  "minEducationalInstitute",
+                  "minQualificationSchool",
+                  "minQualificationSchoolOther",
+                  "minQualificationCollege",
+                  "minQualificationCollegeOther",
+                  "minQualificationVocational",
+                  "minQualificationPolytechnic",
+                  "minQualificationPolytechnicOther",
+                  "minQualificationCert",
+                  "minQualificationInformal"
+                ]
+              }
+            ],
+            "twoColumn": [
+              "hiringManagerPhoneNumber",
+              "hiringManagerEmail",
+              "positions",
+              "stipendMin",
+              "stipendMax",
+              "salaryMin",
+              "salaryMax",
+              "taskRateMin",
+              "taskRateMax"
+            ]
+          },
           "required": [
             "jobProviderName",
             "role",
@@ -770,20 +867,24 @@
             "jobProviderLocation": {
               "type": "string",
               "title": "Job Location",
-              "location": "primary"
+              "location": "primary",
+              "private": true
             },
             "hiringManagerName": {
               "type": "string",
               "title": "Hiring Manager Name",
-              "minLength": 1
+              "minLength": 1,
+              "private": true
             },
             "hiringManagerPhoneNumber": {
               "type": "string",
-              "title": "Hiring Manager Mobile Number"
+              "title": "Hiring Manager Mobile Number",
+              "private": true
             },
             "hiringManagerEmail": {
               "type": "string",
-              "title": "Hiring Manager Email"
+              "title": "Hiring Manager Email",
+              "private": true
             },
             "role": {
               "type": "string",
@@ -842,6 +943,8 @@
             "candidateExperienceType": {
               "vectorize": true,
               "type": "string",
+              "title": "Type of Candidate",
+              "description": "Please select the option that best describes the type of candidate you want to hire based on their previous work experience",
               "enum": [
                 "Fresher",
                 "Worked before",
@@ -850,6 +953,8 @@
             },
             "minEducationalInstitute": {
               "type": "string",
+              "title": "Min. Highest Educational Institute Attended",
+              "description": "Please select the preferred minimum of the highest kind of educational institute they have attended",
               "enum": [
                 "None",
                 "School",
@@ -863,6 +968,8 @@
             },
             "workExperienceYears": {
               "type": "string",
+              "title": "Work Experience (Years)",
+              "description": "Preferred minimum years of work experience",
               "enum": [
                 "0",
                 "< 1 Year",
@@ -878,7 +985,10 @@
             },
             "lastRoleHeld": {
               "type": "string",
-              "minLength": 1,
+              "title": "Name of last role held",
+              "description": "Enter the names of roles the candidate should have last held",
+              "placeholder": "Enter the names of roles the candidate should have last held",
+              "x-show-if": { "candidateExperienceType": ["Worked before"] },
               "vectorize": true
             },
             "title": {
@@ -1191,6 +1301,8 @@
         }
       },
       "id": "provider",
+      "my_items_label": "My Jobs",
+      "guardian_consent_required": false,
       "card": {
         "title_field": "jobProviderName",
         "avatar_from": "jobProviderName",
@@ -1273,6 +1385,34 @@
             "cancel": ["cancelled"]
           },
           "reveals_pii_on_status": ["accepted"]
+        }
+      ]
+    },
+    "connect": {
+      "description": "Lets a provider connect with another provider (partnership / referral) or reach out to a seeker (interview invitation). Either party can initiate; the receiver can accept or reject.",
+      "interactions": [
+        {
+          "from_network": "blue_dot",
+          "from_domain": "provider",
+          "to_network": "blue_dot",
+          "to_domain": "provider",
+          "requirement_schema": { "type": "object", "properties": {} },
+          "event_schema": {
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Provider To Provider Connect Event",
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "remark"],
+            "properties": {
+              "status": {
+                "type": "string",
+                "enum": ["created", "accepted", "rejected", "cancelled"]
+              },
+              "remark": { "type": "string" }
+            }
+          },
+          "metric_categories": null,
+          "reveals_pii_on_status": ["accepted"]
         },
         {
           "from_network": "blue_dot",
@@ -1342,34 +1482,6 @@
             "reject": ["rejected"],
             "cancel": ["cancelled"]
           },
-          "reveals_pii_on_status": ["accepted"]
-        }
-      ]
-    },
-    "connect": {
-      "description": "Lets a provider connect with another provider (partnership / referral). Either party can initiate; the receiver can accept or reject.",
-      "interactions": [
-        {
-          "from_network": "blue_dot",
-          "from_domain": "provider",
-          "to_network": "blue_dot",
-          "to_domain": "provider",
-          "requirement_schema": { "type": "object", "properties": {} },
-          "event_schema": {
-            "$schema": "https://json-schema.org/draft/2020-12/schema",
-            "title": "Provider To Provider Connect Event",
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["status", "remark"],
-            "properties": {
-              "status": {
-                "type": "string",
-                "enum": ["created", "accepted", "rejected", "cancelled"]
-              },
-              "remark": { "type": "string" }
-            }
-          },
-          "metric_categories": null,
           "reveals_pii_on_status": ["accepted"]
         }
       ]

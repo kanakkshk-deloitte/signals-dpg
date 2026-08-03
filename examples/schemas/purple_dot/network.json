@@ -138,8 +138,8 @@
             "age": {
               "type": "integer",
               "title": "Age",
-              "minimum": 0,
-              "maximum": 120
+              "minimum": 1,
+              "maximum": 100
             },
             "gender": {
               "type": "string",
@@ -269,7 +269,8 @@
           }
         }
       },
-      "id": "person_with_disability",
+      "id": "seeker",
+      "guardian_consent_required": true,
       "card": {
         "title_field": "person_name",
         "avatar_from": "person_name",

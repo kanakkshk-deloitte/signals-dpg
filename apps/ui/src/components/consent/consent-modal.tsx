@@ -1,12 +1,11 @@
 import { useState } from 'react';
 import type { ConsentConfigDocument } from '@dpg/schemas';
 import {
-  Dialog,
-  DialogContent,
   DialogHeader,
   DialogTitle,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { ResponsiveDialog } from '@/components/ui/responsive-dialog';
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Label } from '@/components/ui/label';
@@ -22,6 +21,12 @@ export interface ConsentModalProps {
   mode: ConsentModalMode;
   initialTab: ConsentModalTab;
   config: ConsentConfigDocument;
+  /**
+   * Which document set to show. 'u18' renders the minor/guardian copy
+   * (`u18_documents`) so a guardian sees the U18 terms/privacy, not the adult
+   * ones. Falls back to the adult `documents` when a U18 set isn't configured.
+   */
+  variant?: 'adult' | 'u18';
   onAccept?: () => void;
   onOpenChange?: (open: boolean) => void;
 }
@@ -35,6 +40,7 @@ export function ConsentModal({
   mode,
   initialTab,
   config,
+  variant = 'adult',
   onAccept,
   onOpenChange,
 }: ConsentModalProps) {
@@ -42,8 +48,9 @@ export function ConsentModal({
   const { theme } = useNetworkTheme();
   const { t } = useTranslation();
 
-  const privacyVersion = getCurrentVersion(config.documents.privacy);
-  const termsVersion = getCurrentVersion(config.documents.terms);
+  const docs = variant === 'u18' && config.u18_documents ? config.u18_documents : config.documents;
+  const privacyVersion = getCurrentVersion(docs.privacy);
+  const termsVersion = getCurrentVersion(docs.terms);
 
   const handleOpenChange = (nextOpen: boolean) => {
     if (mode === 'gate') return;
@@ -51,17 +58,20 @@ export function ConsentModal({
   };
 
   return (
-    <Dialog open={open} onOpenChange={handleOpenChange}>
-      <DialogContent
-        showCloseButton={mode === 'view'}
-        className="flex flex-col max-w-2xl max-h-[90vh] gap-0 p-0 overflow-hidden"
-        onInteractOutside={(e) => {
-          if (mode === 'gate') e.preventDefault();
-        }}
-        onEscapeKeyDown={(e) => {
-          if (mode === 'gate') e.preventDefault();
-        }}
-      >
+    <ResponsiveDialog
+      open={open}
+      onOpenChange={handleOpenChange}
+      showCloseButton={mode === 'view'}
+      dismissible={mode !== 'gate'}
+      title={mode === 'gate' ? t('consent.title_gate') : t('consent.title_view')}
+      contentClassName="flex flex-col max-w-2xl max-h-[90dvh] gap-0 p-0 overflow-hidden"
+      onInteractOutside={(e) => {
+        if (mode === 'gate') e.preventDefault();
+      }}
+      onEscapeKeyDown={(e) => {
+        if (mode === 'gate') e.preventDefault();
+      }}
+    >
         <DialogHeader className="px-6 pt-6 pb-4 shrink-0 text-left">
           {theme?.name && (
             <p className="text-xs font-bold uppercase tracking-wide text-primary">
@@ -131,7 +141,6 @@ export function ConsentModal({
             </div>
           )}
         </div>
-      </DialogContent>
-    </Dialog>
+    </ResponsiveDialog>
   );
 }

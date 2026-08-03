@@ -13,7 +13,12 @@
     "db:push:api": "pnpm --filter api db:push",
     "db:studio:api": "pnpm --filter api db:studio",
     "db:init:api": "pnpm --filter api db:init",
+    "db:migrate:deploy:api": "pnpm --filter api db:migrate:deploy",
+    "db:check:parity:api": "pnpm --filter api db:check:parity",
+    "db:baseline:api": "pnpm --filter api db:baseline",
+    "db:backfill:lifecycle:api": "pnpm --filter api db:backfill:lifecycle",
     "db:seed:services:api": "pnpm --filter api db:seed:services",
+    "db:backfill:consent:api": "pnpm --filter api db:backfill:consent",
     "db:seed:purple_dot:api": "pnpm --filter api db:seed:purple_dot",
     "e2e:qr": "tsx scripts/e2e/submit_qr_participants.mts",
     "e2e:actions": "pnpm --filter api exec tsx scripts/e2e/seed_actions.mts",
@@ -36,10 +41,10 @@
   },
   "packageManager": "pnpm@11.1.2",
   "devDependencies": {
-    "@types/node": "^25.8.0",
+    "@types/node": "^26.1.2",
     "tsup": "^8.5.1",
-    "tsx": "^4.22.1",
-    "turbo": "^2.9.14",
-    "typescript": "^6.0.3"
+    "tsx": "^4.23.1",
+    "turbo": "^2.10.7",
+    "typescript": "^7.0.2"
   }
 }

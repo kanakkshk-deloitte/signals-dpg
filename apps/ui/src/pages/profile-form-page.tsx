@@ -1,11 +1,20 @@
 import * as React from 'react';
 import { useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
 import { ArrowLeft, Wallet, OctagonX } from 'lucide-react';
 import type { RJSFSchema } from '@rjsf/utils';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+  DialogFooter,
+} from '@/components/ui/dialog';
 import { SchemaForm } from '@/components/forms/schema-form';
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert';
 import { AuthShell } from '@/components/layout/auth-shell';
@@ -15,27 +24,37 @@ import { useNetworkTheme } from '@/theme/theme-provider';
 import { useConsentConfig } from '@/hooks/use-consent-config';
 import { ConsentCheckbox } from '@/components/actions/consent-checkbox';
 import { WalletImportModal } from '@/components/wallet/wallet-import-modal';
-import { resolveNetworkRefs } from '@/engine/schema/resolve-schema';
-import type { DotNetworkSchema } from '@/engine/types';
 import { getConfiguredWalletProviders } from '@/engine/wallet/wallet-registry';
 import type { WalletImportResult } from '@/engine/wallet/types';
 import { useAuth } from '@/contexts/auth-context';
 import { mergeImportedDataIntoSchema } from '@/lib/import-mapping';
 import { getServedScope } from '@/lib/served-binding';
+import { useNetworkConfigs, useResolvedNetwork } from '@/hooks/use-network-config';
+import { useEditItem } from '@/hooks/use-edit-item';
+import { queryKeys } from '@/lib/query-keys';
+import { getStoredSignupDomain, clearStoredSignupDomain } from '@/lib/signup-domain';
+import { getUserDomains } from '@/lib/user-api';
+import { isGuardianConsentRequiredDomain } from '@/lib/guardian-consent';
+import { GuardianOtpDialog } from '@/components/actions/guardian-otp-dialog';
+import { U18GuardianFlow } from '@/components/consent/u18/u18-guardian-flow';
+import {
+  getU18Status,
+  issueProfilePrecreateOtp,
+  verifyProfilePrecreateOtp,
+  finalizeProfileConsent,
+} from '@/lib/consent-api';
+import axios from 'axios';
 
 import {
   createItem,
-  fetchItems,
   updateItem,
   type CreateItemPayload,
   type UpdateItemPayload,
   type Item,
 } from '@/lib/item-api';
-import { fetchNetworkConfig, fetchNetworkConfigs } from '@/lib/network-api';
-import { parseLocationFields, buildLocationQueries, isLocationFieldPrivate } from '@dpg/schemas/location_fields';
+import { parseLocationFields, buildLocationQueries } from '@dpg/schemas/location_fields';
 import { getGeoProvider } from '@/lib/geo/provider';
 import type { GeoComponents } from '@/lib/geo/types';
-import { apiConfig } from '@/lib/api-config';
 
 function parseNetworkIds(networkEnv: string | undefined): string[] {
   if (!networkEnv) return [];
@@ -50,7 +69,8 @@ export function ProfileFormPage() {
   const navigate = useNavigate();
   const { id } = useParams();
   const [searchParams] = useSearchParams();
-  const { user } = useAuth();
+  const { user, signOut } = useAuth();
+  const queryClient = useQueryClient();
   const { theme, brand } = useNetworkTheme();
   const { config: consentConfig, isLoading: consentLoading } = useConsentConfig();
   const isEdit = !!id;
@@ -67,13 +87,12 @@ export function ProfileFormPage() {
   const [selectedDomain, setSelectedDomain] = React.useState<string | null>(
     () => (!isEdit && singleServedDomain ? singleServedDomain : null),
   );
-  const [myItems, setMyItems] = React.useState<Item[]>([]);
-  const [resolvedNetwork, setResolvedNetwork] = React.useState<DotNetworkSchema | null>(null);
   const [existingItem, setExistingItem] = React.useState<Item | null>(null);
   const [initialData, setInitialData] = React.useState<Record<string, unknown> | null>(null);
   const [isSubmitting, setIsSubmitting] = React.useState(false);
-  const [isLoading, setIsLoading] = React.useState(isEdit);
-  const [availableNetworkIds, setAvailableNetworkIds] = React.useState<string[] | null>(null);
+  // Lifecycle controls (pause/resume/retire, #346/#347) live on the "My
+  // Profiles" sidebar rows now — NOT in this editor — so no pause UI state here.
+  // `isLoading`/`availableNetworkIds` come from React Query (#295) below.
   const [isWalletModalOpen, setIsWalletModalOpen] = React.useState(false);
   const [formError, setFormError] = React.useState<{ title: string; description?: string } | null>(null);
   const [resolvedLocations, setResolvedLocations] = React.useState<
@@ -81,6 +100,18 @@ export function ProfileFormPage() {
   >([]);
   const [formValid, setFormValid] = React.useState(false);
   const [consentChecked, setConsentChecked] = React.useState(false);
+
+  // U18 guardian gate, run at the consent tick (BEFORE the profile is created,
+  // like the self-signup materialize-after-verify flow). Null until the stored
+  // status loads; a minor must have their guardian OTP-verify a pre-create
+  // token before "Create profile" is allowed.
+  const [u18IsMinor, setU18IsMinor] = React.useState<boolean | null>(null);
+  // Interstitial shown at the consent tick BEFORE any OTP is sent, so a minor
+  // is told what's about to happen (a code goes to their guardian).
+  const [guardianConfirmOpen, setGuardianConfirmOpen] = React.useState(false);
+  const [guardianOtpOpen, setGuardianOtpOpen] = React.useState(false);
+  const [guardianSetupOpen, setGuardianSetupOpen] = React.useState(false);
+  const [guardianVerifiedForCreate, setGuardianVerifiedForCreate] = React.useState(false);
 
   // Reset consent checkbox when form becomes invalid
   React.useEffect(() => {
@@ -100,26 +131,21 @@ export function ProfileFormPage() {
   );
   const networkFromUrl = searchParams.get('network');
 
-  React.useEffect(() => {
-    const controller = new AbortController();
+  // Networks list (config tier) — discover which network ids are available.
+  const {
+    data: networksData,
+    isError: networksError,
+  } = useNetworkConfigs();
 
-    fetchNetworkConfigs()
-      .then((networks) => {
-        if (controller.signal.aborted) return;
-        const filteredNetworks = configuredNetworkIds.length > 0
-          ? networks.filter((network) => configuredNetworkIds.includes(network.id))
-          : networks;
-        setAvailableNetworkIds(filteredNetworks.map((network) => network.id));
-      })
-      .catch((err) => {
-        if (controller.signal.aborted) return;
-        console.error('Failed to fetch networks:', err);
-        setAvailableNetworkIds([]);
-        setIsLoading(false);
-      });
-
-    return () => { controller.abort(); };
-  }, [configuredNetworkIds]);
+  const availableNetworkIds = React.useMemo<string[] | null>(() => {
+    if (networksError) return [];
+    if (!networksData) return null;
+    const filtered =
+      configuredNetworkIds.length > 0
+        ? networksData.filter((network) => configuredNetworkIds.includes(network.id))
+        : networksData;
+    return filtered.map((network) => network.id);
+  }, [networksData, networksError, configuredNetworkIds]);
 
   const targetNetworkId = React.useMemo(() => {
     if (servedScope?.network) return servedScope.network;
@@ -130,142 +156,113 @@ export function ProfileFormPage() {
     return availableNetworkIds[0] ?? null;
   }, [servedScope?.network, availableNetworkIds, networkFromUrl]);
 
-  // Fetch and resolve network config from API
-  React.useEffect(() => {
-    if (!targetNetworkId) return;
-
-    const controller = new AbortController();
-    setResolvedNetwork(null);
-
-    fetchNetworkConfig(targetNetworkId)
-      .then((config) => {
-        if (controller.signal.aborted) return;
-        return resolveNetworkRefs(config, { baseUrl: apiConfig.getUrl() });
-      })
-      .then((resolved) => {
-        if (controller.signal.aborted || !resolved) return;
-        setResolvedNetwork(resolved as DotNetworkSchema);
-      })
-      .catch((err) => {
-        console.error('Failed to fetch network config:', err);
-        setIsLoading(false);
-      });
-
-    return () => { controller.abort(); };
-  }, [targetNetworkId]);
-
-  // Fetch existing profile for edit mode
-  React.useEffect(() => {
-    if (!isEdit || !id || !resolvedNetwork) return;
-
-    let cancelled = false;
-
-    const loadExistingProfile = async () => {
-      try {
-        let foundItem = false;
-        // Search across all domains to find the item
-        for (const domain of resolvedNetwork.domains ?? []) {
-          const itemTypeKeys = domain.item_schemas ? Object.keys(domain.item_schemas) : [];
-          const itemType = itemTypeKeys.length > 0 ? itemTypeKeys[0] : 'profile';
-
-          const response = await fetchItems({
-            item_network: resolvedNetwork.id,
-            item_domain: domain.id,
-            item_type: itemType,
-            item_id: id,
-            limit: 1,
-          });
-
-          if (response.items.length > 0) {
-            if (cancelled) return;
-            const item = response.items[0];
-            setExistingItem(item);
-            setSelectedDomain(item.item_domain);
-            setInitialData(item.item_state);
-            foundItem = true;
-            break;
-          }
-        }
-
-        if (!cancelled && !foundItem) {
-          toast.error(t('home.toast_profile_not_found'), {
-            description: t('profile.toast_not_found_desc'),
-          });
-          navigate(`/?network=${resolvedNetwork.id}`);
-        }
-      } catch (err) {
-        if (!cancelled) {
-          console.error('Failed to load profile:', err);
-          toast.error(t('profile.toast_load_error'), {
-            description: t('profile.toast_load_error_desc'),
-          });
-        }
-      } finally {
-        if (!cancelled) setIsLoading(false);
-      }
-    };
-
-    loadExistingProfile();
-    return () => { cancelled = true; };
-  }, [isEdit, id, resolvedNetwork]);
-
+  // Resolved network config (config tier) — fetch + $ref resolution, cached.
+  const { data: resolvedNetwork, isError: resolvedNetworkError } = useResolvedNetwork(targetNetworkId);
   const network = resolvedNetwork;
   const domains = network?.domains ?? [];
 
-  // Single-domain lock: a user's domain is implied by the items they already
-  // hold in this network. Fetch them across served domains so the create flow
-  // can lock the picker to the held domain (server enforces the real lock —
-  // see create_item's DOMAIN_LOCKED guard). Edit mode reads the domain off the
-  // existing item, so this only runs for create.
+  // Existing profile for edit mode.
+  const editItem = useEditItem(network, isEdit ? (id ?? null) : null);
+
+  // Edit-mode loading screen: shown from mount through the networks-list and
+  // network-config-resolve phases and while the item itself loads (old
+  // `isLoading` was seeded to `isEdit` and cleared only once the item load
+  // settled). Goes false when the networks-list fetch or the network resolve
+  // errors, so a failure falls through to the terminal "no networks" /
+  // "loading schemas" guards exactly as before.
+  const editLoading =
+    isEdit &&
+    !networksError &&
+    !resolvedNetworkError &&
+    !editItem.isSuccess &&
+    !editItem.isError;
+
+  // Seed the edit form from the fetched item; redirect on a genuine miss.
   React.useEffect(() => {
-    if (isEdit || !network || !user) return;
-    const controller = new AbortController();
-    Promise.all(
-      (network.domains ?? []).map((domain) => {
-        const itemTypeKeys = domain.item_schemas
-          ? Object.keys(domain.item_schemas)
-          : [];
-        const itemType = itemTypeKeys.length > 0 ? itemTypeKeys[0] : 'profile';
-        return fetchItems(
-          {
-            item_network: network.id,
-            item_domain: domain.id,
-            item_type: itemType,
-            created_by_me: true,
-            limit: 100,
-          },
-          controller.signal,
-        )
-          .then((res) => res.items)
-          .catch(() => [] as Item[]);
-      }),
-    ).then((results) => {
-      if (!controller.signal.aborted) setMyItems(results.flat());
-    });
-    return () => controller.abort();
-  }, [isEdit, network, user]);
+    if (!isEdit) return;
+    const item = editItem.data;
+    if (item) {
+      // Seed once per item — a background refetch of the same item must not
+      // clobber the user's in-progress form edits.
+      if (existingItem?.item_id === item.item_id) return;
+      setExistingItem(item);
+      setSelectedDomain(item.item_domain);
+      setInitialData(item.item_state);
+    } else if (editItem.isSuccess && item === null && !existingItem) {
+      toast.error(t('home.toast_profile_not_found'), {
+        description: t('profile.toast_not_found_desc'),
+      });
+      navigate(`/?network=${resolvedNetwork?.id ?? ''}`);
+    } else if (editItem.isError && !existingItem) {
+      console.error('Failed to load profile:', editItem.error);
+      toast.error(t('profile.toast_load_error'), {
+        description: t('profile.toast_load_error_desc'),
+      });
+    }
+  }, [
+    isEdit,
+    editItem.data,
+    editItem.isSuccess,
+    editItem.isError,
+    editItem.error,
+    existingItem,
+    resolvedNetwork?.id,
+    navigate,
+    t,
+  ]);
 
-  // Domain the user is locked to, or null when they hold no items yet.
-  const lockedDomain = React.useMemo(
-    () => (myItems.length > 0 ? myItems[0].item_domain : null),
-    [myItems],
-  );
+  // The user's role(s), persisted on `user.domains` — the single source of
+  // truth for which domain they may create profiles in (set at signup /
+  // bootstrapped on first create; backfilled for existing users). One entry
+  // today = single role; the server enforces the same set (create_item's
+  // DOMAIN_LOCKED guard reads user.domains too), so the picker and the server
+  // can't disagree. Empty → fall back to the served set.
+  const [userDomains, setUserDomainsState] = React.useState<string[]>([]);
+  React.useEffect(() => {
+    if (isEdit || !user) return;
+    let cancelled = false;
+    getUserDomains()
+      .then((d) => { if (!cancelled) setUserDomainsState(d); })
+      .catch(() => { if (!cancelled) setUserDomainsState([]); });
+    return () => { cancelled = true; };
+  }, [isEdit, user]);
 
-  // Domains offered in the picker: restricted to the served set (when a scope
-  // is configured), then to the locked domain when the user already holds one.
+  // Domains offered in the picker: the served set (when a scope is configured),
+  // then narrowed to the user's persisted role(s).
   const selectableDomains = React.useMemo(() => {
     let list = servedScope
       ? domains.filter((d) => servedScope.domains.includes(d.id))
       : domains;
-    if (lockedDomain) list = list.filter((d) => d.id === lockedDomain);
+    if (userDomains.length > 0) list = list.filter((d) => userDomains.includes(d.id));
     return list;
-  }, [domains, servedScope, lockedDomain]);
+  }, [domains, servedScope, userDomains]);
 
-  // Locked users skip the role picker — auto-select their held domain.
+  // Single-role users skip the picker — the one selectable domain is chosen for
+  // them (covers both the stored-role case and a single served domain).
+  const roleLocked = selectableDomains.length <= 1;
   React.useEffect(() => {
-    if (isEdit || selectedDomain || !lockedDomain) return;
-    setSelectedDomain(lockedDomain);
-  }, [isEdit, selectedDomain, lockedDomain]);
+    if (isEdit || selectedDomain || selectableDomains.length !== 1) return;
+    setSelectedDomain(selectableDomains[0].id);
+  }, [isEdit, selectedDomain, selectableDomains]);
+
+  // Domain confirmed at Signals self-signup (see pages/auth/login-page.tsx +
+  // otp-page.tsx): a brand-new user who hasn't created any profile yet, so
+  // without this they'd be asked to pick a domain a second time. One-shot:
+  // cleared once consumed so it never leaks into a later, unrelated
+  // profile-creation flow.
+  React.useEffect(() => {
+    // Wait for the network's domain list to actually load before consuming —
+    // otherwise an empty `domains` on the first render (network still
+    // fetching) would fail the validity check below and clear the stored
+    // value before it ever got a chance to apply.
+    if (isEdit || selectedDomain || !targetNetworkId || domains.length === 0) return;
+    const stored = getStoredSignupDomain(targetNetworkId);
+    if (!stored) return;
+    clearStoredSignupDomain(targetNetworkId);
+    if (domains.some((d) => d.id === stored)) {
+      setSelectedDomain(stored);
+    }
+  }, [isEdit, selectedDomain, targetNetworkId, domains]);
 
   // Find the profile schema for the selected domain
   const profileSchema = React.useMemo<RJSFSchema | null>(() => {
@@ -287,6 +284,66 @@ export function ProfileFormPage() {
   const profileVersion = profileDoc?.versions.find((v) => v.version === profileDoc.current_version);
   const statement = profileVersion?.statement ?? '';
   const consentRequired = !isEdit && !!statement;
+
+  // Stored U18 status: whether THIS ward is a minor. Fetched in create mode so
+  // the consent tick can route a minor through guardian verification before the
+  // profile row is ever written. Adults / edit mode are unaffected.
+  React.useEffect(() => {
+    if (isEdit || !user || !network) { setU18IsMinor(null); return; }
+    let cancelled = false;
+    getU18Status(network.id)
+      .then((s) => { if (!cancelled) setU18IsMinor(s.isMinor); })
+      // On failure leave it null — the server re-checks on finalize, so a
+      // transient error can't let a minor create a live profile ungated.
+      .catch(() => { if (!cancelled) setU18IsMinor(null); });
+    return () => { cancelled = true; };
+  }, [isEdit, user, network]);
+
+  // A minor creating a profile on a guardian-gated domain: the consent tick
+  // triggers guardian OTP; "Create profile" stays blocked until it's verified.
+  const minorGatedCreate = Boolean(
+    !isEdit && u18IsMinor === true && network && selectedDomain &&
+    isGuardianConsentRequiredDomain(network, selectedDomain),
+  );
+
+  // Re-arm the guardian gate whenever the target domain changes.
+  React.useEffect(() => {
+    setGuardianVerifiedForCreate(false);
+    setGuardianOtpOpen(false);
+    setGuardianSetupOpen(false);
+  }, [selectedDomain]);
+
+  const precreateRef = React.useCallback(
+    () => ({
+      network: network?.id ?? '',
+      brand: brand === 'standard' ? null : brand,
+      item_domain: selectedDomain ?? '',
+    }),
+    [network?.id, brand, selectedDomain],
+  );
+
+  // Issue the pre-create guardian OTP and open the OTP dialog. If no guardian is
+  // on file yet (409 GUARDIAN_REQUIRED), run the capture flow first, then retry.
+  const beginGuardianPrecreate = React.useCallback(async () => {
+    try {
+      const { otpSent } = await issueProfilePrecreateOtp(precreateRef());
+      if (otpSent) setGuardianOtpOpen(true);
+    } catch (err) {
+      const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+      const code = axios.isAxiosError(err)
+        ? (err.response?.data as { error?: string } | undefined)?.error
+        : undefined;
+      if (status === 409 && code === 'GUARDIAN_REQUIRED') {
+        setGuardianSetupOpen(true);
+      } else if (status === 429) {
+        toast.error(t('u18.guardian_error_rate_limited', 'Too many attempts. Please try again shortly.'));
+      } else if (status === 503) {
+        toast.error(t('u18.guardian_error_otp_unavailable', "Guardian confirmation isn't available on this instance right now."));
+      } else {
+        toast.error(t('profile.error_generic_desc'));
+      }
+    }
+  }, [precreateRef, t]);
 
   const selectedDomainInfo = domains.find((d) => d.id === selectedDomain);
   const DomainIcon = getDomainIcon(selectedDomain, network?.id);
@@ -361,55 +418,31 @@ export function ProfileFormPage() {
     setFormError(null);
 
     try {
-      // Resolve the coordinates to store, all client-side using the same
-      // (Google) geocoder the autocomplete uses. For a PRIVATE field every
-      // resolved place is coarsened to its CITY centroid — the exact point never
-      // leaves the browser; public fields keep the exact point. We resolve from
-      // the picked suggestion(s) when available, otherwise from the typed text,
-      // and both go through the same coarsening — so a private field is
-      // city-level whether or not a dropdown suggestion was clicked.
-      const isPrivateLocationField = profileSchema
-        ? isLocationFieldPrivate(profileSchema as Record<string, unknown>)
-        : false;
-
-      const coarsenPlace = async (
+      // Resolve the coordinates to submit, client-side, using the same (Google)
+      // geocoder the autocomplete uses. We send the EXACT point for every field —
+      // for a PRIVATE field the server jitters it (100–250 m) before storing, so
+      // the exact coordinate is never persisted (see PII location jitter, #243).
+      // Resolve from the picked suggestion(s) when available, else the typed text.
+      const toPoint = (
         lat: number,
         lng: number,
-        components: GeoComponents | undefined,
         label: string | undefined,
-      ): Promise<{ lat: number; lng: number; label?: string }> => {
-        if (!isPrivateLocationField) {
-          return label ? { lat, lng, label } : { lat, lng };
-        }
-        const cityQuery = components?.city
-          ? [components.city, components.state, components.country]
-              .filter((p): p is string => Boolean(p && p.trim()))
-              .join(', ')
-          : null;
-        if (cityQuery) {
-          const [best] = await getGeoProvider().suggest(cityQuery);
-          if (best) return { lat: best.lat, lng: best.lng };
-        }
-        // No city component (or its lookup failed): snap to a ~1km grid so a
-        // private field never stores the exact point.
-        return { lat: Math.round(lat * 100) / 100, lng: Math.round(lng * 100) / 100 };
-      };
+      ): { lat: number; lng: number; label?: string } => (label ? { lat, lng, label } : { lat, lng });
 
       let item_locations: Array<{ lat: number; lng: number; label?: string }> = [];
 
       if (resolvedLocations.length > 0) {
         // A suggestion was picked in the widget.
         for (const place of resolvedLocations) {
-          item_locations.push(await coarsenPlace(place.lat, place.lng, place.components, place.label));
+          item_locations.push(toPoint(place.lat, place.lng, place.label));
         }
       } else if (profileSchema) {
-        // No suggestion picked — geocode the marked field(s) from the typed text,
-        // then coarsen (city centroid for a private field, exact for public).
+        // No suggestion picked — geocode the marked field(s) from the typed text.
         const { primary } = parseLocationFields(profileSchema as Record<string, unknown>);
         const queries = buildLocationQueries(data, primary);
         for (const { query, label } of queries) {
           const [best] = await getGeoProvider().suggest(query);
-          if (best) item_locations.push(await coarsenPlace(best.lat, best.lng, best.components, label));
+          if (best) item_locations.push(toPoint(best.lat, best.lng, label));
         }
       }
 
@@ -429,6 +462,24 @@ export function ProfileFormPage() {
         }
 
         await updateItem(existingItem.item_id, updatePayload);
+        // Reflect the write immediately in cached lists (§C5).
+        queryClient.invalidateQueries({ queryKey: queryKeys.myItems(network.id) });
+        // Network-level prefix of the browse-items key (React Query matches
+        // prefixes) — invalidates every domain's browse cache for this network.
+        queryClient.invalidateQueries({ queryKey: ['browse-items', network.id] });
+        // Bust the by-id caches for THIS item too, else re-opening the editor
+        // within the 60s own-data window seeds the form from the pre-edit copy —
+        // and the seed-once guard above then pins that stale value so the
+        // background refetch can't correct it. removeQueries (not invalidate)
+        // for editItem so the next open has no stale copy to seed from and
+        // refetches fresh via the same masked read path; itemDetail (marker
+        // click-through / detail popup) can just be invalidated.
+        queryClient.removeQueries({
+          queryKey: queryKeys.editItem(network.id, existingItem.item_id),
+        });
+        queryClient.invalidateQueries({
+          queryKey: queryKeys.itemDetail(network.id, existingItem.item_id),
+        });
         toast.success(t('profile.toast_updated'), {
           description: t('profile.toast_updated_desc'),
         });
@@ -460,7 +511,38 @@ export function ProfileFormPage() {
           };
         }
 
-        await createItem(createPayload);
+        const created = await createItem(createPayload);
+        // Reflect the write immediately in cached lists (§C5).
+        queryClient.invalidateQueries({ queryKey: queryKeys.myItems(network.id) });
+        // Network-level prefix of the browse-items key (React Query matches
+        // prefixes) — invalidates every domain's browse cache for this network.
+        queryClient.invalidateQueries({ queryKey: ['browse-items', network.id] });
+        if (consentRequired && profileDoc) {
+          // This create recorded profile_creation consent. Optimistically add
+          // the new item to the profileConsent cache so returning to home sees
+          // it as consented IMMEDIATELY. A plain invalidate is not enough: the
+          // profileConsent query is stale-while-revalidate, so the home gate
+          // would read the old set (without this profile) during the refetch
+          // window and spuriously re-prompt. Mirrors the accept handler's
+          // setQueryData approach.
+          queryClient.setQueryData<Set<string>>(
+            queryKeys.profileConsent(network.id),
+            (prev) => new Set([...(prev ?? []), created.item_id]),
+          );
+        }
+        // Minor on a gated domain: the guardian already OTP-verified a
+        // pre-create token at the consent tick. Consume it now to record the
+        // GUARDIAN profile_creation consent and promote the fresh item to live
+        // (the create above wrote a draft with source='profile').
+        if (minorGatedCreate) {
+          await finalizeProfileConsent({
+            network: network.id,
+            brand: brand === 'standard' ? null : brand,
+            item_domain: selectedDomain,
+            item_type: defaultItemType ?? 'profile',
+            item_id: created.item_id,
+          });
+        }
         toast.success(t('profile.toast_created'), {
           description: t('profile.toast_created_desc'),
         });
@@ -501,11 +583,11 @@ export function ProfileFormPage() {
     }
   };
 
-  if (availableNetworkIds === null || isLoading) {
+  if (availableNetworkIds === null || editLoading) {
     return (
-      <div className="flex h-screen items-center justify-center">
+      <div className="flex h-svh items-center justify-center">
         <p className="text-muted-foreground">
-          {isLoading ? t('profile.loading_profile') : t('profile.loading_schemas')}
+          {editLoading ? t('profile.loading_profile') : t('profile.loading_schemas')}
         </p>
       </div>
     );
@@ -513,7 +595,7 @@ export function ProfileFormPage() {
 
   if (!targetNetworkId) {
     return (
-      <div className="flex h-screen items-center justify-center">
+      <div className="flex h-svh items-center justify-center">
         <p className="text-muted-foreground">{t('profile.no_networks')}</p>
       </div>
     );
@@ -521,7 +603,7 @@ export function ProfileFormPage() {
 
   if (!network) {
     return (
-      <div className="flex h-screen items-center justify-center">
+      <div className="flex h-svh items-center justify-center">
         <p className="text-muted-foreground">{t('profile.loading_schemas')}</p>
       </div>
     );
@@ -531,47 +613,60 @@ export function ProfileFormPage() {
   if (!selectedDomain && !isEdit) {
     return (
       <AuthShell>
-        <button
-          type="button"
-          onClick={() => navigate(`/?network=${targetNetworkId}`)}
-          className="mb-6 flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
-        >
-          <ArrowLeft className="h-4 w-4" />
-          {t('common.back')}
-        </button>
-        <div className="mb-6">
-          <p className="mb-2 inline-flex items-center rounded-full bg-primary/10 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">
-            {theme.portalLabel}
-          </p>
-          <h2 className="text-2xl font-bold">{t('profile.create_heading')}</h2>
-          <p className="text-muted-foreground mt-1">{t('profile.choose_role')}</p>
-          <p className="text-sm text-muted-foreground/80 mt-2">{theme.subline}</p>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          {selectableDomains.map((domain, idx) => {
-            const Icon = getDomainIcon(domain.id, network?.id);
-            const label = domain.id
-              .replace(/_/g, ' ')
-              .replace(/\b\w/g, (c) => c.toUpperCase());
-            return (
-              <RoleCard
-                key={domain.id}
-                icon={Icon}
-                title={label}
-                description={domain.description ?? ''}
-                onClick={() => setSelectedDomain(domain.id)}
-                variant={idx % 2 === 0 ? 'primary' : 'secondary'}
-              />
-            );
-          })}
-        </div>
+        <main id="main-content">
+          <button
+            type="button"
+            onClick={() => navigate(`/?network=${targetNetworkId}`)}
+            className="mb-6 flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
+          >
+            <ArrowLeft className="h-4 w-4" />
+            {t('common.back')}
+          </button>
+          <div className="mb-6">
+            <p className="mb-2 inline-flex items-center rounded-full bg-primary/10 px-2.5 py-0.5 text-[10px] font-semibold uppercase tracking-[0.18em] text-primary">
+              {theme.portalLabel}
+            </p>
+            {/* Only heading in this branch — safe to be a plain (visible) h1: no
+                deeper section headings (RoleCard renders plain text, not h3+),
+                so h1 here can't create a level skip. */}
+            <h1 className="text-2xl font-bold">{t('profile.create_heading')}</h1>
+            <p className="text-muted-foreground mt-1">{t('profile.choose_role')}</p>
+            <p className="text-sm text-muted-foreground/80 mt-2">{theme.subline}</p>
+          </div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            {selectableDomains.map((domain, idx) => {
+              const Icon = getDomainIcon(domain.id, network?.id);
+              const label = domain.id
+                .replace(/_/g, ' ')
+                .replace(/\b\w/g, (c) => c.toUpperCase());
+              return (
+                <RoleCard
+                  key={domain.id}
+                  icon={Icon}
+                  title={label}
+                  description={domain.description ?? ''}
+                  onClick={() => setSelectedDomain(domain.id)}
+                  variant={idx % 2 === 0 ? 'primary' : 'secondary'}
+                />
+              );
+            })}
+          </div>
+        </main>
       </AuthShell>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-[var(--brand-hero-to)]/8 to-background p-4 sm:p-6">
-      <div className="mx-auto max-w-2xl">
+    <div className="min-h-svh bg-gradient-to-b from-[var(--brand-hero-to)]/8 to-background p-4 sm:p-6">
+      <main id="main-content" className="mx-auto max-w-2xl">
+        {/* Visually-hidden page title: the shared SchemaForm renders its
+            section headings as <h3> (schema-form.tsx), so the visible hero
+            title just below must stay an <h2> to avoid an h1→h3 skip. This
+            sr-only <h1> keeps the accessible heading chain valid
+            (h1 → h2 hero → h3 form sections) without changing the look. */}
+        <h1 className="sr-only">
+          {isEdit ? t('profile.edit_role_heading', { role: roleLabel }) : t('profile.create_role_heading', { role: roleLabel })}
+        </h1>
         {/* Branded hero strip — sits flush above the form Card */}
         <div className="relative overflow-hidden rounded-t-xl bg-brand-hero">
           <div className="pointer-events-none absolute inset-0 opacity-15">
@@ -581,11 +676,11 @@ export function ProfileFormPage() {
           <div className="relative z-10 px-5 pt-4 sm:px-6">
             <button
               type="button"
-              onClick={() => (selectedDomain && !isEdit && !lockedDomain && !singleServedDomain ? setSelectedDomain(null) : navigate(`/?network=${resolvedNetwork?.id ?? ''}`))}
+              onClick={() => (selectedDomain && !isEdit && !roleLocked && !singleServedDomain ? setSelectedDomain(null) : navigate(`/?network=${resolvedNetwork?.id ?? ''}`))}
               className="flex items-center gap-1.5 text-sm text-white/70 hover:text-white transition-colors"
             >
               <ArrowLeft className="h-4 w-4" />
-              {selectedDomain && !isEdit && !lockedDomain && !singleServedDomain ? t('profile.choose_different_role') : t('common.back')}
+              {selectedDomain && !isEdit && !roleLocked && !singleServedDomain ? t('profile.choose_different_role') : t('common.back')}
             </button>
           </div>
           <div className="relative z-10 flex items-center gap-4 px-5 pb-6 pt-3 sm:px-6">
@@ -637,6 +732,7 @@ export function ProfileFormPage() {
                 hideSubmit={!isEdit}
                 onValidityChange={!isEdit ? setFormValid : undefined}
                 domainId={selectedDomain ?? undefined}
+                networkId={network?.id}
                 formContext={{
                   onLocationResolved: (
                     place: { lat: number; lng: number; components?: GeoComponents } | null,
@@ -663,20 +759,44 @@ export function ProfileFormPage() {
                     <ConsentCheckbox
                       text={statement}
                       checked={consentChecked}
-                      onCheckedChange={setConsentChecked}
+                      // For a minor on a gated domain, ticking the consent is the
+                      // trigger: it fires the guardian OTP BEFORE the profile is
+                      // created (no draft is written until "Create profile").
+                      onCheckedChange={(v) => {
+                        setConsentChecked(v);
+                        // Don't fire the OTP straight away — show the "you're
+                        // under 18, a code goes to your guardian" interstitial
+                        // first, then issue on confirm.
+                        if (v && minorGatedCreate && !guardianVerifiedForCreate) {
+                          setGuardianConfirmOpen(true);
+                        }
+                      }}
                     />
                   )
+                )}
+                {minorGatedCreate && consentChecked && (
+                  <p className="text-sm text-muted-foreground">
+                    {guardianVerifiedForCreate
+                      ? t('u18.guardian_verified_for_create', 'Guardian verified. You can now create your profile.')
+                      : t('u18.guardian_pending_for_create', "You're under 18 — your guardian must verify with a one-time code before you can create this profile.")}
+                  </p>
                 )}
                 <button
                   type="submit"
                   form="profile-form"
-                  disabled={!formValid || (!isEdit && consentLoading) || (consentRequired && !consentChecked)}
+                  disabled={
+                    !formValid ||
+                    (!isEdit && consentLoading) ||
+                    (consentRequired && !consentChecked) ||
+                    (minorGatedCreate && !guardianVerifiedForCreate)
+                  }
                   className="mt-2 h-12 w-full rounded-md text-base font-semibold bg-brand-cta hover:brightness-110 transition-all active:scale-95 shadow-md text-white disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {t('profile.btn_create')}
                 </button>
               </div>
             )}
+
           </CardContent>
         </Card>
 
@@ -686,7 +806,89 @@ export function ProfileFormPage() {
           context={walletImportContext}
           onImported={handleImportedCredentials}
         />
-      </div>
+
+        {/* Interstitial: tell the minor what's about to happen before any code
+            is sent. Confirming issues the guardian OTP. */}
+        <Dialog
+          open={guardianConfirmOpen}
+          onOpenChange={(open) => {
+            if (open) return;
+            setGuardianConfirmOpen(false);
+            // Backed out → untick so re-ticking re-opens this notice.
+            if (!guardianVerifiedForCreate) setConsentChecked(false);
+          }}
+        >
+          <DialogContent className="max-h-[90dvh] overflow-y-auto">
+            <DialogHeader>
+              <DialogTitle>
+                {t('profile.guardian_confirm_title', 'Guardian confirmation needed')}
+              </DialogTitle>
+              <DialogDescription>
+                {t(
+                  'profile.guardian_confirm_desc',
+                  "You're under 18, so a one-time code will be sent to your guardian. Once they verify it, you can create your profile.",
+                )}
+              </DialogDescription>
+            </DialogHeader>
+            <DialogFooter>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setGuardianConfirmOpen(false);
+                  setConsentChecked(false);
+                }}
+              >
+                {t('common.cancel', 'Cancel')}
+              </Button>
+              <Button
+                onClick={() => {
+                  setGuardianConfirmOpen(false);
+                  void beginGuardianPrecreate();
+                }}
+              >
+                {t('profile.guardian_confirm_proceed', 'Send code to guardian')}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+
+        {/* Pre-create guardian OTP: verified BEFORE the profile row is written. */}
+        <GuardianOtpDialog
+          open={guardianOtpOpen}
+          purpose={{ kind: 'profile' }}
+          onOpenChange={(open) => {
+            if (open) return;
+            setGuardianOtpOpen(false);
+            // Closed without verifying → untick consent so re-ticking re-issues
+            // the OTP (otherwise the create button stays stuck-disabled).
+            if (!guardianVerifiedForCreate) setConsentChecked(false);
+          }}
+          onLogout={() => { void signOut(); }}
+          onSubmitOtp={async (otp) => {
+            // Throws on an invalid/expired code → the dialog shows the inline
+            // error and stays open for a retry.
+            await verifyProfilePrecreateOtp({ ...precreateRef(), otp });
+            setGuardianVerifiedForCreate(true);
+            setGuardianOtpOpen(false);
+          }}
+        />
+
+        {/* No guardian on file yet → capture (details + setup OTP), then retry. */}
+        {guardianSetupOpen && network && selectedDomain && (
+          <U18GuardianFlow
+            network={network.id}
+            brand={brand === 'standard' ? null : brand}
+            purpose={{ kind: 'profile' }}
+            initialStep="guardian"
+            onComplete={() => {
+              setGuardianSetupOpen(false);
+              void beginGuardianPrecreate();
+            }}
+            onNotMinor={() => { setGuardianSetupOpen(false); }}
+            onLogout={() => { void signOut(); }}
+          />
+        )}
+      </main>
     </div>
   );
 }

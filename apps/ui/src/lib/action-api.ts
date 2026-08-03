@@ -36,6 +36,10 @@ export interface ContactDetailsOtherActorItem {
 export interface ContactDetailsResponse {
   action_id: string;
   action_status: string;
+  /** false → `item` is the masked pre-reveal view (a party is not live/paused). */
+  revealed: boolean;
+  /** When not revealed: `self` = viewer's own profile not live; `other` = counterparty's. */
+  reveal_blocked_reason?: 'self' | 'other' | 'retired';
   other_actor: {
     item: ContactDetailsOtherActorItem;
   };
@@ -94,7 +98,8 @@ export const ACTION_CONSENT_SENTINEL = '__consent' as const;
 
 /**
  * Payload for performing an action (initiated by source user)
- * Matches the actual API schema: POST /api/v1/action/perform
+ * Sent as a single object to POST /api/v1/action/perform
+ * For bulk actions, use performActionsBulk which posts to /api/v1/action/perform/bulk
  */
 export interface PerformActionPayload {
   action_type: string;
@@ -171,6 +176,9 @@ export interface Action {
   target_item_owner: string | null;
   target_item_locations?: Array<{ lat: number; lng: number; label?: string }>;
   requirements_snapshot: Record<string, unknown>;
+  // Reason attached when the action was rejected/cancelled — the actor's own
+  // remark, or a system remark (e.g. when the counterparty retired, #347).
+  remarks?: string | null;
   created_at: string;
   updated_at: string;
   ownership_roles: ('initiated' | 'received')[];
@@ -243,6 +251,72 @@ export interface FetchActionEventsQuery {
   offset?: number;
 }
 
+// ─── Guardian OTP (U18) ─────────────────────────────────────────────
+
+/**
+ * Machine-readable error codes the guardian-OTP challenge/response flow can
+ * surface on a bulk result entry's `error` field (perform_action /
+ * update_action_status), so `action-modal` can branch on them.
+ */
+export type GuardianOtpErrorCode =
+  | 'GUARDIAN_OTP_REQUIRED'
+  | 'GUARDIAN_OTP_INVALID'
+  | 'GUARDIAN_OTP_THROTTLED'
+  | 'GUARDIAN_OTP_RATE_LIMITED'
+  | 'OTP_PROVIDER_UNAVAILABLE';
+
+const GUARDIAN_OTP_ERROR_CODES: readonly GuardianOtpErrorCode[] = [
+  'GUARDIAN_OTP_REQUIRED',
+  'GUARDIAN_OTP_INVALID',
+  'GUARDIAN_OTP_THROTTLED',
+  'GUARDIAN_OTP_RATE_LIMITED',
+  'OTP_PROVIDER_UNAVAILABLE',
+];
+
+/**
+ * Classifies a bulk result entry's `error` field (e.g. from
+ * `BulkEnvelope.results[i]` or a thrown `BulkSingleError`) as a
+ * `GuardianOtpErrorCode`, or `null` if it isn't one of those codes (including
+ * a success entry with no `error` field at all).
+ */
+// The profile-consent guardian OTP routes (/u18/profile-consent/*) use
+// different code strings than the action routes; map them to the shared set so
+// GuardianOtpDialog shows the right message (e.g. INVALID_OTP -> "Incorrect code"
+// instead of a generic error).
+const GUARDIAN_OTP_CODE_ALIASES: Record<string, GuardianOtpErrorCode> = {
+  INVALID_OTP: 'GUARDIAN_OTP_INVALID',
+  OTP_VERIFY_THROTTLED: 'GUARDIAN_OTP_THROTTLED',
+  OTP_RATE_LIMITED: 'GUARDIAN_OTP_RATE_LIMITED',
+  OTP_PROVIDER_UNAVAILABLE: 'OTP_PROVIDER_UNAVAILABLE',
+};
+
+export function guardianOtpErrorOf(
+  entry: { error?: string } | null | undefined,
+): GuardianOtpErrorCode | null {
+  const code = entry?.error;
+  if (code === undefined) return null;
+  if ((GUARDIAN_OTP_ERROR_CODES as readonly string[]).includes(code)) {
+    return code as GuardianOtpErrorCode;
+  }
+  return GUARDIAN_OTP_CODE_ALIASES[code] ?? null;
+}
+
+/**
+ * Classifies a *thrown* error as a `GuardianOtpErrorCode`, or `null` if it
+ * isn't one. Single-item calls (`performAction`/`updateActionStatus`) throw a
+ * `BulkSingleError` (via `unwrapBulkSingle`) carrying the machine code on
+ * `.code`; a raw axios error carries it on `response.data.error`. This lets
+ * `action-modal`/`action-handler`/`action-status-updater` share one place
+ * that knows how to pull the code out of a caught error regardless of shape.
+ */
+export function guardianOtpErrorFromThrown(err: unknown): GuardianOtpErrorCode | null {
+  if (axios.isAxiosError(err)) {
+    return guardianOtpErrorOf(err.response?.data as { error?: string } | undefined);
+  }
+  const code = (err as { code?: string } | null | undefined)?.code;
+  return guardianOtpErrorOf({ error: code });
+}
+
 // ─── API Functions ────────────────────────────────────────────────
 
 /**
@@ -253,32 +327,46 @@ export interface FetchActionEventsQuery {
  * The source instance validates the source item exists, then forwards to target.
  * 
  * @param payload - The action payload
- * @param sourceInstanceUrl - Optional: URL of the source instance. 
+ * @param sourceInstanceUrl - Optional: URL of the source instance.
  *   If not provided, uses default API. Should be the instance where source item exists.
+ * @param guardianOtp - Optional: guardian OTP code to resubmit this same action with,
+ *   after a prior call returned a `GUARDIAN_OTP_REQUIRED` per-item error. Sent as
+ *   `guardian_otp` on the payload.
  */
 export async function performAction(
   payload: PerformActionPayload,
-  sourceInstanceUrl?: string
+  sourceInstanceUrl?: string,
+  guardianOtp?: string,
 ): Promise<PerformActionResponse> {
   // Use source instance URL if provided, otherwise fall back to default API client
   const client = sourceInstanceUrl
     ? createInstanceApiClient(sourceInstanceUrl)
     : apiClient;
 
+  const body = guardianOtp ? { ...payload, guardian_otp: guardianOtp } : payload;
+
   return unwrapBulkSingle(
-    client.post<BulkEnvelope<PerformActionResponse>>('/api/v1/action/perform', [payload]),
+    // Feature #293: single-object body to /perform. `body` carries guardian_otp
+    // when resubmitting a minor's action after a GUARDIAN_OTP_REQUIRED.
+    client.post<BulkEnvelope<PerformActionResponse>>('/api/v1/action/perform', body),
   );
 }
 
 /**
  * Update action status (target user response)
  * Target user calls this to accept, reject, or complete an action
+ *
+ * @param guardianOtp - Optional: guardian OTP code to resubmit this same action with,
+ *   after a prior call returned a `GUARDIAN_OTP_REQUIRED` per-item error. Sent as
+ *   `guardian_otp` on the payload.
  */
 export async function updateActionStatus(
-  payload: UpdateActionStatusPayload
+  payload: UpdateActionStatusPayload,
+  guardianOtp?: string,
 ): Promise<UpdateActionStatusResponse> {
+  const body = guardianOtp ? { ...payload, guardian_otp: guardianOtp } : payload;
   return unwrapBulkSingle(
-    apiClient.post<BulkEnvelope<UpdateActionStatusResponse>>('/api/v1/action/update-status', [payload]),
+    apiClient.post<BulkEnvelope<UpdateActionStatusResponse>>('/api/v1/action/update-status', [body]),
   );
 }
 
@@ -291,12 +379,18 @@ export async function updateActionStatus(
 export async function performActionsBulk(
   payloads: PerformActionPayload[],
   sourceInstanceUrl?: string,
+  guardianOtp?: string,
 ): Promise<BulkEnvelope<PerformActionResponse>> {
   const client = sourceInstanceUrl
     ? createInstanceApiClient(sourceInstanceUrl)
     : apiClient;
+  const body = guardianOtp
+    ? payloads.map((payload) => ({ ...payload, guardian_otp: guardianOtp }))
+    : payloads;
   return postBulkEnvelope<PerformActionResponse>(
-    client.post<BulkEnvelope<PerformActionResponse>>('/api/v1/action/perform', payloads),
+    // Feature #293: array goes to the dedicated /perform/bulk route. `body`
+    // carries guardian_otp on each payload when set.
+    client.post<BulkEnvelope<PerformActionResponse>>('/api/v1/action/perform/bulk', body),
   );
 }
 
@@ -307,9 +401,15 @@ export async function performActionsBulk(
  */
 export async function updateActionStatusBulk(
   payloads: UpdateActionStatusPayload[],
+  guardianOtp?: string,
 ): Promise<BulkEnvelope<UpdateActionStatusResponse>> {
+  const body = guardianOtp
+    ? payloads.map((payload) => ({ ...payload, guardian_otp: guardianOtp }))
+    : payloads;
   return postBulkEnvelope<UpdateActionStatusResponse>(
-    apiClient.post<BulkEnvelope<UpdateActionStatusResponse>>('/api/v1/action/update-status', payloads),
+    // `body` carries the single guardian OTP on each payload when set, so a
+    // minor's whole accept batch clears with one code (#393).
+    apiClient.post<BulkEnvelope<UpdateActionStatusResponse>>('/api/v1/action/update-status', body),
   );
 }
 

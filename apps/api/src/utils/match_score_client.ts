@@ -1,7 +1,8 @@
-import type {
-  MatchScoreClient,
-  MatchScoreRequest,
-  MatchScoreResult,
+import {
+  createMatchScoreClient,
+  type MatchScoreClient,
+  type MatchScoreRequest,
+  type MatchScoreResult,
 } from '@dpg/match_score';
 import { matchScoreConfig } from '@/config';
 
@@ -58,27 +59,19 @@ function createInProcessMatchScoreClient(): MatchScoreClient {
 
 export const getMatchScoreClient = () => {
   switch (matchScoreConfig.provider) {
-    case 'dpg_scoring': {
-      // Previous implementation (external scorer API call):
-      // const dpgScoring = matchScoreConfig.dpg_scoring;
-      //
-      // if (!dpgScoring.endpoint || !dpgScoring.key_id || !dpgScoring.secret) {
-      //   return undefined;
-      // }
-      //
-      // return createMatchScoreClient({
-      //   provider: 'dpg_scoring',
-      //   baseUrl: dpgScoring.endpoint,
-      //   keyId: dpgScoring.key_id,
-      //   secret: dpgScoring.secret,
-      //   path: dpgScoring.path,
-      //   version: dpgScoring.version,
-      //   promptVersion: dpgScoring.prompt_version,
-      // });
+    case 'signals_search': {
+      const signalsSearch = matchScoreConfig.signals_search;
 
-      // ponytail: local-only shortcut. This bypasses external scorer API calls
-      // entirely and computes a deterministic score in-process.
-      return createInProcessMatchScoreClient();
+      if (!signalsSearch.endpoint || !signalsSearch.api_key) {
+        return undefined;
+      }
+
+      return createMatchScoreClient({
+        provider: 'signals_search',
+        baseUrl: signalsSearch.endpoint,
+        apiKey: signalsSearch.api_key,
+        path: signalsSearch.path,
+      });
     }
 
     default:

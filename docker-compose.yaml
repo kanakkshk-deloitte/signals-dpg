@@ -2,9 +2,8 @@ version: '3.8'
 services:
   db:
     build:
-      context: ./docker/db
-      dockerfile: Dockerfile
-    image: dpg-db-local
+      context: ./docker/postgres
+    image: dpg-db-postgis-pgvector:17
     container_name: dpg-db
     restart: always
     ports:

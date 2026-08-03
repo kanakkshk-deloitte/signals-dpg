@@ -5,8 +5,9 @@ import type { RJSFSchema, UiSchema, RegistryWidgetsType, ObjectFieldTemplateProp
 import { DatePickerWidget } from './custom-widgets/date-picker-widget';
 import { LocationAutocompleteWidget } from './custom-widgets/location-autocomplete-widget';
 import { MultiLocationAutocompleteWidget } from './custom-widgets/multi-location-autocomplete-widget';
+import { ReferenceAutocompleteWidget } from './custom-widgets/reference-autocomplete-widget';
 import CustomFieldTemplate from './custom-field-template';
-import { formLayouts } from '@/theme/form-layouts';
+import { resolveFormLayout, type FormLayout } from '@/theme/form-layouts';
 import { resolveVisibleSchema } from '@/lib/show-if';
 
 interface RjsfError {
@@ -93,14 +94,18 @@ interface SchemaFormProps {
    */
   onValidityChange?: (isValid: boolean) => void;
   domainId?: string;
+  /**
+   * Network id, used with domainId to resolve the section layout. Domain ids
+   * (seeker/provider) collide across networks, so the layout is keyed on
+   * `${networkId}:${domainId}` — see resolveFormLayout.
+   */
+  networkId?: string;
   formContext?: Record<string, unknown>;
 }
 
 // Root-only ObjectFieldTemplate that renders section headers + two-column grid.
 // For nested objects (non-root) it falls back to the default RJSF column layout.
-function SectionedObjectFieldTemplate(domainId: string) {
-  const layout = formLayouts[domainId];
-
+function SectionedObjectFieldTemplate(layout: FormLayout | undefined) {
   return function ObjectFieldTemplate(props: ObjectFieldTemplateProps) {
     if (!layout) {
       // No layout config — render properties in a simple column
@@ -166,7 +171,7 @@ function SectionedObjectFieldTemplate(domainId: string) {
               <div className="space-y-3">
                 {rows.map((row, ri) =>
                   row.length === 2 ? (
-                    <div key={ri} className="grid grid-cols-2 gap-3">
+                    <div key={ri} className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       {row.map((el) => <div key={el.name}>{el.content}</div>)}
                     </div>
                   ) : (
@@ -263,6 +268,48 @@ function generateUiSchema(
       }
     }
 
+    // A field-level `placeholder` on the schema (network.json) wins over the
+    // generic defaults above ('Select...', email sample) so each field can
+    // carry its own prompt text.
+    const fieldPlaceholder = (typed as { placeholder?: unknown }).placeholder;
+    if (typeof fieldPlaceholder === 'string' && fieldPlaceholder.length > 0) {
+      uiSchema[key] = {
+        ...(uiSchema[key] as object),
+        'ui:placeholder': fieldPlaceholder,
+      };
+    }
+
+    // External reference vocabulary (network.json `x-reference-source`): render
+    // an autocomplete backed by a reference dataset instead of an inline enum,
+    // so large lists (colleges/institutes/trades) stay out of the schema. The
+    // marker is either a bare `"source"` string or `{ source, subtitle }`, where
+    // `subtitle` is the ordered option fields shown under each result.
+    const referenceMarker = (typed as { 'x-reference-source'?: unknown })['x-reference-source'];
+    let referenceSource: string | undefined;
+    let subtitleFields: string[] | undefined;
+    if (typeof referenceMarker === 'string') {
+      referenceSource = referenceMarker;
+    } else if (referenceMarker && typeof referenceMarker === 'object') {
+      const m = referenceMarker as { source?: unknown; subtitle?: unknown };
+      if (typeof m.source === 'string') referenceSource = m.source;
+      if (Array.isArray(m.subtitle)) {
+        subtitleFields = m.subtitle.filter((s): s is string => typeof s === 'string');
+      }
+    }
+    if (referenceSource && referenceSource.length > 0) {
+      const existing = (uiSchema[key] as Record<string, unknown>) ?? {};
+      const existingOptions = (existing['ui:options'] as Record<string, unknown>) ?? {};
+      uiSchema[key] = {
+        ...existing,
+        'ui:widget': 'reference-autocomplete',
+        'ui:options': {
+          ...existingOptions,
+          source: referenceSource,
+          ...(subtitleFields ? { subtitleFields } : {}),
+        },
+      };
+    }
+
     const locationRole = (typed as { location?: unknown }).location;
     if (locationRole === 'primary' || locationRole === 'secondary') {
       const isArray = typed.type === 'array';
@@ -285,6 +332,7 @@ const widgets: RegistryWidgetsType = {
   date: DatePickerWidget,
   'location-autocomplete': LocationAutocompleteWidget,
   'location-multi': MultiLocationAutocompleteWidget,
+  'reference-autocomplete': ReferenceAutocompleteWidget,
 };
 
 function stripMetaSchema(schema: RJSFSchema): RJSFSchema {
@@ -323,6 +371,17 @@ function normalizeSchemaForRjsf(schema: RJSFSchema, rootSchema?: RJSFSchema): RJ
     // Strip the custom `x-show-if` keyword — consumed by resolveVisibleSchema before
     // this point; ajv must never see it.
     if (key === 'x-show-if') continue;
+    // Strip the custom `x-form-layout` keyword — consumed by the section
+    // renderer (read off the raw schema); ajv/RJSF must never see it.
+    if (key === 'x-form-layout') continue;
+    // Strip the custom field-level `placeholder` keyword (string value) — it's
+    // mapped to `ui:placeholder` by generateUiSchema, so ajv must not see it.
+    // The `typeof string` guard avoids stripping a property NAMED "placeholder".
+    if (key === 'placeholder' && typeof value === 'string') continue;
+    // Strip the custom `x-reference-source` marker (string or `{source,subtitle}`
+    // object) — it's mapped to the reference-autocomplete widget by
+    // generateUiSchema, so ajv must not see it.
+    if (key === 'x-reference-source') continue;
     result[key] = normalizeSchemaForRjsf(value as RJSFSchema, root);
   }
 
@@ -366,6 +425,7 @@ export function SchemaForm({
   hideSubmit = false,
   onValidityChange,
   domainId,
+  networkId,
   formContext,
 }: SchemaFormProps) {
   // Base schema (meta stripped) still carries `x-show-if` so the evaluator can read it.
@@ -420,12 +480,20 @@ export function SchemaForm({
     if (cb) cb(isSchemaFormValid(validator, rjsfSchema, data));
   }, [rjsfSchema, data]);
 
+  // Section layout is schema-driven first: an `x-form-layout` block on the item
+  // schema (network.json) is the single source of truth, so field add/remove/
+  // reorder needs no code change. Falls back to the code-side `formLayouts` map
+  // (keyed network:domain) for networks not yet migrated to x-form-layout.
+  const activeLayout: FormLayout | undefined =
+    (schema as { 'x-form-layout'?: FormLayout })['x-form-layout'] ??
+    resolveFormLayout(networkId, domainId);
+
   // FieldTemplate applies to every form (red required marker). ObjectFieldTemplate
-  // (section layout) is added only for domains with a configured layout.
+  // (section layout) is added only when a layout is resolved.
   const templates = {
     FieldTemplate: CustomFieldTemplate,
-    ...(domainId && formLayouts[domainId]
-      ? { ObjectFieldTemplate: SectionedObjectFieldTemplate(domainId) }
+    ...(activeLayout
+      ? { ObjectFieldTemplate: SectionedObjectFieldTemplate(activeLayout) }
       : {}),
   };
 

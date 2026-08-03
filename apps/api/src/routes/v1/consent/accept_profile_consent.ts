@@ -7,10 +7,12 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { and, eq } from 'drizzle-orm';
 import { db } from '@api/db/postgres/drizzle_config';
 import { consent_record } from '@api/db/postgres/schema';
-import { items } from '@dpg/database';
 import { auth_middleware_if_enabled } from '@api/plugins/auth/auth_middleware';
 import { apiConfig } from '@/config';
 import { resolveConsentVersion } from '@/services/consent_version';
+import { hasAcceptedTermsAndPrivacy } from '@/services/consent_acceptance';
+import { promoteItemOnProfileConsent, isItemOwnedBy } from '@/services/item_service';
+import { invalidateItemFetchCache } from '@/utils/item_fetch_cache_invalidate';
 
 const ProfileConsentAcceptResponseSchema = z.object({ recorded: z.number().int() });
 
@@ -58,21 +60,7 @@ export const accept_profile_consent_handler = async (
   // partition key columns (item_network + item_domain + item_type + item_id) so
   // the planner can prune partitions.
   try {
-    const ownerRows = await db
-      .select({ created_by: items.created_by })
-      .from(items)
-      .where(
-        and(
-          eq(items.item_network, body.network),
-          eq(items.item_domain, body.item_domain),
-          eq(items.item_type, body.item_type),
-          eq(items.item_id, body.item_id),
-          eq(items.created_by, userId),
-        ),
-      )
-      .limit(1);
-
-    if (ownerRows.length === 0) {
+    if (!(await isItemOwnedBy(userId, body))) {
       return reply.code(403).send({
         error: 'NOT_ITEM_OWNER',
         message: 'You do not own this item or it does not exist',
@@ -83,6 +71,26 @@ export const accept_profile_consent_handler = async (
     return reply.code(500).send({
       error: 'CONSENT_READ_FAILED',
       message: 'Failed to verify item ownership',
+    });
+  }
+
+  // Prerequisite: terms + privacy must already be accepted before per-profile
+  // consent can be recorded. This enforces the invariant that lets the live
+  // gate check profile_creation alone (see hasAcceptedProfileConsent).
+  try {
+    const prereqMet = await hasAcceptedTermsAndPrivacy(db, userId, body.network);
+    if (!prereqMet) {
+      return reply.code(409).send({
+        error: 'CONSENT_PREREQUISITE_MISSING',
+        message:
+          'Terms and privacy must be accepted before recording profile consent',
+      });
+    }
+  } catch (err) {
+    request.log.error({ err }, 'profile consent prerequisite check failed');
+    return reply.code(500).send({
+      error: 'CONSENT_READ_FAILED',
+      message: 'Failed to verify consent prerequisite',
     });
   }
 
@@ -127,17 +135,24 @@ export const accept_profile_consent_handler = async (
     });
   }
 
+  let promoted = false;
   try {
-    await db.insert(consent_record).values({
-      level: 'item',
-      consentCategory: 'profile_creation',
-      userId,
-      itemId: body.item_id,
-      network: body.network,
-      brand: body.brand ?? null,
-      documentVersion: profileVersion,
-      source: 'profile',
-      acceptedAt: new Date(),
+    await db.transaction(async (tx) => {
+      await tx.insert(consent_record).values({
+        level: 'item',
+        consentCategory: 'profile_creation',
+        userId,
+        itemId: body.item_id,
+        network: body.network,
+        brand: body.brand ?? null,
+        documentVersion: profileVersion,
+        source: 'profile',
+        acceptedAt: new Date(),
+      });
+      // Recording profile consent can make a complete draft discoverable
+      // (aggregator-dpg#464). Promote in the same transaction so the ledger
+      // write and the lifecycle flip are atomic.
+      promoted = await promoteItemOnProfileConsent(tx, body.item_id);
     });
   } catch (err) {
     // consent_record is append-only, so the idempotency check + insert are not
@@ -162,6 +177,21 @@ export const accept_profile_consent_handler = async (
       error: 'CONSENT_WRITE_FAILED',
       message: 'Failed to record consent',
     });
+  }
+
+  // A promotion changed lifecycle_status, so both item read caches now hold a
+  // stale `draft`: the 1 s local one the owner's "My Profiles" list reads
+  // through, and the domain-TTL inter-instance ones (5 min for blue_dot/seeker)
+  // that would otherwise keep the freshly-live profile out of everyone else's
+  // browse feed. Sweep both, as the lifecycle route does. Best-effort — a cache
+  // miss must never fail an already-recorded consent.
+  if (promoted) {
+    await invalidateItemFetchCache(body.network, body.item_domain).catch((err) =>
+      request.log.warn(
+        { err },
+        'cache invalidation after profile-consent promotion failed',
+      ),
+    );
   }
 
   return reply.code(200).send({ recorded: 1 });

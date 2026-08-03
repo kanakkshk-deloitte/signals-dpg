@@ -1,9 +1,17 @@
 import { createAuth } from '@dpg/auth';
 import { allowed_origins, admin_domains } from '@dpg/config';
-import { api, instance, auth, notification } from '@/config';
+import {
+  api,
+  instance,
+  auth,
+  notification,
+  authConfig,
+  getCurrentApiBaseUrl,
+} from '@/config';
 import { db } from '@api/db/postgres/drizzle_config';
 import { redis } from '@api/db/secondary/redis';
 import { getNotificationClient } from '@/utils/notificationClient';
+import { materializeSignupGuardian } from '@/services/signup_guardian';
 
 function withDevLocalPort(url: URL): URL {
   const isLocalHost =
@@ -38,7 +46,12 @@ export const authInstance = createAuth({
   appName: instance.INSTANCE_NAME ?? 'DPG',
   nodeEnv: instance.INSTANCE_ENV,
 
-  baseURL: buildAuthBaseUrl(),
+  // getCurrentApiBaseUrl() only appends API_PORT when API_DOMAIN doesn't
+  // already carry one; a naive `${api.API_DOMAIN}:${api.API_PORT}` (the
+  // prior form here) double-appended the port whenever API_DOMAIN was
+  // already a full origin like "http://localhost:2742", which better-auth's
+  // URL parsing rejects outright.
+  baseURL: `${getCurrentApiBaseUrl()}/api/auth`,
 
   secret: auth.AUTH_SECRET,
   apiDomain: buildAuthApiDomain(),
@@ -52,4 +65,19 @@ export const authInstance = createAuth({
   createTestOTP: auth.CREATE_TEST_OTP,
   notificationClient: getNotificationClient(),
   smsTemplateId: notification.SMS_TEMPLATE_ID,
+
+  allowSelfSignup: authConfig.allow_self_signup,
+  loginChannels: authConfig.login_channels,
+
+  // Materialize a pre-auth signup-guardian capture (services/signup_guardian.ts)
+  // onto the new user id, only for genuinely new users. Never blocks signup —
+  // failures are caught and logged here (createAuth also wraps this call, so
+  // this is defense in depth, not the only safety net).
+  afterUserCreate: async ({ user }) => {
+    try {
+      await materializeSignupGuardian(user);
+    } catch (err) {
+      console.error('materializeSignupGuardian failed:', err);
+    }
+  },
 });

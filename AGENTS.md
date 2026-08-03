@@ -13,6 +13,7 @@ dpg-monorepo/
 │   ├── auth/              # better-auth configuration
 │   ├── config/            # Zod env schemas & allowed lists
 │   ├── database/          # Drizzle ORM setup & utilities
+│   ├── match_score/       # Match-scoring provider client (DPG scoring)
 │   ├── notification/      # Notification service client
 │   └── schemas/           # Shared Zod schemas & schema registry
 ├── turbo.json             # Turborepo task definitions
@@ -56,10 +57,12 @@ an app/package dir, or `pnpm add -w <pkg>` for workspace-wide deps.
 
 ### Tests
 
-**No test framework is configured.** If adding tests, use Vitest and run:
+**Vitest**, colocated `__tests__/` folders per directory (the norm — a top-level `apps/api/src/__tests__/` also exists for a handful of cross-cutting integration tests). `*.test.ts` is a unit test; `*.integration.test.ts` requires a running Postgres + Redis (`docker compose up -d db redis`) and is excluded from the default `pnpm --filter api test` run.
 
 ```bash
-pnpm vitest run src/path/to/testfile.ts
+pnpm --filter api test                              # unit tests
+pnpm --filter api exec vitest run src/path/to/file.test.ts   # one file
+pnpm --filter api test:integration                   # integration (needs db+redis running)
 ```
 
 ### Type Checking
@@ -190,17 +193,6 @@ export default my_route;
 - Use `drizzle-kit` for migrations. **Never edit migration files manually.**
 - Use partition-aware queries for item tables to enable partition pruning.
 
-## Cursor Rules (Codacy MCP)
-
-Follow rules in `.cursor/rules/codacy.mdc`:
-
-- After any `edit_file` operation, run `codacy_cli_analyze` via Codacy MCP
-  Server.
-- If Codacy CLI is not installed, ask the user before proceeding.
-- After installing dependencies, run `codacy_cli_analyze` with tool `trivy` for
-  security checks.
-- Do NOT run complexity or coverage analysis.
-
 ## General Guidelines
 
 - ESM-only: all packages set `"type": "module"`.
@@ -209,3 +201,24 @@ Follow rules in `.cursor/rules/codacy.mdc`:
 - Graceful shutdown on SIGINT/SIGTERM for server apps.
 - No `// TODO` comments — open an issue instead.
 - No hardcoded secrets or credentials in code.
+
+## UI Data Caching (React Query)
+
+One QueryClient (`apps/ui/src/lib/query-client.ts`), one key factory
+(`apps/ui/src/lib/query-keys.ts`). staleTime tiers: config-like data 5 min
+(invalidate on change), browse feeds ~90s (+ `cache_ttl_seconds`), own data 60s
+(+ invalidate-on-write), actions via `refetchInterval`. Geocoding uses dedicated
+caches (Redis server-side, in-memory session client-side), not React Query.
+Never rely on `refetchOnWindowFocus` for freshness.
+
+**Deferred — instance-URL cache-busting (caching-spec §8):** when a
+`selectedApiUrl` / instance switcher is added to the UI, switching it must bust
+the React Query caches (browse/my-items/markers) and the client schema cache
+(`clearSchemaCache`), because `createApiClient` captures `baseURL` at
+construction. The `resolvedNetwork(networkId, apiBaseUrl)` key already carries
+the API base URL. There is no switcher today, so no busting is wired yet.
+
+**Deferred — active profile id (caching-spec §8):** once relevance ranking
+(§9, cross-repo P6) lands, add `activeProfileId` to `browseItems` and `markers`
+keys because ranking results differ per profile. Not in keys today; placeholder
+is in code comments at `queryKeys.browseItems` and `queryKeys.markers`.

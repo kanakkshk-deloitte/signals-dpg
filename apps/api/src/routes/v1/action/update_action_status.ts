@@ -27,6 +27,14 @@ import {
 } from '@/utils/action_event_runtime';
 import { runBulk, BulkItemFailure } from '@/utils/bulk_runner';
 import { dispatchActionNotifications } from '@/notifications/notify_actions';
+import {
+  guardianActionGate,
+  guardianBulkActionGate,
+  guardianGateFailure,
+  type BulkGateItem,
+  type GateResult,
+} from '@/services/guardian_action_gate';
+import { guardianActionConsentRow, actionConsentRow } from '@/services/guardian_consent_rows';
 
 const BulkUpdateActionStatusBodySchema = z.array(z.unknown());
 
@@ -57,6 +65,76 @@ export const update_action_status: FastifyPluginAsyncZod = async function (fasti
 };
 
 /**
+ * Pre-pass for the bulk update-status route (#393, accept side): resolve each
+ * row far enough to know whether accepting it reveals the caller's PII (the
+ * same `requiresReceiverConsent` condition the main loop applies), and gate the
+ * gated subset with ONE guardian OTP + ONE email instead of one per row —
+ * mirroring perform_action's initiator-side batch pre-pass. Only rows where the
+ * caller is the accepting party (target item owner) and the transition reveals
+ * PII are batched; everything else falls back to the per-item gate below (a
+ * cheap `not_required`). The single OTP is read from the first row carrying
+ * `guardian_otp` (the client puts one code on the resubmitted batch). The gate
+ * scope mirrors the single call: the accepting minor's own item is the *source*
+ * of the scope, the counterparty's item the *target*.
+ */
+async function buildBulkGuardianAcceptGate(
+  items: unknown[],
+  callerId: string,
+): Promise<Map<number, GateResult>> {
+  const gateItems: BulkGateItem[] = [];
+  let otp: string | undefined;
+  for (let index = 0; index < items.length; index++) {
+    const parsed = UpdateActionStatusBodySchema.safeParse(items[index]);
+    if (!parsed.success) continue;
+    const body = parsed.data;
+    if (!otp && body.guardian_otp) otp = body.guardian_otp;
+
+    const [existingAction] = await db
+      .select()
+      .from(item_actions)
+      .where(eq(item_actions.action_id, body.action_id))
+      .limit(1);
+    if (!existingAction) continue;
+    // Only the accepting party (target item owner) is gated here.
+    if (existingAction.target_item_owner !== callerId) continue;
+
+    let interaction: ReturnType<typeof getActionInteraction>;
+    try {
+      const networkConfig = await getNetworkConfigById(existingAction.target_item_network);
+      interaction = getActionInteraction(networkConfig, {
+        actionType: existingAction.action_type,
+        fromNetwork: existingAction.source_item_network,
+        fromDomain: existingAction.source_item_domain,
+        fromItemType: existingAction.source_item_type,
+        toNetwork: existingAction.target_item_network,
+        toDomain: existingAction.target_item_domain,
+        toItemType: existingAction.target_item_type,
+      });
+    } catch {
+      continue; // the per-item handler surfaces the real INVALID_ACTION_EVENT
+    }
+
+    const cancelStatuses = interaction.metric_categories?.cancel ?? [];
+    const isCancellation = cancelStatuses.includes(body.action_status);
+    const requiresReceiverConsent =
+      !isCancellation && interaction.reveals_pii_on_status.includes(body.action_status);
+    if (!requiresReceiverConsent) continue;
+
+    gateItems.push({
+      index,
+      wardUserId: callerId,
+      network: existingAction.target_item_network,
+      sourceDomain: existingAction.target_item_domain,
+      actionType: existingAction.action_type,
+      sourceItemId: existingAction.target_item_id,
+      targetItemId: existingAction.source_item_id,
+    });
+  }
+  if (gateItems.length === 0) return new Map();
+  return guardianBulkActionGate({ items: gateItems, stage: 'accept', otp });
+}
+
+/**
  * Self-acted only. For receiver responses (accept/reject/…) the caller
  * (session cookie or apikey-as-self) must be the target item's owner. The one
  * exception is a cancellation (a status bucketed under metric_categories.cancel):
@@ -71,6 +149,24 @@ export const update_action_status_handler = async (
   reply: FastifyReply,
 ) => {
   const callerId = request.user.id;
+
+  // Only a genuine batch (>1 row) within the bulk limit uses the one-OTP-per-
+  // batch accept gate; a single update keeps the per-item gate untouched, and an
+  // over-limit batch is left for runBulk to reject before any gating work.
+  // Fail-safe: if the pre-pass errors, fall back to the per-item gate (still
+  // fail-closed) rather than failing the whole request.
+  let batchGate: Map<number, GateResult> | undefined;
+  if (request.body.length > 1 && request.body.length <= apiConfig.bulk_max_items) {
+    try {
+      batchGate = await buildBulkGuardianAcceptGate(request.body, callerId);
+    } catch (err) {
+      request.log.error(
+        { err },
+        'bulk guardian accept pre-pass failed; falling back to per-action gate',
+      );
+      batchGate = undefined;
+    }
+  }
 
   const outcome = await runBulk(
     request.body,
@@ -200,6 +296,57 @@ export const update_action_status_handler = async (
       // reveals_pii_on_status.
       const requiresReceiverConsent =
         !isCancellation && interaction.reveals_pii_on_status.includes(body.action_status);
+
+      // U18 guardian gate (Phase 5b). Scoped to exactly the accept / PII-
+      // reveal stage — the same `requiresReceiverConsent` condition the
+      // adult consent-acknowledgment check below applies to — so every
+      // other transition (reject, custom statuses, etc.) is byte-for-byte
+      // unchanged. The party who must clear this gate is the ACCEPTING
+      // party: every non-cancellation transition reaching this point has
+      // already required `callerId === existingAction.target_item_owner`
+      // above, so the accepting minor's own item is the *target* item and
+      // the other party's item is the *source* item (mirrored from the DB
+      // row, not re-derived from the request body). A minor *initiator* was
+      // already gated at perform (Task 2, commit bc87fd0) — this gates the
+      // minor *acceptor*. Adults and ungated domains resolve `not_required`
+      // and the rest of this handler runs exactly as it does today.
+      let guardianGate: GateResult = { status: 'not_required' };
+      if (requiresReceiverConsent) {
+        // In a bulk submit (#393) the accept pre-pass already produced this
+        // row's result (one OTP for the whole batch); fall back to the
+        // per-action gate for a single update or an unbatched row.
+        guardianGate =
+          batchGate?.get(index) ??
+          (await guardianActionGate({
+            wardUserId: callerId,
+            network: existingAction.target_item_network,
+            sourceDomain: existingAction.target_item_domain,
+            actionType: existingAction.action_type,
+            sourceItemId: existingAction.target_item_id,
+            targetItemId: existingAction.source_item_id,
+            stage: 'accept',
+            // Self-acted only (on-behalf was removed) — the external block must
+            // never fire here. Passing 'self' locks that invariant: if on-behalf
+            // is ever re-added, minors are blocked automatically (#395).
+            channel: 'self',
+            otp: body.guardian_otp,
+          }));
+
+        // Per-item BulkItemFailure (mirrors perform_action.ts, commit
+        // bc87fd0) — NOT a mid-loop reply.send. runBulk is sequential
+        // best-effort: a thrown BulkItemFailure is recorded for this item
+        // and the loop continues to the next one, so a real HTTP
+        // challenge/response status here would be wrong on two counts — it
+        // would apply to the whole batch, not just this item, and trailing
+        // items would still run and commit underneath it while the
+        // envelope that describes them never gets sent (the original bug:
+        // a batch [minorAccept-no-otp, adultAccept] could commit the
+        // adult's PII-revealing accept and then return a blanket 428 that
+        // hides it). Every item — gated or not — is reported in the normal
+        // per-item results array instead.
+        const guardianGateFail = guardianGateFailure(guardianGate);
+        if (guardianGateFail) throw guardianGateFail;
+      }
 
       if (requiresReceiverConsent && !body.consent?.acknowledged) {
         throw new BulkItemFailure(
@@ -332,9 +479,7 @@ export const update_action_status_handler = async (
               );
             }
             try {
-              await tx.insert(consent_record).values({
-                level: 'item',
-                consentCategory: 'action',
+              await tx.insert(consent_record).values(actionConsentRow({
                 actionType: row.action_type,
                 actionStage: 'accept',
                 userId: callerId,
@@ -344,11 +489,48 @@ export const update_action_status_handler = async (
                 brand: body.consent.brand ?? null,
                 documentVersion: acceptVersion,
                 source: 'action',
-                acceptedAt: new Date(),
-              });
+              }));
             } catch (err) {
               throw new ConsentWriteError(
                 err instanceof Error ? err.message : 'consent write failed',
+              );
+            }
+          }
+
+          // U18 guardian accept-consent (Phase 5b): only reached when the
+          // gate verified a fresh guardian OTP for this exact accept above.
+          // Mirrors the adult accept-consent write immediately above —
+          // same columns, same fail-closed behavior (a write/version
+          // failure rolls back the status update via ConsentWriteError) —
+          // with `source:'guardian'` and the u18 metadata tag. Action
+          // statements were not variant-split in Phase 2, so the version
+          // comes from the same (non-variant) accept resolver.
+          if (guardianGate.status === 'verified') {
+            const guardianVersion = await resolveConsentVersion({
+              network: row.target_item_network,
+              category: 'action',
+              actionType: row.action_type,
+              stage: 'accept',
+            });
+            if (guardianVersion === null) {
+              throw new ConsentWriteError(
+                `guardian accept consent version not configured for ${row.action_type}`,
+              );
+            }
+            try {
+              await tx.insert(consent_record).values(guardianActionConsentRow({
+                actionType: row.action_type,
+                actionStage: 'accept',
+                userId: callerId,
+                itemId: row.target_item_id,
+                actionId: body.action_id,
+                network: row.target_item_network,
+                brand: body.consent?.brand ?? null,
+                documentVersion: guardianVersion,
+              }));
+            } catch (err) {
+              throw new ConsentWriteError(
+                err instanceof Error ? err.message : 'guardian consent write failed',
               );
             }
           }

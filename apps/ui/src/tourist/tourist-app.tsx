@@ -3,8 +3,10 @@ import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import type { RJSFSchema } from '@rjsf/utils';
 import { fetchNetworkConfig, fetchNetworkItems, PROFILE_FETCH_LIMIT } from '@/lib/network-api';
+import { queryKeys } from '@/lib/query-keys';
 import type { Item } from '@/lib/item-api';
 import { useBrowserLocation } from '@/hooks/use-browser-location';
+import { useGeolocationPermission } from '@/hooks/use-geolocation-permission';
 import type { LatLng } from '@/lib/geo/types';
 import { getEnumFilterFieldsForDomains, itemPassesEnumFilters } from '@/lib/enum-filters';
 import { MapFiltersPanel } from '@/components/map/map-filters-panel';
@@ -13,7 +15,7 @@ import type { ViewMode } from '@/engine/types';
 import { TouristTopBar } from './tourist-top-bar';
 import { TouristMap } from './tourist-map';
 import { TouristList } from './tourist-list';
-import { EnableLocationBanner } from './enable-location-banner';
+import { EnableLocationBanner } from '@/components/location/enable-location-banner';
 import { TouristHero } from './tourist-hero';
 import { itemToCardItem, matchesSearch, type CardItem } from './practitioner-data';
 import { TOURIST_NETWORK_ID as ORANGE_NETWORK_ID } from './resolve-tourist-config';
@@ -39,34 +41,16 @@ export function TouristApp() {
     }
   }, [browser.isSupported, browser.status, browser.request]);
 
-  // Track the geolocation PERMISSION state. The geolocation error code is
-  // PERMISSION_DENIED for both "Never allow" AND merely dismissing the prompt,
-  // so we can't tell them apart from the error. The Permissions API can: it's
-  // 'denied' only on a real block, and stays 'prompt' when dismissed. We use
-  // this to hide the "Enable location" button only when truly blocked.
-  const [geoPermission, setGeoPermission] = React.useState<PermissionState | 'unknown'>('unknown');
-  React.useEffect(() => {
-    if (typeof navigator === 'undefined' || !navigator.permissions?.query) return;
-    let status: PermissionStatus | null = null;
-    const onChange = () => setGeoPermission(status?.state ?? 'unknown');
-    navigator.permissions
-      .query({ name: 'geolocation' as PermissionName })
-      .then((s) => {
-        status = s;
-        setGeoPermission(s.state);
-        s.addEventListener('change', onChange);
-      })
-      .catch(() => setGeoPermission('unknown'));
-    return () => status?.removeEventListener('change', onChange);
-  }, []);
+  const geoPermission = useGeolocationPermission();
 
   const userLocation: LatLng | null = browser.location
     ? { lat: browser.location.lat, lng: browser.location.lng }
     : null;
 
   const configQuery = useQuery({
-    queryKey: ['tourist', 'config', ORANGE_NETWORK_ID],
+    queryKey: queryKeys.networkConfig(ORANGE_NETWORK_ID),
     queryFn: () => fetchNetworkConfig(ORANGE_NETWORK_ID),
+    staleTime: 5 * 60 * 1000,
   });
 
   const network = configQuery.data ?? null;
@@ -77,12 +61,21 @@ export function TouristApp() {
 
   const itemsQuery = useQuery({
     enabled: !!network,
-    queryKey: ['tourist', 'items', ORANGE_NETWORK_ID, ORANGE_DOMAIN_ID, itemType],
+    queryKey: queryKeys.browseItems(ORANGE_NETWORK_ID, ORANGE_DOMAIN_ID, {
+      limit: PROFILE_FETCH_LIMIT,
+    }),
     queryFn: ({ signal }) =>
       fetchNetworkItems(
-        { item_network: ORANGE_NETWORK_ID, item_domain: ORANGE_DOMAIN_ID, item_type: itemType, limit: PROFILE_FETCH_LIMIT },
+        {
+          item_network: ORANGE_NETWORK_ID,
+          item_domain: ORANGE_DOMAIN_ID,
+          item_type: itemType,
+          limit: PROFILE_FETCH_LIMIT,
+          cache_ttl_seconds: 90,
+        },
         signal,
       ),
+    staleTime: 90 * 1000,
   });
 
   const enumFields = React.useMemo(
@@ -116,7 +109,7 @@ export function TouristApp() {
   const locationDenied = browser.status === 'error' || !browser.isSupported;
 
   return (
-    <div className="flex h-screen flex-col">
+    <div className="flex h-svh flex-col">
       <TouristTopBar
         search={search}
         onSearchChange={setSearch}
@@ -129,6 +122,10 @@ export function TouristApp() {
         <EnableLocationBanner
           onEnable={() => void browser.request()}
           blocked={geoPermission === 'denied'}
+          title={t('tourist.enable_location_title')}
+          body={t('tourist.enable_location_body')}
+          blockedBody={t('tourist.enable_location_blocked_body')}
+          cta={t('tourist.enable_location_cta')}
         />
       )}
 
