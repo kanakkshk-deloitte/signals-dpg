@@ -129,8 +129,12 @@ export const apiReferenceEnabled: boolean =
 
 export function getCurrentApiBaseUrl(): string {
   const parsedUrl = new URL(api.API_DOMAIN);
+  const isLocalHostDomain =
+    parsedUrl.hostname === 'localhost' ||
+    parsedUrl.hostname === '127.0.0.1' ||
+    parsedUrl.hostname === '::1';
 
-  if (instance.INSTANCE_ENV === 'development' && !parsedUrl.port) {
+  if (instance.INSTANCE_ENV === 'development' && isLocalHostDomain && !parsedUrl.port) {
     parsedUrl.port = String(api.API_PORT);
   }
 

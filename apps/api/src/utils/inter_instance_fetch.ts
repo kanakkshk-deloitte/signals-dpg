@@ -6,6 +6,7 @@ import {
 import { redis } from '@api/db/secondary/redis';
 import { stableStringify } from './stable_stringify';
 import { apiConfig, getCurrentApiBaseUrl } from '@/config';
+import { normalizeInstanceUrl } from '@/utils/action_event_runtime';
 import { buildPeerHeaders } from '@/utils/instance_token';
 import { isServedDomainBinding } from '@/utils/served_domain_guard';
 import {
@@ -34,6 +35,26 @@ type FetchItemsResponseItem = FetchItemsResponse['items'][number];
 
 type FetchMarkersResponse = Awaited<ReturnType<typeof fetchLocalMarkers>>;
 type FetchMarkersResponseMarker = FetchMarkersResponse['markers'][number];
+
+function isLocalInstanceUrl(instanceUrl: string) {
+  return normalizeInstanceUrl(instanceUrl) === normalizeInstanceUrl(getCurrentApiBaseUrl());
+}
+
+function buildPeerTarget(instanceUrl: string, routePath: string): URL {
+  const base = new URL(instanceUrl);
+  const basePath =
+    base.pathname && base.pathname !== '/'
+      ? base.pathname.replace(/\/$/, '')
+      : '';
+  const normalizedRoute = routePath.startsWith('/') ? routePath : `/${routePath}`;
+
+  // Keep configured instance path prefixes (for example /signals-api)
+  // when composing peer API routes.
+  base.pathname = `${basePath}${normalizedRoute}`;
+  base.search = '';
+  base.hash = '';
+  return base;
+}
 
 export function buildPagePlan(
   counts: InstanceCount[],
@@ -544,8 +565,8 @@ export async function getInstanceCount(input: {
   };
 
   const count =
-    input.instanceUrl === getCurrentApiBaseUrl() &&
-    isServedDomainBinding(input.filters.item_network, input.filters.item_domain)
+    isLocalInstanceUrl(input.instanceUrl) &&
+      isServedDomainBinding(input.filters.item_network, input.filters.item_domain)
       ? await countLocalItems(countFilters, input.log)
       : await fetchRemoteCount(input.instanceUrl, countFilters);
 
@@ -560,7 +581,7 @@ async function fetchInstancePage(input: {
   log?: ItemFetchLog;
 }) {
   if (
-    input.instanceUrl === getCurrentApiBaseUrl() &&
+    isLocalInstanceUrl(input.instanceUrl) &&
     isServedDomainBinding(input.filters.item_network, input.filters.item_domain)
   ) {
     return fetchLocalItems(input.filters, input.log);
@@ -573,13 +594,14 @@ async function fetchRemoteCount(
   instanceUrl: string,
   filters: Omit<ItemFetchFilters, 'limit' | 'offset'>
 ) {
-  const target = new URL('/api/v1/network/item/count_local', instanceUrl);
+  const routePath = '/api/v1/network/item/count_local';
+  const target = buildPeerTarget(instanceUrl, routePath);
   const requestBody = JSON.stringify(filters);
   const response = await fetch(target, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      ...buildPeerHeaders(target.pathname, requestBody),
+      ...buildPeerHeaders(routePath, requestBody),
     },
     body: requestBody,
     signal: AbortSignal.timeout(apiConfig.peer_fetch_timeout_ms),
@@ -596,13 +618,14 @@ async function fetchRemoteCount(
 }
 
 async function fetchRemotePage(instanceUrl: string, filters: ItemFetchFilters) {
-  const target = new URL('/api/v1/network/item/fetch_local', instanceUrl);
+  const routePath = '/api/v1/network/item/fetch_local';
+  const target = buildPeerTarget(instanceUrl, routePath);
   const requestBody = JSON.stringify(filters);
   const response = await fetch(target, {
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      ...buildPeerHeaders(target.pathname, requestBody),
+      ...buildPeerHeaders(routePath, requestBody),
     },
     body: requestBody,
     signal: AbortSignal.timeout(apiConfig.peer_fetch_timeout_ms),
@@ -625,7 +648,7 @@ async function fetchInstanceMarkers(input: {
   log?: ItemFetchLog;
 }) {
   if (
-    input.instanceUrl === getCurrentApiBaseUrl() &&
+    isLocalInstanceUrl(input.instanceUrl) &&
     isServedDomainBinding(input.filters.item_network, input.filters.item_domain)
   ) {
     return fetchLocalMarkers(input.filters, input.log);
@@ -635,7 +658,8 @@ async function fetchInstanceMarkers(input: {
 }
 
 async function fetchRemoteMarkers(instanceUrl: string, filters: ItemFetchFilters) {
-  const target = new URL('/api/v1/network/item/markers_local', instanceUrl);
+  const routePath = '/api/v1/network/item/markers_local';
+  const target = buildPeerTarget(instanceUrl, routePath);
   // #394: `filters.text_search.q` (never `.fields` — the peer resolves its
   // OWN non-private field allowlist from its own network config, see
   // fetch_local_markers_handler in routes/v1/network/item/markers.ts) must be
@@ -650,7 +674,7 @@ async function fetchRemoteMarkers(instanceUrl: string, filters: ItemFetchFilters
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      ...buildPeerHeaders(target.pathname, requestBody),
+      ...buildPeerHeaders(routePath, requestBody),
     },
     body: requestBody,
     signal: AbortSignal.timeout(apiConfig.peer_fetch_timeout_ms),
@@ -701,7 +725,7 @@ function bucketGeoForCacheKey(filters: ItemFetchFilters): ItemFetchFilters {
   const radiusBucket =
     radius_meters !== undefined
       ? Math.round(radius_meters / RADIUS_BUCKET_STEP_METERS) *
-        RADIUS_BUCKET_STEP_METERS
+      RADIUS_BUCKET_STEP_METERS
       : RADIUS_BUCKET_STEP_METERS;
   const cellMeters = Math.max(radiusBucket / 2, RADIUS_BUCKET_STEP_METERS);
   const latStepDeg = cellMeters / METERS_PER_DEG_LAT;

@@ -1,4 +1,5 @@
 import { authInstance } from '@/routes/auth/create_auth';
+import { getCurrentApiBaseUrl } from '@/config';
 import { FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
 
 const AuthRoutes: FastifyPluginAsyncZod = async (fastify) => {
@@ -14,7 +15,10 @@ const AuthRoutes: FastifyPluginAsyncZod = async (fastify) => {
       }
 
       try {
-        const url = new URL(request.url, `http://${request.headers.host}`);
+        const basePath = new URL(getCurrentApiBaseUrl()).pathname.replace(/\/$/, '');
+        const requestPath = request.url.startsWith('/') ? request.url : `/${request.url}`;
+        const authPath = `${basePath}${requestPath}`;
+        const url = new URL(authPath, `http://${request.headers.host}`);
         const headers = new Headers();
 
         for (const [key, value] of Object.entries(request.headers)) {

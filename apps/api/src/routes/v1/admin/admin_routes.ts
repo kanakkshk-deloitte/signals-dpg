@@ -5,6 +5,8 @@ import { aggregator_upsert } from './aggregator/upsert.js';
 import { participant } from './participant.js';
 import { participant_read } from './participant_read.js';
 import { participant_decrypt } from './participant_decrypt.js';
+import { participant_items_by_phone } from './participant_items_by_phone.js';
+
 
 /**
  * Mounts /api/v1/admin/*. Every request through this scope passes through:
@@ -22,6 +24,7 @@ export const admin_routes: FastifyPluginAsync = async (app) => {
   await app.register(participant);
   await app.register(participant_read);
   await app.register(participant_decrypt);
+  await app.register(participant_items_by_phone);
 };
 
 export default admin_routes;

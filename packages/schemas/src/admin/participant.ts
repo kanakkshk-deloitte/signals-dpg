@@ -161,8 +161,30 @@ export const GetParticipantResponse = z.object({
   items: z.array(ParticipantItemSnapshot),
 });
 
+/**
+ * Query for GET /api/v1/admin/participant/items/by-phone.
+ *
+ * Looks up person_with_disability profile items by the phone stored inside the
+ * profile payload (`item_state.mobile_number`) after decrypting private state.
+ */
+export const GetParticipantItemsByPhoneRequest = z.object({
+  phone_number: PhoneLookup,
+});
+
+export const GetParticipantItemsByPhoneResponse = z.object({
+  total: z.number().int().min(0),
+  items: z.array(ParticipantItemSnapshot),
+});
+
+
 export type UpsertParticipantRequest = z.infer<typeof UpsertParticipantRequest>;
 export type UpsertParticipantResponse = z.infer<typeof UpsertParticipantResponse>;
 export type ParticipantItemSnapshot = z.infer<typeof ParticipantItemSnapshot>;
 export type GetParticipantRequest = z.infer<typeof GetParticipantRequest>;
 export type GetParticipantResponse = z.infer<typeof GetParticipantResponse>;
+export type GetParticipantItemsByPhoneRequest = z.infer<
+  typeof GetParticipantItemsByPhoneRequest
+>;
+export type GetParticipantItemsByPhoneResponse = z.infer<
+  typeof GetParticipantItemsByPhoneResponse
+>;

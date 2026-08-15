@@ -30,6 +30,23 @@ const DEFAULT_LEAFLET_ATTRIBUTION =
 const DEFAULT_BOUNDARY_PMTILES_URL =
   'https://cdn.jsdelivr.net/npm/@india-boundary-corrector/data@0.2.2/india_boundary_corrections.pmtiles';
 
+function resolveBoundaryPmtilesUrl(): string {
+  const configured = getRuntimeEnv('VITE_INDIA_BOUNDARY_PMTILES_URL')?.toString().trim();
+  if (!configured) return DEFAULT_BOUNDARY_PMTILES_URL;
+
+  // In prefixed deployments the app is served under /signals-ui, but
+  // absolute root-relative asset paths still point at / on the host.
+  // Re-anchor local static paths so they resolve inside the UI prefix.
+  if (typeof window !== 'undefined' && configured.startsWith('/')) {
+    const uiPrefix = '/signals-ui';
+    if (window.location.pathname.startsWith(uiPrefix) && !configured.startsWith(`${uiPrefix}/`)) {
+      return `${uiPrefix}${configured}`;
+    }
+  }
+
+  return configured;
+}
+
 function getLeafletTileConfig() {
   const tileUrl =
     getRuntimeEnv('VITE_LEAFLET_TILE_URL')?.toString().trim() ||
@@ -66,9 +83,7 @@ function CorrectedTileLayer({
   const map = useMap();
 
   React.useEffect(() => {
-    const pmtilesUrl =
-      getRuntimeEnv('VITE_INDIA_BOUNDARY_PMTILES_URL')?.toString().trim() ||
-      DEFAULT_BOUNDARY_PMTILES_URL;
+    const pmtilesUrl = resolveBoundaryPmtilesUrl();
     const layerConfig = /openstreetmap\.org/i.test(url) ? 'osm-carto' : undefined;
     const layer = L.tileLayer.indiaBoundaryCorrected(url, {
       attribution,
@@ -443,6 +458,8 @@ export function LeafletMapProvider({
   onViewportChange,
 }: MapProviderProps) {
   const { t } = useTranslation();
+  const { tileUrl, attribution, subdomains } = getLeafletTileConfig();
+
   return (
     <MapContainer
       center={center}
@@ -450,9 +467,10 @@ export function LeafletMapProvider({
       className="h-full w-full rounded-lg"
       scrollWheelZoom
     >
-      <TileLayer
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+      <CorrectedTileLayer
+        url={tileUrl}
+        attribution={attribution}
+        subdomains={subdomains}
       />
       {/*
        * In viewport-markers mode (onViewportChange provided) the query itself

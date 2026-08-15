@@ -8,10 +8,54 @@
       "description": "People looking for jobs.",
       "minimum_cache_ttl_seconds": 300,
       "status_rules": [
-        { "status": "new",      "label": "New",      "description": "Joined within the last 7 days",            "when": { "item_age_days": { "lte": 7 } } },
-        { "status": "active",   "label": "Active",   "description": "Applied to a job in the last 30 days",     "when": { "days_since_last": { "buckets": ["create", "accept"], "lte": 30 } } },
-        { "status": "at_risk",  "label": "At Risk",  "description": "No applications for 30–90 days",           "when": { "days_since_last": { "buckets": ["create", "accept", "reject"], "between": [31, 90] } } },
-        { "status": "inactive", "label": "Inactive", "description": "No activity 90+ days",                     "when": "default" }
+        {
+          "status": "new",
+          "label": "New",
+          "description": "Joined within the last 7 days",
+          "when": {
+            "item_age_days": {
+              "lte": 7
+            }
+          }
+        },
+        {
+          "status": "active",
+          "label": "Active",
+          "description": "Applied to a job in the last 30 days",
+          "when": {
+            "days_since_last": {
+              "buckets": [
+                "create",
+                "accept"
+              ],
+              "lte": 30
+            }
+          }
+        },
+        {
+          "status": "at_risk",
+          "label": "At Risk",
+          "description": "No applications for 30–90 days",
+          "when": {
+            "days_since_last": {
+              "buckets": [
+                "create",
+                "accept",
+                "reject"
+              ],
+              "between": [
+                31,
+                90
+              ]
+            }
+          }
+        },
+        {
+          "status": "inactive",
+          "label": "Inactive",
+          "description": "No activity 90+ days",
+          "when": "default"
+        }
       ],
       "item_schemas": {
         "profile_1.0": {
@@ -23,7 +67,13 @@
             "sections": [
               {
                 "title": "Personal Details",
-                "fields": ["name", "age", "gender", "phone", "location"]
+                "fields": [
+                  "name",
+                  "age",
+                  "gender",
+                  "phone",
+                  "location"
+                ]
               },
               {
                 "title": "Work Experience & Preferences",
@@ -131,9 +181,10 @@
                 "15+ Years",
                 "Other"
               ],
-               "x-show-if": {
+              "x-show-if": {
                 "workExperience": [
-                  "Worked before", "Returning after a break"
+                  "Worked before",
+                  "Returning after a break"
                 ]
               }
             },
@@ -693,7 +744,13 @@
               "title": "College / Institute Name",
               "description": "Please specify your college or institute name",
               "placeholder": "Please specify your college or institute name",
-              "x-reference-source": { "source": "colleges", "subtitle": ["district", "state"] }
+              "x-reference-source": {
+                "source": "colleges",
+                "subtitle": [
+                  "district",
+                  "state"
+                ]
+              }
             },
             "nameOfLastRoleHeld": {
               "type": "string",
@@ -772,18 +829,41 @@
       "card": {
         "title_field": "name",
         "avatar_from": "name",
-        "default_fields": ["location", "natureOfJobsInterestedIn", "educationCategory", "workExperience"]
+        "default_fields": [
+          "location",
+          "natureOfJobsInterestedIn",
+          "educationCategory",
+          "workExperience"
+        ]
       },
       "dashboard_tiles": {
         "profile": [
-          { "field": "total_items", "label": "Profiles Registered" },
-          { "field": "complete_profiles", "label": "Profiles Complete" },
-          { "field": "has_applications", "label": "Applied for Jobs" }
+          {
+            "field": "total_items",
+            "label": "Profiles Registered"
+          },
+          {
+            "field": "complete_profiles",
+            "label": "Profiles Complete"
+          },
+          {
+            "field": "has_applications",
+            "label": "Applied for Jobs"
+          }
         ],
         "user": [
-          { "field": "total_users", "label": "Total Job Seekers" },
-          { "field": "avg_items_per_user", "label": "Avg Profiles per User" },
-          { "field": "avg_actions_per_user", "label": "Avg Actions per User" }
+          {
+            "field": "total_users",
+            "label": "Total Job Seekers"
+          },
+          {
+            "field": "avg_items_per_user",
+            "label": "Avg Profiles per User"
+          },
+          {
+            "field": "avg_actions_per_user",
+            "label": "Avg Actions per User"
+          }
         ]
       }
     },
@@ -791,10 +871,77 @@
       "description": "Employers and recruiters posting jobs.",
       "minimum_cache_ttl_seconds": 300,
       "status_rules": [
-        { "status": "new",      "label": "New",      "description": "Job posted within the last 7 days",                                "when": { "item_age_days": { "lte": 7 } } },
-        { "status": "active",   "label": "Active",   "description": "Received applications and shortlisted or rejected in last 30 days", "when": { "all": [ { "count": { "buckets": ["create"], "gt": 0 } }, { "days_since_last": { "buckets": ["accept", "reject"], "lte": 30 } } ] } },
-        { "status": "at_risk",  "label": "At Risk",  "description": "No applications shortlisted or rejected for 30–90 days",            "when": { "all": [ { "count": { "buckets": ["create"], "gt": 0 } }, { "days_since_last": { "buckets": ["accept", "reject"], "between": [31, 90] } } ] } },
-        { "status": "inactive", "label": "Inactive", "description": "No activity for 90+ days",                                          "when": "default" }
+        {
+          "status": "new",
+          "label": "New",
+          "description": "Job posted within the last 7 days",
+          "when": {
+            "item_age_days": {
+              "lte": 7
+            }
+          }
+        },
+        {
+          "status": "active",
+          "label": "Active",
+          "description": "Received applications and shortlisted or rejected in last 30 days",
+          "when": {
+            "all": [
+              {
+                "count": {
+                  "buckets": [
+                    "create"
+                  ],
+                  "gt": 0
+                }
+              },
+              {
+                "days_since_last": {
+                  "buckets": [
+                    "accept",
+                    "reject"
+                  ],
+                  "lte": 30
+                }
+              }
+            ]
+          }
+        },
+        {
+          "status": "at_risk",
+          "label": "At Risk",
+          "description": "No applications shortlisted or rejected for 30–90 days",
+          "when": {
+            "all": [
+              {
+                "count": {
+                  "buckets": [
+                    "create"
+                  ],
+                  "gt": 0
+                }
+              },
+              {
+                "days_since_last": {
+                  "buckets": [
+                    "accept",
+                    "reject"
+                  ],
+                  "between": [
+                    31,
+                    90
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "status": "inactive",
+          "label": "Inactive",
+          "description": "No activity for 90+ days",
+          "when": "default"
+        }
       ],
       "item_schemas": {
         "job_posting_1.0": {
@@ -807,15 +954,33 @@
             "sections": [
               {
                 "title": "Job Details",
-                "fields": ["jobProviderName", "jobProviderLocation", "role", "title", "positions", "natureOfJob"]
+                "fields": [
+                  "jobProviderName",
+                  "jobProviderLocation",
+                  "role",
+                  "title",
+                  "positions",
+                  "natureOfJob"
+                ]
               },
               {
                 "title": "Hiring Contact",
-                "fields": ["hiringManagerName", "hiringManagerPhoneNumber", "hiringManagerEmail"]
+                "fields": [
+                  "hiringManagerName",
+                  "hiringManagerPhoneNumber",
+                  "hiringManagerEmail"
+                ]
               },
               {
                 "title": "Compensation",
-                "fields": ["stipendMin", "stipendMax", "salaryMin", "salaryMax", "taskRateMin", "taskRateMax"]
+                "fields": [
+                  "stipendMin",
+                  "stipendMax",
+                  "salaryMin",
+                  "salaryMax",
+                  "taskRateMin",
+                  "taskRateMax"
+                ]
               },
               {
                 "title": "Candidate Requirements",
@@ -964,7 +1129,7 @@
                 "Other Vocational Training",
                 "Certifications",
                 "Learned Informally"
-            ]
+              ]
             },
             "workExperienceYears": {
               "type": "string",
@@ -988,7 +1153,11 @@
               "title": "Name of last role held",
               "description": "Enter the names of roles the candidate should have last held",
               "placeholder": "Enter the names of roles the candidate should have last held",
-              "x-show-if": { "candidateExperienceType": ["Worked before"] },
+              "x-show-if": {
+                "candidateExperienceType": [
+                  "Worked before"
+                ]
+              },
               "vectorize": true
             },
             "title": {
@@ -1306,18 +1475,41 @@
       "card": {
         "title_field": "jobProviderName",
         "avatar_from": "jobProviderName",
-        "default_fields": ["role", "jobProviderLocation", "natureOfJob", "positions"]
+        "default_fields": [
+          "role",
+          "jobProviderLocation",
+          "natureOfJob",
+          "positions"
+        ]
       },
       "dashboard_tiles": {
         "profile": [
-          { "field": "total_items", "label": "Postings Registered" },
-          { "field": "complete_profiles", "label": "Postings Complete" },
-          { "field": "has_applications", "label": "Received Applications" }
+          {
+            "field": "total_items",
+            "label": "Postings Registered"
+          },
+          {
+            "field": "complete_profiles",
+            "label": "Postings Complete"
+          },
+          {
+            "field": "has_applications",
+            "label": "Received Applications"
+          }
         ],
         "user": [
-          { "field": "total_users", "label": "Total Employers" },
-          { "field": "avg_items_per_user", "label": "Avg Profiles per User" },
-          { "field": "avg_actions_per_user", "label": "Avg Actions per User" }
+          {
+            "field": "total_users",
+            "label": "Total Employers"
+          },
+          {
+            "field": "avg_items_per_user",
+            "label": "Avg Profiles per User"
+          },
+          {
+            "field": "avg_actions_per_user",
+            "label": "Avg Actions per User"
+          }
         ]
       }
     }
@@ -1325,13 +1517,13 @@
   "instances": [
     {
       "instance_name": "Blue Dot Seeker Local",
-      "instance_url": "http://localhost:2742",
+      "instance_url": "https://bluedot.dpxdemo.com/signals-api",
       "custom_item_schema_urls": {},
       "domain_id": "seeker"
     },
     {
       "instance_name": "Blue Dot Provider Local",
-      "instance_url": "http://localhost:2742",
+      "instance_url": "https://bluedot.dpxdemo.com/signals-api",
       "custom_item_schema_urls": {},
       "domain_id": "provider"
     }
@@ -1379,12 +1571,23 @@
             }
           },
           "metric_categories": {
-            "create": ["created", "submitted"],
-            "accept": ["accepted"],
-            "reject": ["rejected"],
-            "cancel": ["cancelled"]
+            "create": [
+              "created",
+              "submitted"
+            ],
+            "accept": [
+              "accepted"
+            ],
+            "reject": [
+              "rejected"
+            ],
+            "cancel": [
+              "cancelled"
+            ]
           },
-          "reveals_pii_on_status": ["accepted"]
+          "reveals_pii_on_status": [
+            "accepted"
+          ]
         }
       ]
     },
@@ -1396,23 +1599,38 @@
           "from_domain": "provider",
           "to_network": "blue_dot",
           "to_domain": "provider",
-          "requirement_schema": { "type": "object", "properties": {} },
+          "requirement_schema": {
+            "type": "object",
+            "properties": {}
+          },
           "event_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "Provider To Provider Connect Event",
             "type": "object",
             "additionalProperties": false,
-            "required": ["status", "remark"],
+            "required": [
+              "status",
+              "remark"
+            ],
             "properties": {
               "status": {
                 "type": "string",
-                "enum": ["created", "accepted", "rejected", "cancelled"]
+                "enum": [
+                  "created",
+                  "accepted",
+                  "rejected",
+                  "cancelled"
+                ]
               },
-              "remark": { "type": "string" }
+              "remark": {
+                "type": "string"
+              }
             }
           },
           "metric_categories": null,
-          "reveals_pii_on_status": ["accepted"]
+          "reveals_pii_on_status": [
+            "accepted"
+          ]
         },
         {
           "from_network": "blue_dot",
@@ -1477,12 +1695,23 @@
             }
           },
           "metric_categories": {
-            "create": ["created", "invited"],
-            "accept": ["accepted"],
-            "reject": ["rejected"],
-            "cancel": ["cancelled"]
+            "create": [
+              "created",
+              "invited"
+            ],
+            "accept": [
+              "accepted"
+            ],
+            "reject": [
+              "rejected"
+            ],
+            "cancel": [
+              "cancelled"
+            ]
           },
-          "reveals_pii_on_status": ["accepted"]
+          "reveals_pii_on_status": [
+            "accepted"
+          ]
         }
       ]
     }

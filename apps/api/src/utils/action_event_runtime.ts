@@ -47,6 +47,22 @@ export function normalizeInstanceUrl(url: string) {
   return parsedUrl.toString().replace(/\/$/, '');
 }
 
+export function buildInstanceRouteUrl(instanceUrl: string, routePath: string): URL {
+  const base = new URL(instanceUrl);
+  const basePath =
+    base.pathname && base.pathname !== '/'
+      ? base.pathname.replace(/\/$/, '')
+      : '';
+  const normalizedRoute = routePath.startsWith('/') ? routePath : `/${routePath}`;
+
+  // Keep configured API path prefixes (for example /signals-api)
+  // when resolving peer routes.
+  base.pathname = `${basePath}${normalizedRoute}`;
+  base.search = '';
+  base.hash = '';
+  return base;
+}
+
 function decodeSnapshot<
   T extends { item_state: unknown; item_private_state: string },
 >(row: T) {
@@ -110,7 +126,7 @@ export async function fetchLocalItemSnapshot(
   if (
     localAliasResult &&
     normalizeInstanceUrl(localAliasResult.item_instance_url) ===
-      normalizedCurrentInstanceUrl
+    normalizedCurrentInstanceUrl
   ) {
     return decodeSnapshot(localAliasResult);
   }

@@ -12,6 +12,7 @@ import type { FastifyReply, FastifyRequest } from 'fastify';
 import { auth_middleware_if_enabled } from '@api/plugins/auth/auth_middleware';
 import { apiConfig, getCurrentApiBaseUrl } from '@/config';
 import {
+  buildInstanceRouteUrl,
   buildNetworkActionTargetItem,
   fetchLocalItemSnapshot,
   normalizeInstanceUrl,
@@ -232,7 +233,7 @@ async function runPerformActions(
           (instance) =>
             instance.domain_id === targetItem.item_domain &&
             normalizeInstanceUrl(instance.instance_url) ===
-              normalizeInstanceUrl(targetItem.item_instance_url),
+            normalizeInstanceUrl(targetItem.item_instance_url),
         );
 
         if (!allowedInstance) {
@@ -303,8 +304,14 @@ async function runPerformActions(
       let responseOk: boolean;
       let responseBody: Record<string, unknown>;
       try {
+        const relayBaseUrl =
+          normalizeInstanceUrl(targetItem.item_instance_url) ===
+            normalizeInstanceUrl(getCurrentApiBaseUrl())
+            ? `http://127.0.0.1:${apiConfig.port}`
+            : targetItem.item_instance_url;
+
         const response = await fetch(
-          new URL('/api/v1/network/action/perform', targetItem.item_instance_url),
+          buildInstanceRouteUrl(relayBaseUrl, '/api/v1/network/action/perform'),
           {
             method: 'POST',
             headers: { 'content-type': 'application/json' },
