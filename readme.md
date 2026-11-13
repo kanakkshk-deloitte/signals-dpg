@@ -26,7 +26,7 @@ This repository contains the current DPG API runtime, schema-driven UI app, exam
 - `packages/config`: env parsing, network config loading, and consent config loading
 - `packages/database`: database helpers and partitioning
 - `packages/schemas`: API request schemas and network schema parsing
-- `packages/auth`: auth integration
+- `packages/auth`: **no longer auth** — #517 retired better-auth and Keycloak is the only provider, so what remains here is the PII crypto (`pii_crypto`/`pii_key`) backing item encryption and location jitter
 - `packages/notification`: notification service client for OTP and outbound messages
 - `packages/match_score`: match score service client for item comparison
 
@@ -43,7 +43,7 @@ Main route groups:
 - `/api/v1/admin` — service-to-service admin surface (requires `x-acting-org-id`)
 - `/api/v1/aggregator`
 - `/api/v1/auth` — public, unauthenticated auth-flow config (`GET /api/v1/auth/config`) and the U18 age precheck (`POST /api/v1/auth/u18-precheck`)
-- `/api/v1/support` — authenticated contact-support form (`POST /api/v1/support`)
+- `/api/v1/support` — authenticated contact-support form (`POST /api/v1/support`, with optional image/video/audio attachments) plus `GET /api/v1/support/config` for the client-visible limits
 - `GET /health/live` and `GET /health/ready` — Kubernetes probes at the **root** path (not `/api/v1`); `live` is pure process-liveness, `ready` actively probes Postgres + Redis
 
 Important behavior:
@@ -57,7 +57,7 @@ Important behavior:
 - `GET`/`POST /api/v1/consent/*` reads and records consent; the accepted document **version is always derived server-side** from the loaded `consent.json`, never trusted from the client
 - `POST /api/v1/admin/participant/decrypt` returns decrypted participant profile `item_state` for owned items (aggregator scoped to items it onboarded; `network_service` scoped to its served networks)
 - `GET /api/v1/auth/config` returns `{ selfSignupAllowed, loginChannels }` derived from server env — the UI uses it to render the login/signup flow; server env stays the single source of truth
-- `POST /api/v1/support` submits an in-app contact-support message (requires an authenticated user); it emails `SUPPORT_EMAIL` via the notification service, and returns `503 SUPPORT_NOT_CONFIGURED` when the recipient or notification client is unset
+- `POST /api/v1/support` submits an in-app contact-support message (requires an authenticated user); it emails `SUPPORT_EMAIL` via the notification service, and returns `503 SUPPORT_NOT_CONFIGURED` when the recipient or notification client is unset. It accepts optional `attachments` (base64 image/video/audio, server-side MIME allowlist + filename sanitisation, up to `SUPPORT_ATTACHMENT_MAX_FILES` files totalling `SUPPORT_ATTACHMENT_MAX_TOTAL_BYTES`), and is rate-limited per user (`429 SUPPORT_RATE_LIMITED`). `GET /api/v1/support/config` returns `{enabled, maxTotalBytes, maxFiles, allowedTypes, allowedExtensions}` so the form self-configures
 - `GET /api/v1/network/item/fetch` fans out to peer instances via the `*_local` peer routes (`item/count_local`, `item/fetch_local`), which require an HMAC instance token (see [Inter-instance peer auth](#inter-instance-peer-auth))
 - A profile is only network-discoverable once it is **live**: required fields must be complete **and** `profile_creation` consent accepted. Accepting profile consent runs `promoteItemOnProfileConsent`, which re-classifies a `draft` item to `live` (see [Consent](#consent))
 - `POST /api/v1/admin/participant` onboards/updates a participant from an integrating DPG (always-create profiles; per-user cap via `MAX_PROFILES_PER_USER`); it accepts a `compliance` consent array + `age`, records the ledger, and promotes the profile to `live` when the U18/consent gate passes. Under-18 onboarding is rejected (`400 U18_NOT_ALLOWED`)
@@ -81,8 +81,11 @@ Current UI responsibilities:
 - browse items by domain
 - create and edit schema-driven profiles
 - render public item cards
+- share a profile via a public link and open it on a public profile view page
+- filter and sort **My Actions** per profile (PII-aware, server-enforced)
+- first-time-login redirect into an in-shell profile form with inline consent
 - trigger action flows
-- show map-based views through a pluggable map provider layer
+- show map-based views through a pluggable map provider layer (follows the app's dark/light theme)
 
 UI runtime envs:
 
@@ -142,11 +145,24 @@ chars) and is **not** yet in `.env.example` — set it before starting the API:
 INSTANCE_SHARED_SECRET="<shared 32+ char secret>"
 PEER_AUTH_MODE="permissive"      # permissive (default) | enforced
 
-# Self-signup + login. gated (default): no self-service signup via the public
-# OTP flow — onboard participants via POST /api/v1/admin/participant.
-# allowed: opens public self-registration.
-SELF_SIGNUP_MODE="gated"
+# Self-signup + login. allowed: public self-registration (local default).
+# gated (code default when unset): no self-service signup via the public OTP
+# flow — onboard participants via POST /api/v1/admin/participant.
+SELF_SIGNUP_MODE="allowed"
 LOGIN_CHANNELS="phone,email"     # ordered subset of phone,email
+
+# DLT-approved provider template id for the guardian/U18 OTP SMS; defaults to
+# "login_otp". Set alongside the NOTIFICATION_SERVICE_* creds when
+# CREATE_TEST_OTP is off. (The login OTP is minted and sent by Keycloak.) (Distinct from the per-event lifecycle SMS templates,
+# which live in apps/api/src/notifications/sms/*.properties.)
+SMS_TEMPLATE_ID=""
+
+# Bulk engagement export (POST /action/export). Optional; defaults shown.
+# Max rows per export (above it: 413), IANA zone for export timestamps, and
+# exports one user may run per hour (above it: 429 EXPORT_RATE_LIMITED).
+# EXPORT_MAX_ROWS=10000
+# EXPORT_TIMEZONE="Asia/Kolkata"
+# EXPORT_RATE_LIMIT_PER_HOUR=20
 
 # Max profiles a single user may hold (default 5). A network.json domain's
 # max_profiles_per_user overrides this per-domain.
@@ -162,10 +178,36 @@ PII_LOCATION_JITTER_MAX_METERS=250
 # Recipient for the in-app "Contact support" form; unset → 503 + button hidden.
 SUPPORT_EMAIL="hello@bluedotseconomy.org"
 
+# Contact-support attachment budget (image/video/audio). Enforced server-side on
+# the DECODED bytes; the per-route body limit is derived from these. Callers must
+# stay at or below the notification-service's NOTIFY_ATTACHMENT_* caps.
+SUPPORT_ATTACHMENT_MAX_FILES=3
+SUPPORT_ATTACHMENT_MAX_TOTAL_BYTES=5242880
+
 # Support/grievance address rendered into the CONSENT copy (T&C/Privacy/
 # Grievances) in place of the __SUPPORT_EMAIL__ placeholder the consent.json
 # files ship. Distinct from SUPPORT_EMAIL above (the contact-form recipient).
 CONSENT_SUPPORT_EMAIL="hello@bluedotseconomy.org"
+
+# Optional override of the bundled email copy (subjects/bodies/CTA labels for
+# every email the API sends). Unset → bundled defaults; per-network/brand copy
+# also layers from a messages.properties beside network.json in local mode.
+# See docs/operations/email-copy-overrides.md.
+EMAIL_MESSAGES_PATH=""
+
+# Host -> "network/domain" map for a split-UI deployment, identical to the
+# string the UI ingress uses. Inverted at boot so an email CTA points the
+# recipient at their own portal instead of the combined front-door. Empty =
+# single-host install (FRONTEND_BASE_URL is the only source). #569/#602 — see
+# docs/operations/local-split-ui.md.
+UI_HOST_BINDINGS=""
+
+# Auth provider. `keycloak` is the only value — #517 removed better-auth, and a
+# stale `betterauth` here fails at startup with an actionable message rather than
+# being silently coerced. Flipping an existing instance is migration-gated: every
+# user must already exist in the realm (`pnpm keycloak:migrate:users --apply`,
+# then `--reconcile` to 1:1), because nothing creates a missing identity on the fly.
+AUTH_PROVIDER="keycloak"
 ```
 
 For remote network configs, use:
@@ -180,26 +222,36 @@ Or use `SCHEMA_REGISTRY_URL` with either:
 - one base URL
 - comma-separated `network=url` mappings
 
-### 3. Start PostgreSQL and Redis
+### 3. Start PostgreSQL, Redis and Keycloak
 
 ```bash
 docker compose up -d db redis
 ```
 
-Optional (analytics UI):
+Keycloak is **required** — it is the only login provider (#517), and the API
+refuses to start without `KEYCLOAK_BASE_URL`. The root compose file does not
+define it; bring up Keycloak and Mailpit from the `local-setup/` compose
+(`local-setup/.env` must exist — copy it from `local-setup/.env.example`):
 
 ```bash
-docker compose up -d db redis metabase
+cd local-setup
+docker compose --profile keycloak up -d keycloak mailpit keycloak-init
+cd ..
 ```
 
-Metabase runs at `http://localhost:3030` by default (`METABASE_PORT` in `.env`).
+Keycloak serves on http://localhost:8080 (realm `bluedots`). The login OTP is
+minted by Keycloak, not the API: email codes land in Mailpit at
+http://localhost:8025, and phone codes are logged by the Keycloak container
+(`docker compose logs keycloak | grep -i otp` from `local-setup/`).
+`CREATE_TEST_OTP` does not affect login; it only fixes the guardian/U18 OTP to
+`000000`.
 
 ### 4. Set up the database (first time only)
 
 ```bash
-pnpm db:push:api           # apply better-auth + Drizzle schema (may prompt to confirm)
+pnpm db:push:api           # apply the Drizzle schema (may prompt to confirm)
 pnpm db:init:api           # create partitioned items / actions / events tables
-pnpm db:seed:services:api  # mint the service user + apikey (idempotent)
+pnpm db:seed:services:api  # service users: aggregator-dpg org, signals-search org + apikey (idempotent)
 ```
 
 See `SETUP.md` for the full walkthrough and the aggregator integration steps.
@@ -210,25 +262,11 @@ See `SETUP.md` for the full walkthrough and the aggregator integration steps.
 pnpm dev:api
 ```
 
-### 6. Start Match Score Service (Amazon Bedrock)
-
-```bash
-pnpm docker:match-score
-```
-
-The API calls this service through `DPG_SCORING_ENDPOINT` (default `http://127.0.0.1:5103`).
-
 To run the API itself as a container against the Compose PostgreSQL and Redis services:
 
 ```bash
 docker compose up -d db redis
 DOCKER_NETWORK=dpg_internal pnpm docker:api
-```
-
-To run the match-score service as a container:
-
-```bash
-DOCKER_NETWORK=dpg_internal pnpm docker:match-score
 ```
 
 To run the UI app:
@@ -250,16 +288,11 @@ VITE_MAP_PROVIDER="leaflet"
 - `pnpm build:api`
 - `pnpm preview:api`
 - `pnpm start:api`
-- `pnpm dev:match-score` — docker-only alias to `pnpm docker:match-score`
-- `pnpm build:match-score`
-- `pnpm preview:match-score` — docker-only alias to `pnpm docker:match-score`
-- `pnpm start:match-score` — docker-only alias to `pnpm docker:match-score`
-- `pnpm docker:match-score`
 - `pnpm db:generate:api`
 - `pnpm db:migrate:api`
 - `pnpm db:push:api`
 - `pnpm db:init:api` — create partitioned items / actions / events tables
-- `pnpm db:seed:services:api` — mint the service user + apikey
+- `pnpm db:seed:services:api` — seed the service users (aggregator-dpg org, signals-search org + apikey)
 - `pnpm db:seed:purple_dot:api` — seed purple_dot sample data
 - `pnpm db:backfill:consent:api` — one-off deploy backfill for the consent-gated discoverability change (#275); re-classifies existing profiles against the consent gate
 - `pnpm db:studio:api`
@@ -336,6 +369,12 @@ Consent now gates **discoverability**: a profile becomes network-visible
 used on write (with consent now true) and flips a `draft` item to `live`
 (`paused` is sticky; `live` is unchanged). A one-off deploy backfill,
 `pnpm db:backfill:consent:api`, re-classifies existing profiles against this gate.
+
+Which gates a profile must clear to go `live` is **configurable per domain** via
+`go_live_required` in `network.json` (`schema_required`, `consent_required`
+and/or `owner_required`; default `schema_required`). A `guardian_consent_required`
+domain must keep `consent_required` in the list — config that dropped it would
+silently disable the U18 age control, so it is rejected at load.
 
 **U18 guardian gate.** On domains where `guardianConsentRequired` is true, a
 minor (`user.age <= 18` — an age snapshot captured at registration, #331)

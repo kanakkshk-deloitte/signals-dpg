@@ -1,4 +1,4 @@
-import { type FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
+import { type FastifyPluginCallbackZod } from 'fastify-type-provider-zod';
 import z, {
   ItemResponseSchema,
   UpdateItemBodySchema,
@@ -19,7 +19,9 @@ type UpdateItemRequest = FastifyRequest<{
   Body: z.infer<typeof UpdateItemBodySchema>;
 }>;
 
-export const update_item: FastifyPluginAsyncZod = async function (fastify) {
+// Callback-style: registering a route is synchronous, so there is nothing to
+// await (an async plugin with no await is Sonar S7503).
+export const update_item: FastifyPluginCallbackZod = function (fastify, _opts, done) {
   fastify.route({
     method: 'PATCH',
     url: '/:itemId',
@@ -36,6 +38,7 @@ export const update_item: FastifyPluginAsyncZod = async function (fastify) {
     },
     handler: update_item_handler,
   });
+  done();
 };
 
 export const update_item_handler = async (
@@ -75,6 +78,23 @@ export const update_item_handler = async (
       (err) => request.log.warn({ err }, 'cache invalidation after update failed'),
     );
 
+    // Owner-facing update email. Fire-and-forget after commit.
+    // Lazy-imported to keep the notification chain out of the static graph.
+    void import('@/notifications/notify_item_lifecycle')
+      .then(({ dispatchItemLifecycleNotification }) =>
+        dispatchItemLifecycleNotification(
+          {
+            op: 'update',
+            ownerId: updated.created_by,
+            itemId: updated.item_id,
+            domain: updated.item_domain,
+            network: updated.item_network,
+          },
+          request.log,
+        ),
+      )
+      .catch((err) => request.log.warn({ err }, 'item-lifecycle notify (update) failed'));
+
     // Surface real (decrypted) private values to the owner.
     const { mergedState } = decryptItemPrivate({
       item_state: updated.item_state as Record<string, unknown>,
@@ -87,7 +107,10 @@ export const update_item_handler = async (
     });
   } catch (err) {
     if (err instanceof ItemServiceError) {
+      // `details` (e.g. INVALID_ITEM_STATE's per-field `fields`) spread first so
+      // it can never override the error code or message — as create does.
       return reply.code(err.statusCode).send({
+        ...err.details,
         error: err.errorCode,
         message: err.message,
       });

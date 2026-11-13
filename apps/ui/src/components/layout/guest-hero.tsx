@@ -8,9 +8,8 @@ export function GuestHero() {
   const { theme, themeId } = useNetworkTheme();
   const { t } = useTranslation();
 
-  // Banner copy is localizable per network. Keys are network-scoped
-  // (`hero.<networkId>.*`); the theme strings are the English fallback, so
-  // networks without translations keep their own copy unchanged.
+  // Network-scoped keys (`hero.<networkId>.*`), with the theme strings as the
+  // English fallback.
   const portalLabel = t(`hero.${themeId}.portal_label`, { defaultValue: theme.portalLabel });
   const taglineLead = t(`hero.${themeId}.tagline_lead`, { defaultValue: theme.tagline.lead });
   const taglineHighlight = t(`hero.${themeId}.tagline_highlight`, {
@@ -22,7 +21,7 @@ export function GuestHero() {
   const subline = t(`hero.${themeId}.subline`, { defaultValue: theme.subline });
 
   return (
-    <div className="-mx-4 mb-4 sm:-mx-6">
+    <div data-tour="guest-hero" className="-mx-4 mb-4 sm:-mx-6">
       <div className="relative overflow-hidden bg-brand-hero shadow-lg sm:mx-4 sm:rounded-xl lg:mx-6">
         {/* Constellation — faint backdrop; compact banner doesn't need full cover */}
         <div className="pointer-events-none absolute inset-0 opacity-[0.18]">

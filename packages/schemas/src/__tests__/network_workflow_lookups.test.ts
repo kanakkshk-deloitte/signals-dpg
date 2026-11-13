@@ -1,0 +1,602 @@
+import { describe, it, expect } from 'vitest';
+import {
+  parseNetworkConfigDocument,
+  getActionInteraction,
+  getDomainItemSchema,
+  getDomainItemTypes,
+  getDomainMinimumCacheTtlSeconds,
+  getInstanceCustomItemSchemaUrl,
+  validateAgainstJsonSchema,
+  JsonSchemaValidationError,
+} from '../network_workflow';
+
+const defaultTail = [{ status: 'new', when: 'default' }];
+
+const profileSchema = {
+  type: 'object',
+  properties: {
+    full_name: { type: 'string' },
+    city: { type: 'string' },
+  },
+  required: ['full_name'],
+  additionalProperties: false,
+};
+
+const config = parseNetworkConfigDocument({
+  id: 'yellow_dot',
+  domains: [
+    {
+      id: 'student',
+      item_schemas: { 'profile_1.0': profileSchema, 'resume_1.0': { type: 'object' } },
+      status_rules: defaultTail,
+    },
+    {
+      id: 'college',
+      minimum_cache_ttl_seconds: 900,
+      default_item_schemas: { 'profile_1.0': { type: 'object', title: 'default' } },
+      item_schemas: { 'profile_1.0': { type: 'object', title: 'override' } },
+      status_rules: defaultTail,
+    },
+  ],
+  instances: [
+    {
+      domain_id: 'student',
+      instance_url: 'https://student.example.com',
+      schema_url: 'https://schemas.example.com/student.json',
+      custom_item_schema_urls: { 'resume_1.0': 'https://schemas.example.com/resume.json' },
+    },
+    { domain_id: 'college', instance_url: 'https://college.example.com' },
+  ],
+  actions: {
+    apply: {
+      interactions: [
+        {
+          from_domain: 'student',
+          from_items: ['profile_1.0'],
+          to_domain: 'college',
+          requirement_schema: { type: 'object' },
+        },
+        {
+          from_network: 'blue_dot',
+          from_domain: 'seeker',
+          to_domain: 'college',
+          requirement_schema: { type: 'object', title: 'cross-network' },
+        },
+      ],
+    },
+  },
+});
+
+describe('getActionInteraction', () => {
+  it('resolves an interaction, defaulting omitted networks to the config id', () => {
+    const interaction = getActionInteraction(config, {
+      actionType: 'apply',
+      fromNetwork: 'yellow_dot',
+      fromDomain: 'student',
+      fromItemType: 'profile_1.0',
+      toNetwork: 'yellow_dot',
+      toDomain: 'college',
+    });
+    expect(interaction.from_items).toEqual(['profile_1.0']);
+  });
+
+  it('honours an explicit from_network instead of the config id', () => {
+    const interaction = getActionInteraction(config, {
+      actionType: 'apply',
+      fromNetwork: 'blue_dot',
+      fromDomain: 'seeker',
+      toNetwork: 'yellow_dot',
+      toDomain: 'college',
+    });
+    expect(interaction.requirement_schema.title).toBe('cross-network');
+  });
+
+  it('throws when the action type is not declared on the network', () => {
+    expect(() =>
+      getActionInteraction(config, {
+        actionType: 'endorse',
+        fromNetwork: 'yellow_dot',
+        fromDomain: 'student',
+        toNetwork: 'yellow_dot',
+        toDomain: 'college',
+      }),
+    ).toThrow('Action "endorse" is not defined for network "yellow_dot".');
+  });
+
+  it('throws when no interaction matches the direction', () => {
+    expect(() =>
+      getActionInteraction(config, {
+        actionType: 'apply',
+        fromNetwork: 'yellow_dot',
+        fromDomain: 'college',
+        toNetwork: 'yellow_dot',
+        toDomain: 'student',
+      }),
+    ).toThrow(
+      'Action "apply" is not allowed from "yellow_dot/college" to "yellow_dot/student".',
+    );
+  });
+
+  it('rejects a from_item_type outside the interaction allowlist and names it in the error', () => {
+    expect(() =>
+      getActionInteraction(config, {
+        actionType: 'apply',
+        fromNetwork: 'yellow_dot',
+        fromDomain: 'student',
+        fromItemType: 'resume_1.0',
+        toNetwork: 'yellow_dot',
+        toDomain: 'college',
+        toItemType: 'profile_1.0',
+      }),
+    ).toThrow(
+      'from "yellow_dot/student/resume_1.0" to "yellow_dot/college/profile_1.0"',
+    );
+  });
+
+  it('treats an empty allowlist as "any item type" on that side', () => {
+    // to_items is empty on the student→college interaction, so any toItemType matches.
+    const interaction = getActionInteraction(config, {
+      actionType: 'apply',
+      fromNetwork: 'yellow_dot',
+      fromDomain: 'student',
+      fromItemType: 'profile_1.0',
+      toNetwork: 'yellow_dot',
+      toDomain: 'college',
+      toItemType: 'anything_9.9',
+    });
+    expect(interaction.to_domain).toBe('college');
+  });
+
+  it('rejects an absent item type when the interaction declares a from_items allowlist', () => {
+    // from_items: ['profile_1.0'] is non-empty, so an undefined fromItemType
+    // cannot satisfy it — the omitted type is left out of the error string.
+    expect(() =>
+      getActionInteraction(config, {
+        actionType: 'apply',
+        fromNetwork: 'yellow_dot',
+        fromDomain: 'student',
+        toNetwork: 'yellow_dot',
+        toDomain: 'college',
+      }),
+    ).toThrow(
+      'Action "apply" is not allowed from "yellow_dot/student" to "yellow_dot/college".',
+    );
+  });
+});
+
+describe('getDomainItemSchema', () => {
+  it('returns the schema for a declared item type', () => {
+    expect(getDomainItemSchema(config, 'student', 'profile_1.0')).toEqual(profileSchema);
+  });
+
+  it('lets item_schemas override default_item_schemas for the same key', () => {
+    expect(getDomainItemSchema(config, 'college', 'profile_1.0')).toEqual({
+      type: 'object',
+      title: 'override',
+    });
+  });
+
+  it('throws for an unknown domain', () => {
+    expect(() => getDomainItemSchema(config, 'ghost', 'profile_1.0')).toThrow(
+      'Domain "ghost" is not defined for network "yellow_dot".',
+    );
+  });
+
+  it('throws for an unknown item type in a known domain', () => {
+    expect(() => getDomainItemSchema(config, 'student', 'nope_1.0')).toThrow(
+      'Item type "nope_1.0" is not defined for domain "student" in network "yellow_dot".',
+    );
+  });
+});
+
+describe('getDomainItemTypes', () => {
+  it('lists every merged item schema key for the domain', () => {
+    expect(getDomainItemTypes(config, 'student').sort()).toEqual([
+      'profile_1.0',
+      'resume_1.0',
+    ]);
+  });
+
+  it('throws for an unknown domain', () => {
+    expect(() => getDomainItemTypes(config, 'ghost')).toThrow(
+      'Domain "ghost" is not defined for network "yellow_dot".',
+    );
+  });
+});
+
+describe('getDomainMinimumCacheTtlSeconds', () => {
+  it('returns the declared ttl', () => {
+    expect(getDomainMinimumCacheTtlSeconds(config, 'college')).toBe(900);
+  });
+
+  it('falls back to the 300s schema default when unset', () => {
+    expect(getDomainMinimumCacheTtlSeconds(config, 'student')).toBe(300);
+  });
+
+  it('throws for an unknown domain', () => {
+    expect(() => getDomainMinimumCacheTtlSeconds(config, 'ghost')).toThrow(
+      'Domain "ghost" is not defined for network "yellow_dot".',
+    );
+  });
+});
+
+describe('getInstanceCustomItemSchemaUrl', () => {
+  it('maps a legacy schema_url onto the "profile" key', () => {
+    expect(
+      getInstanceCustomItemSchemaUrl(config, {
+        domain: 'student',
+        instanceUrl: 'https://student.example.com',
+        itemType: 'profile',
+      }),
+    ).toBe('https://schemas.example.com/student.json');
+  });
+
+  it('returns an explicit per-item-type override', () => {
+    expect(
+      getInstanceCustomItemSchemaUrl(config, {
+        domain: 'student',
+        instanceUrl: 'https://student.example.com',
+        itemType: 'resume_1.0',
+      }),
+    ).toBe('https://schemas.example.com/resume.json');
+  });
+
+  it('returns null when the instance has no url for that item type', () => {
+    expect(
+      getInstanceCustomItemSchemaUrl(config, {
+        domain: 'college',
+        instanceUrl: 'https://college.example.com',
+        itemType: 'profile',
+      }),
+    ).toBeNull();
+  });
+
+  it('returns null when no instance matches the domain/url pair', () => {
+    expect(
+      getInstanceCustomItemSchemaUrl(config, {
+        domain: 'student',
+        instanceUrl: 'https://other.example.com',
+        itemType: 'profile',
+      }),
+    ).toBeNull();
+  });
+});
+
+describe('validateAgainstJsonSchema', () => {
+  it('returns silently for a valid payload', () => {
+    expect(() =>
+      validateAgainstJsonSchema(profileSchema, { full_name: 'Asha', city: 'Pune' }, 'item_state'),
+    ).not.toThrow();
+  });
+
+  it('throws an "Invalid <label>" error naming the field behind every failure', () => {
+    let message = '';
+    try {
+      validateAgainstJsonSchema(profileSchema, { city: 42, extra: true }, 'item_state');
+    } catch (err) {
+      message = (err as Error).message;
+    }
+    expect(message).toContain('Invalid item_state:');
+    expect(message).toContain('full_name: is required');
+    expect(message).toContain('city: must be string');
+    expect(message).toContain('extra: is not an allowed field');
+  });
+
+  it('exposes a per-field map on a typed error', () => {
+    let caught: unknown;
+    try {
+      validateAgainstJsonSchema(profileSchema, { city: 42, extra: true }, 'item_state');
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(JsonSchemaValidationError);
+    expect((caught as JsonSchemaValidationError).fields).toEqual({
+      full_name: 'is required',
+      city: 'must be string',
+      extra: 'is not an allowed field',
+    });
+  });
+
+  it("uses the field's x-error-message for a failed pattern, never the raw regex", () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        mobile_number: {
+          type: 'string',
+          pattern: '^[0-9]{10}$',
+          'x-error-message': 'Enter a 10-digit mobile number, no spaces.',
+        },
+        pincode: { type: 'string', pattern: '^[0-9]{6}$', title: 'Pincode' },
+      },
+    };
+    let caught: JsonSchemaValidationError | undefined;
+    try {
+      validateAgainstJsonSchema(schema, { mobile_number: '12', pincode: 'x' }, 'item_state');
+    } catch (err) {
+      caught = err as JsonSchemaValidationError;
+    }
+    expect(caught?.fields).toEqual({
+      mobile_number: 'Enter a 10-digit mobile number, no spaces.',
+      pincode: 'Please enter a valid Pincode.',
+    });
+    expect(caught?.message).not.toContain('[0-9]');
+  });
+
+  it('uses the URL copy for a failed x-uri field without its own x-error-message', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        website: { type: 'string', 'x-uri': true, title: 'Website' },
+        portfolio: { type: 'string', 'x-uri': true, 'x-error-message': 'Link your portfolio.' },
+      },
+    };
+    let caught: JsonSchemaValidationError | undefined;
+    try {
+      validateAgainstJsonSchema(
+        schema,
+        { website: 'not a url', portfolio: 'not a url' },
+        'item_state',
+      );
+    } catch (err) {
+      caught = err as JsonSchemaValidationError;
+    }
+    expect(caught?.fields).toEqual({
+      website: 'Please enter a valid web address.',
+      portfolio: 'Link your portfolio.',
+    });
+  });
+
+  it('keeps the first message when one field fails more than once', () => {
+    // ajv reports minLength before pattern for the same string.
+    const schema = {
+      type: 'object',
+      properties: { pin: { type: 'string', minLength: 6, pattern: '^[0-9]+$', title: 'PIN' } },
+    };
+    let caught: JsonSchemaValidationError | undefined;
+    try {
+      validateAgainstJsonSchema(schema, { pin: 'ab' }, 'item_state');
+    } catch (err) {
+      caught = err as JsonSchemaValidationError;
+    }
+    expect(caught?.fields).toEqual({ pin: 'must NOT have fewer than 6 characters' });
+  });
+
+  it('lists the allowed values for a failed enum', () => {
+    const schema = {
+      type: 'object',
+      properties: { gender: { type: 'string', enum: ['Male', 'Female'] } },
+    };
+    expect(() => validateAgainstJsonSchema(schema, { gender: 'X' }, 'item_state')).toThrow(
+      'gender: must be one of: Male, Female',
+    );
+  });
+
+  it('names nested fields with a dotted path', () => {
+    const schema = {
+      type: 'object',
+      properties: {
+        address: {
+          type: 'object',
+          properties: { city: { type: 'string' } },
+          required: ['city'],
+        },
+      },
+    };
+    expect(() => validateAgainstJsonSchema(schema, { address: {} }, 'item_state')).toThrow(
+      'address.city: is required',
+    );
+  });
+
+  it('rejects extra properties by default but accepts them with allowAdditionalProperties', () => {
+    const payload = { full_name: 'Asha', surprise: 1 };
+    expect(() => validateAgainstJsonSchema(profileSchema, payload, 'item_state')).toThrow(
+      /surprise: is not an allowed field/,
+    );
+    expect(() =>
+      validateAgainstJsonSchema(profileSchema, payload, 'item_state', {
+        allowAdditionalProperties: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it('relaxes unevaluatedProperties:false as well, recursively through nested objects and arrays', () => {
+    const nested = {
+      type: 'object',
+      unevaluatedProperties: false,
+      properties: {
+        profile: { type: 'object', additionalProperties: false, properties: { a: { type: 'string' } } },
+        tags: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: false, properties: { b: { type: 'string' } } },
+        },
+      },
+    };
+    const payload = {
+      profile: { a: 'x', deep_extra: 1 },
+      tags: [{ b: 'y', array_extra: 2 }],
+      top_extra: 3,
+    };
+    expect(() => validateAgainstJsonSchema(nested, payload, 'requirement')).toThrow(
+      /Invalid requirement:/,
+    );
+    expect(() =>
+      validateAgainstJsonSchema(nested, payload, 'requirement', {
+        allowAdditionalProperties: true,
+      }),
+    ).not.toThrow();
+  });
+
+  it('ignoredKeys strips the key from both the required list and the payload', () => {
+    // `full_name` is required and `additionalProperties:false` would reject a
+    // stray key — ignoring it must drop it from the requirement AND the payload.
+    expect(() =>
+      validateAgainstJsonSchema(profileSchema, { city: 'Pune' }, 'item_state'),
+    ).toThrow(/full_name: is required/);
+
+    expect(() =>
+      validateAgainstJsonSchema(profileSchema, { city: 'Pune' }, 'item_state', {
+        ignoredKeys: ['full_name'],
+      }),
+    ).not.toThrow();
+
+    // The ignored key is removed from the payload, so a bad value for it passes.
+    expect(() =>
+      validateAgainstJsonSchema(profileSchema, { city: 'Pune', full_name: 99 }, 'item_state', {
+        ignoredKeys: ['full_name'],
+      }),
+    ).not.toThrow();
+  });
+
+  describe('conditional required (if/then) alongside ignoredKeys', () => {
+    // The item service ignores every top-level required key so a draft can be
+    // saved incomplete. A condition that TESTS one of those keys (category ===
+    // 'licensed' → two more fields required) must still see its value, and its own
+    // `required` must not be stripped — it is a test, not a requirement.
+    const conditionalSchema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        name: { type: 'string' },
+        category: { type: 'string', enum: ['individual', 'licensed'] },
+        licence_number: { type: 'string', pattern: '^$|^[0-9]+$' },
+        licence_type: { type: 'string', enum: ['Clinical', 'Other'] },
+      },
+      required: ['name', 'category'],
+      allOf: [
+        {
+          if: { properties: { category: { const: 'licensed' } }, required: ['category'] },
+          then: {
+            required: ['licence_number', 'licence_type'],
+            properties: { licence_number: { minLength: 1 } },
+          },
+        },
+      ],
+    };
+    const serverMode = { ignoredKeys: conditionalSchema.required };
+    const run = (payload: Record<string, unknown>) => () =>
+      validateAgainstJsonSchema(conditionalSchema, payload, 'item_state', serverMode);
+
+    it('enforces the conditional fields when the ignored condition key matches', () => {
+      // One line per missing field, and no Ajv `if` summary ("must match
+      // \"then\" schema") — it names no field and repeats what the lines say.
+      expect(run({ name: 'A', category: 'licensed' })).toThrow(
+        'Invalid item_state: licence_number: is required, licence_type: is required',
+      );
+      // minLength 1 on a string is "required, and not blank" — say that.
+      expect(run({ name: 'A', category: 'licensed', licence_number: '', licence_type: 'Other' })).toThrow(
+        'Invalid item_state: licence_number: is required',
+      );
+      expect(run({ name: 'A', category: 'licensed', licence_number: '123', licence_type: 'Other' })).not.toThrow();
+    });
+
+    it('does not apply the condition to any other category', () => {
+      expect(run({ name: 'A', category: 'individual' })).not.toThrow();
+    });
+
+    it('does not apply the condition to a draft with no category yet', () => {
+      expect(run({ name: 'A' })).not.toThrow();
+      expect(run({})).not.toThrow();
+    });
+  });
+
+  describe('ignoredKeys keeps today\'s behaviour for existing data', () => {
+    // Regression guards: the fix keeps ignored keys' VALUES in the payload (so
+    // a condition can read them) but must still not validate them, exactly as
+    // when they were dropped from the payload.
+    const schema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        category: { type: 'string', enum: ['individual', 'Government Entity'] },
+        phone: { type: 'string', pattern: '^[0-9]{10}$' },
+        city: { type: 'string' },
+      },
+      required: ['category', 'phone'],
+    };
+    const ignored = { ignoredKeys: schema.required };
+
+    it('still accepts a stored value outside an ignored key\'s enum (e.g. a retired option)', () => {
+      expect(() =>
+        validateAgainstJsonSchema(schema, { category: 'Government Body', phone: '9876543210' }, 'item_state', ignored),
+      ).not.toThrow();
+    });
+
+    it('still accepts an ignored key whose value fails its pattern (e.g. a masked phone)', () => {
+      expect(() =>
+        validateAgainstJsonSchema(schema, { category: 'individual', phone: '987***' }, 'item_state', ignored),
+      ).not.toThrow();
+    });
+
+    it('still validates every key that is not ignored', () => {
+      expect(() =>
+        validateAgainstJsonSchema(schema, { category: 'individual', phone: '987***', city: 42 }, 'item_state', ignored),
+      ).toThrow(/city: must be string/);
+    });
+
+    it('still rejects an undeclared key under additionalProperties:false', () => {
+      expect(() =>
+        validateAgainstJsonSchema(schema, { category: 'individual', extra: 1 }, 'item_state', ignored),
+      ).toThrow(/extra: is not an allowed field/);
+    });
+  });
+
+  it('strips ignoredKeys from nested required arrays too', () => {
+    const nested = {
+      type: 'object',
+      properties: {
+        inner: { type: 'object', properties: { secret: { type: 'string' } }, required: ['secret'] },
+      },
+      required: ['inner'],
+    };
+    expect(() => validateAgainstJsonSchema(nested, { inner: {} }, 'requirement')).toThrow(
+      /inner.secret: is required/,
+    );
+    expect(() =>
+      validateAgainstJsonSchema(nested, { inner: {} }, 'requirement', {
+        ignoredKeys: ['secret'],
+      }),
+    ).not.toThrow();
+  });
+
+  it('leaves a non-object payload untouched when ignoredKeys is set', () => {
+    expect(() =>
+      validateAgainstJsonSchema({ type: 'string' }, 'plain', 'item_state', {
+        ignoredKeys: ['anything'],
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateAgainstJsonSchema({ type: 'string' }, 7, 'item_state', {
+        ignoredKeys: ['anything'],
+      }),
+    ).toThrow(/Invalid item_state: must be string/);
+  });
+
+  it('keeps a non-string entry in a required array, so ajv rejects the schema itself', () => {
+    // The ignoredKeys filter only drops string entries; a numeric one survives
+    // and ajv.compile throws a raw schema-invalid error that is NOT wrapped in
+    // the "Invalid <label>: ..." message (the wrap only covers payload errors).
+    const odd = { type: 'object', properties: { a: { type: 'string' } }, required: [123] };
+    expect(() =>
+      validateAgainstJsonSchema(odd, { a: 'x' }, 'item_state', { ignoredKeys: ['a'] }),
+    ).toThrow('schema is invalid: data/required/0 must be string');
+  });
+
+  it('preserves array-valued schema keywords (enum) through the rewrite', () => {
+    const enumSchema = {
+      type: 'object',
+      properties: { status: { type: 'string', enum: ['open', 'closed'] } },
+      required: ['status'],
+      additionalProperties: false,
+    };
+    expect(() =>
+      validateAgainstJsonSchema(enumSchema, { status: 'open' }, 'event', {
+        allowAdditionalProperties: true,
+      }),
+    ).not.toThrow();
+    expect(() =>
+      validateAgainstJsonSchema(enumSchema, { status: 'nope' }, 'event', {
+        allowAdditionalProperties: true,
+      }),
+    ).toThrow(/Invalid event:/);
+  });
+});

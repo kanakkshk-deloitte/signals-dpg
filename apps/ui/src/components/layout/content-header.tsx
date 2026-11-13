@@ -5,7 +5,11 @@ import { Button } from '@/components/ui/button';
 import { UserPlus } from 'lucide-react';
 
 interface ContentHeaderProps {
-  title: string;
+  /**
+   * Optional. The browse page omits it because the toolbar's domain control
+   * already names what is on screen.
+   */
+  title?: string;
   description?: string;
   count?: number;
   noProfilePrompt?: { show: boolean; networkId: string };
@@ -13,20 +17,40 @@ interface ContentHeaderProps {
   actions?: ReactNode;
 }
 
-export function ContentHeader({ title, description, count, noProfilePrompt, actions }: ContentHeaderProps) {
+export function ContentHeader({
+  title,
+  description,
+  count,
+  noProfilePrompt,
+  actions,
+}: Readonly<ContentHeaderProps>) {
   const { t } = useTranslation();
+
+  // Render nothing when empty, or the wrapper's `mb-6` leaves a dead band.
+  const hasContent =
+    Boolean(title) ||
+    count !== undefined ||
+    Boolean(description) ||
+    Boolean(actions) ||
+    Boolean(noProfilePrompt?.show);
+  if (!hasContent) return null;
+
   return (
     <div className="mb-6 space-y-3">
       <div className="flex items-start gap-3">
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <h1 className="text-xl font-semibold tracking-tight text-foreground">{title}</h1>
-            {count !== undefined && count > 0 && (
-              <span className="shrink-0 rounded-full bg-primary/10 text-primary text-xs font-medium px-2 py-0.5 leading-none">
-                {t('header.listings', { count })}
-              </span>
-            )}
-          </div>
+          {(title || count !== undefined) && (
+            <div className="flex items-center gap-2 flex-wrap">
+              {title && (
+                <h1 className="text-xl font-semibold tracking-tight text-foreground">{title}</h1>
+              )}
+              {count !== undefined && count > 0 && (
+                <span className="shrink-0 rounded-full bg-primary/10 text-primary text-xs font-medium px-2 py-0.5 leading-none">
+                  {t('header.listings', { count })}
+                </span>
+              )}
+            </div>
+          )}
           {description && (
             <p className="mt-0.5 text-sm text-muted-foreground">{description}</p>
           )}

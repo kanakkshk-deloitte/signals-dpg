@@ -2,22 +2,14 @@ import type { FastifyBaseLogger } from 'fastify';
 
 import type { RetireCancelledCounterparty } from '@/services/items/retire_connections';
 import { resolveNetworkBrandName, resolveNotifierConfig } from './notify_actions';
-import { renderRetireCancelEmail } from './render_action_email';
 import { resolveOwnerEmail } from './resolve_owner';
 
 /**
- * Fire-and-forget notifier for the retire → counterparty email (#418).
+ * Sends the `retire.cancel` email to each counterparty whose open connection
+ * `cancelItemConnections` ended. Call after the retire transaction commits.
  *
- * Called from the lifecycle route AFTER the retire transaction commits, with
- * the counterparties whose open connections `cancelItemConnections` ended. For
- * each, resolves the (local) owner email and sends one branded email using the
- * dedicated retire-cancel copy. Reuses the action-notifier config, brand
- * resolution, owner-email lookup, and render shell.
- *
- * Never throws and never blocks the route (mirrors `dispatchActionNotifications`).
- * No-op when notifications aren't configured. A counterparty with no local user
- * (owner-less, or hosted on another instance) resolves to no email and is
- * skipped — this is the v1 "local counterparties only" rule.
+ * Never throws. No-op when notifications are not configured. Counterparties
+ * with no local user (owner-less or on another instance) are skipped.
  *
  * @param brandNetwork the retired item's network id, for the brand sign-off.
  */
@@ -45,25 +37,25 @@ export async function dispatchRetireCancelNotifications(
       const email = await resolveOwnerEmail(cp.ownerUserId);
       if (!email) continue;
 
-      const { subject, html } = renderRetireCancelEmail({
-        network: cp.network,
-        brandName,
-        ctaUrl: config.ctaUrl,
-      });
+      // Links to the counterparty's own portal; without a URL the CTA would be
+      // `<a href="">`, so skip.
+      const ctaUrl = config.resolveCtaUrl(cp.domain);
+      if (!ctaUrl) {
+        log.warn(
+          { actionId: cp.actionId, domain: cp.domain },
+          'retire notification skipped: no CTA url for counterparty domain',
+        );
+        continue;
+      }
 
-      await config.notify({
-        channel: 'email',
-        template_id: 'basic_email',
+      await config.sender.dispatchEmail({
+        caseId: 'retire.cancel',
         to: email,
-        priority: 'other',
-        dedupe_id: `retire_cancel:${cp.actionId}:${cp.ownerUserId}`,
-        variables: {
-          fromName: brandName,
-          fromEmail: config.fromEmail,
-          replyTo: config.replyTo,
-          subject,
-          html,
-        },
+        fromName: brandName,
+        network: cp.network,
+        ctaUrl,
+        dedupeId: `retire_cancel:${cp.actionId}:${cp.ownerUserId}`,
+        log: (message, meta) => log.warn(meta ?? {}, message),
       });
     } catch (err) {
       log.warn(

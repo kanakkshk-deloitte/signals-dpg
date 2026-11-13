@@ -2,8 +2,10 @@ import type { FastifyRequest, FastifyReply } from 'fastify';
 import { eq } from 'drizzle-orm';
 import { db } from '@api/db/postgres/drizzle_config';
 import { organization, member } from '../../db/postgres/schema/auth.js';
+import { authConfig } from '@/config';
+import { ACTING_ORG_WILDCARD } from '@/utils/keycloak_token';
 
-const ALLOWED_ORG_TYPES = ['aggregator', 'voice', 'network_service'] as const;
+const ALLOWED_ORG_TYPES = ['aggregator', 'network_service'] as const;
 type AllowedOrgType = (typeof ALLOWED_ORG_TYPES)[number];
 
 const get_header_value = (raw: string | string[] | undefined): string | undefined => {
@@ -16,31 +18,70 @@ const get_header_value = (raw: string | string[] | undefined): string | undefine
 /**
  * Fastify preHandler that resolves the acting org for a request.
  *
- * Reads the `x-acting-org-id` header and the apikey-bound user (set upstream
- * by the apikey auth path), validates that the org exists and is one of the
- * types allowed to be asserted as an acting org (`aggregator` | `voice` |
- * `network_service`), and that the service user is a registered member of
- * some org in Signals. On success, attaches `request.acting_org` and resolves.
+ * Reads `x-acting-org-id` (or, under claim enforcement, a single-org grant) and
+ * the authenticated `request.user`. Checks the org is inside the token grant
+ * when `ACTING_ORG_SOURCE` enforces it, exists, has an assertable type
+ * (`aggregator` | `network_service`), and that the user is a member of some
+ * org. On success attaches `request.acting_org`; otherwise sends an error
+ * reply. It does not check which users the org may reach; routes do that.
+ * Design: docs/architecture/api-middleware-acting-org-scope.md.
  *
- * Each error branch responds via the reply and returns early; the request
- * lifecycle is terminated by Fastify when the reply is sent.
- *
- * The signature is declared as a plain async function (rather than typed via
- * Fastify's `preHandlerAsyncHookHandler`) so unit tests can invoke it without
- * binding a FastifyInstance `this`. The runtime shape still satisfies the
- * Fastify preHandler contract.
+ * A plain async function rather than `preHandlerAsyncHookHandler` so unit
+ * tests can call it without binding a FastifyInstance `this`.
  */
 export const acting_org_preHandler = async (
   request: FastifyRequest,
   reply: FastifyReply,
 ): Promise<void> => {
-  const acting_org_id = get_header_value(
+  /**
+   * The header selects the org in every mode; `ACTING_ORG_SOURCE` controls
+   * whether it must fall inside the token's `signals_acting_orgs` grant.
+   * An `undefined` grant means the token carried no claim; an empty grant
+   * authorises nothing.
+   */
+  const grant = request.acting_org_grant;
+  const grant_is_wildcard = grant?.includes(ACTING_ORG_WILDCARD) === true;
+
+  if (authConfig.acting_org_claim_required && grant === undefined) {
+    reply.code(403).send({
+      error: 'ACTING_ORG_CLAIM_MISSING',
+      message:
+        'this token carries no acting-org grant; ACTING_ORG_SOURCE=claim_required',
+    });
+    return;
+  }
+
+  let acting_org_id = get_header_value(
     request.headers['x-acting-org-id'] as string | string[] | undefined,
   );
+
+  // A grant naming exactly one org is unambiguous, so the header is optional.
+  if (!acting_org_id && authConfig.acting_org_claim_enforced && grant?.length === 1 && !grant_is_wildcard) {
+    acting_org_id = grant[0];
+  }
+
   if (!acting_org_id) {
     reply.code(400).send({
       error: 'MISSING_ACTING_ORG',
       message: 'x-acting-org-id header is required',
+    });
+    return;
+  }
+
+  // Under claim enforcement, an asserted org outside the grant is refused.
+  if (
+    authConfig.acting_org_claim_enforced &&
+    grant !== undefined &&
+    !grant_is_wildcard &&
+    !grant.includes(acting_org_id)
+  ) {
+    request.log.warn(
+      { asserted_org_id: acting_org_id, grant },
+      'acting-org assertion refused: outside the token grant',
+    );
+    reply.code(403).send({
+      error: 'ACTING_ORG_NOT_GRANTED',
+      message: `this token may not act for org ${acting_org_id}`,
     });
     return;
   }
@@ -82,6 +123,8 @@ export const acting_org_preHandler = async (
     return;
   }
 
+  // A participant without a `member` row is refused here. Which users the org
+  // may reach is checked downstream, per route.
   const member_rows = await db
     .select({ id: member.id })
     .from(member)

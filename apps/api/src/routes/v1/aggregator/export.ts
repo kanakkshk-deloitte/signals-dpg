@@ -4,9 +4,10 @@ import type {
   FastifyReply,
 } from 'fastify';
 import { Readable } from 'node:stream';
+import { csvCell } from '@/utils/csv';
 import { db } from '@api/db/postgres/drizzle_config';
 import { item_metrics } from '../../../../db/postgres/schema/metrics.js';
-import { organization } from '../../../../db/postgres/schema/auth.js';
+import { readConfiguredDomains } from '@/utils/org_metadata';
 import { eq, and, inArray, asc, getTableColumns } from 'drizzle-orm';
 import { ExportQuery, type ExportQuery as ExportQueryType } from '@dpg/schemas';
 import { check_and_refresh_if_stale } from '@/services/metrics/staleness';
@@ -49,33 +50,6 @@ const COLUMNS = [
 
 const PAGE_SIZE = 5000;
 
-const csv_escape = (v: unknown): string => {
-  if (v === null || v === undefined) return '';
-  let s: string;
-  if (Array.isArray(v)) s = v.join('|');
-  else if (v instanceof Date) s = v.toISOString();
-  else s = String(v);
-  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
-  return s;
-};
-
-const read_configured_domains = async (
-  org_id: string,
-): Promise<string[] | null> => {
-  const [org] = (await db
-    .select({ metadata: organization.metadata })
-    .from(organization)
-    .where(eq(organization.id, org_id))
-    .limit(1)) as Array<{ metadata: string | null }>;
-  if (!org?.metadata) return null;
-  try {
-    const meta = JSON.parse(org.metadata) as { domains?: unknown };
-    if (!Array.isArray(meta.domains)) return null;
-    return (meta.domains as unknown[]).filter((x): x is string => typeof x === 'string');
-  } catch {
-    return null;
-  }
-};
 
 async function* generate_csv(
   aggregator_id: string,
@@ -145,7 +119,7 @@ async function* generate_csv(
         last_received_cancel_at: lastReceived.cancel ?? null,
         actionable_tags: r.actionableTags,
       };
-      yield COLUMNS.map((c) => csv_escape(projected[c])).join(',') + '\n';
+      yield COLUMNS.map((c) => csvCell(projected[c])).join(',') + '\n';
     }
 
     if (rows.length < PAGE_SIZE) break;
@@ -155,7 +129,7 @@ async function* generate_csv(
 
 type ExportRequest = FastifyRequest<{ Querystring: ExportQueryType }>;
 
-export const aggregator_export: FastifyPluginAsync = async (app) => {
+export const aggregator_export: FastifyPluginAsync = (app) => {
   app.route({
     method: 'GET',
     url: '/dashboard/export',
@@ -169,8 +143,8 @@ export const aggregator_export: FastifyPluginAsync = async (app) => {
         });
       }
 
-      const configured = await read_configured_domains(acting.org_id);
-      if (!configured || configured.length === 0) {
+      const configured = await readConfiguredDomains(acting.org_id);
+      if (configured.length === 0) {
         return reply.code(400).send({
           error: 'NO_DOMAINS_CONFIGURED',
           message: 'org.metadata.domains is empty — re-upsert with domains array',
@@ -205,6 +179,8 @@ export const aggregator_export: FastifyPluginAsync = async (app) => {
       );
     },
   });
+  // Plugins return a promise; nothing here awaits (the route registers synchronously).
+  return Promise.resolve();
 };
 
 export default aggregator_export;

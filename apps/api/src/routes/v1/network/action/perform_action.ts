@@ -5,6 +5,7 @@ import z, {
 } from '@dpg/schemas';
 import { type FastifyPluginAsyncZod } from 'fastify-type-provider-zod';
 import type { FastifyReply, FastifyRequest } from 'fastify';
+import { and, eq } from 'drizzle-orm';
 import { db } from '@api/db/postgres/drizzle_config';
 import {
   ensureActionEventPartition,
@@ -12,6 +13,16 @@ import {
   item_actions,
 } from '@dpg/database';
 import { consent_record } from '@api/db/postgres/schema';
+import {
+  computeActionMatchScore,
+  type ItemSnapshotLike,
+} from '@/services/actions/compute_match_score';
+import {
+  assertPairCapAvailable,
+  maxActionsPerPair,
+  terminalStatuses,
+  ActionPairCapError,
+} from '@/services/action_pair_cap';
 import { resolveConsentVersion } from '@/services/consent_version';
 import { apiConfig, getCurrentApiBaseUrl } from '@/config';
 import { getNetworkConfigById } from '@/network_configs';
@@ -28,10 +39,43 @@ import {
   validateActionEventPayload,
 } from '@/utils/action_event_runtime';
 import { dispatchActionNotifications } from '@/notifications/notify_actions';
+import { public_rate_limit } from '@/middleware/public_rate_limit';
+import { peer_instance_guard_strict } from '@/middleware/peer_instance_guard';
 
 type PerformNetworkActionRequest = FastifyRequest<{
   Body: z.infer<typeof PerformNetworkActionBodySchema>;
 }>;
+
+type ActionItemRef = z.infer<
+  typeof PerformNetworkActionBodySchema
+>['source_item'];
+
+/**
+ * Builds the match-score `ItemSnapshotLike` from the body's item ref (identity)
+ * and a local snapshot (content). Uses the public `item_state`, never
+ * `private_state`, so decrypted PII never reaches match scoring.
+ */
+function toMatchScoreSnapshot(
+  ref: ActionItemRef,
+  snapshot: {
+    item_schema_url: string;
+    item_state: Record<string, unknown>;
+    private_state: Record<string, unknown>;
+    item_locations?: Array<{ lat: number; lng: number }> | null;
+  } | null
+): ItemSnapshotLike | null {
+  if (!snapshot) return null;
+  return {
+    item_network: ref.item_network,
+    item_domain: ref.item_domain,
+    item_type: ref.item_type,
+    item_id: ref.item_id,
+    item_instance_url: ref.item_instance_url,
+    item_schema_url: snapshot.item_schema_url,
+    item_state: snapshot.item_state,
+    item_locations: snapshot.item_locations,
+  };
+}
 
 /**
  * Thrown inside the create transaction when the initiate-consent row cannot be
@@ -55,6 +99,15 @@ export const perform_network_action: FastifyPluginAsyncZod = async function (
   fastify.route({
     url: '/action/perform',
     method: 'POST',
+    // Peer-only (AUTH-VULN-05). This body asserts identity (`source_item_owner`,
+    // `performed_by_*`) that the handler cannot check independently, so the
+    // HMAC guard binds it to a peer holding INSTANCE_SHARED_SECRET. Strict
+    // guard: unlike the *_local reads, this route never had a legitimate
+    // unsigned caller, so it ignores PEER_AUTH_MODE=permissive.
+    preHandler: [
+      peer_instance_guard_strict,
+      public_rate_limit('network_action_perform', 100),
+    ],
     schema: {
       tags: ['network'],
       body: PerformNetworkActionBodySchema,
@@ -93,8 +146,9 @@ export const perform_network_action_handler = async (
   }
 
   let interaction: ReturnType<typeof getActionInteraction>;
+  let networkConfig: Awaited<ReturnType<typeof getNetworkConfigById>>;
   try {
-    const networkConfig = await getNetworkConfigById(
+    networkConfig = await getNetworkConfigById(
       body.target_item.item_network
     );
     interaction = getActionInteraction(networkConfig, {
@@ -120,12 +174,9 @@ export const perform_network_action_handler = async (
     });
   }
 
-  // Initiate-consent gate, enforced HERE (the write endpoint) — not only on the
-  // /action/perform proxy — because this is where the row is created and the PII
-  // action event is emitted. The proxy forwards `consent` for reveals_pii
-  // actions, so legitimate (proxied and inter-instance) calls pass; a direct
-  // call that bypasses the proxy without consent is rejected rather than
-  // creating a PII-revealing action with no consent recorded.
+  // Initiate-consent gate, enforced at this write endpoint and not only on the
+  // /action/perform proxy, so a direct call without consent cannot create a
+  // PII-revealing action. The proxy forwards `consent` for reveals_pii actions.
   if (interaction.reveals_pii_on_status.length > 0 && !body.consent?.acknowledged) {
     return reply.code(400).send({
       error: 'CONSENT_REQUIRED',
@@ -159,6 +210,22 @@ export const perform_network_action_handler = async (
     if (sourceItemSnapshot.lifecycle_status !== 'live') {
       return reply.code(409).send({ error: 'PROFILE_NOT_LIVE', message: 'source_item is not live; cannot perform actions' });
     }
+  }
+
+  // Self-action guard; the UI also hides the viewer's own pins, but the API is
+  // the control. Owner equality uses only the DB-resolved source owner, never
+  // the caller-asserted `body.source_item_owner`. A remote source (no local
+  // snapshot) relies on the item-id check alone; its instance enforces the
+  // two-profiles-of-one-user case at its own perform endpoint.
+  const isSelfAction =
+    body.source_item.item_id === body.target_item.item_id ||
+    (sourceItemSnapshot !== null &&
+      sourceItemSnapshot.created_by === targetItemSnapshot.created_by);
+  if (isSelfAction) {
+    return reply.code(400).send({
+      error: 'SELF_ACTION_NOT_ALLOWED',
+      message: 'You cannot perform this action on your own profile.',
+    });
   }
 
   try {
@@ -210,11 +277,22 @@ export const perform_network_action_handler = async (
     });
   }
 
-  // Action + initiate-consent are written in one transaction so a consent-write
-  // failure rolls the action back too (fail-closed — never a PII-revealing
-  // action without a consent row). The action event is emitted only after commit.
+  // Action + initiate-consent in one transaction: never a PII-revealing action
+  // without a consent row. The action event is emitted only after commit.
+  // Pair cap: at most `max_actions_per_pair` (default 1) open actions between
+  // these two items, bidirectional and type-agnostic. Enforced here, the single
+  // write endpoint every perform funnels through, under a pair-scoped advisory
+  // lock so concurrent submits cannot both land.
+  let capExceeded = false;
   const created = await db
     .transaction(async (tx) => {
+      await assertPairCapAvailable(tx, {
+        network: body.target_item.item_network,
+        sourceItemId: body.source_item.item_id,
+        targetItemId: body.target_item.item_id,
+        cap: maxActionsPerPair(networkConfig),
+        terminal: terminalStatuses(networkConfig),
+      });
       const [row] = await tx
         .insert(item_actions)
         .values({
@@ -288,9 +366,20 @@ export const perform_network_action_handler = async (
       return row;
     })
     .catch((err: unknown) => {
+      if (err instanceof ActionPairCapError) {
+        capExceeded = true;
+        return null;
+      }
       if (err instanceof ConsentWriteError) return null;
       throw err;
     });
+
+  if (capExceeded) {
+    return reply.code(409).send({
+      error: 'ACTION_LIMIT_REACHED',
+      message: 'An active request already exists between these two profiles.',
+    });
+  }
 
   if (created === null) {
     request.log.error(
@@ -352,6 +441,32 @@ export const perform_network_action_handler = async (
       request.log.error({ err }, 'action notification dispatch failed'),
     );
   }
+
+  // Match score: computed once at create and stored on the row; never
+  // recomputed on status change. Fire-and-forget so connect latency is
+  // unaffected. Stays null when a snapshot is unavailable (cross-instance) or
+  // scoring errors.
+  void computeActionMatchScore(
+    toMatchScoreSnapshot(body.source_item, sourceItemSnapshot),
+    toMatchScoreSnapshot(body.target_item, targetItemSnapshot),
+    request.log,
+  )
+    .then(async (score) => {
+      if (score === null) return;
+      await db
+        .update(item_actions)
+        .set({ match_score: score })
+        .where(
+          and(
+            eq(item_actions.partition_network, body.target_item.item_network),
+            eq(item_actions.action_type, created.action_type),
+            eq(item_actions.action_id, created.action_id),
+          ),
+        );
+    })
+    .catch((err) =>
+      request.log.error({ err, action_id: created.action_id }, 'match-score row update failed'),
+    );
 
   return reply.code(201).send(created);
 };

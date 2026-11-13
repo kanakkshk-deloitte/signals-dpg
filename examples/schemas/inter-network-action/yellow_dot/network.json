@@ -235,6 +235,10 @@
           }
         }
       },
+      "profile_completion_prompt": {
+        "heading": "Complete your profile to find the right tutors",
+        "body": "Tutors and coaching centers can find and connect with you only once your profile is live. Fill in the details below to get matched."
+      },
       "id": "student",
       "card": {
         "title_field": "name",
@@ -290,6 +294,10 @@
           }
         }
       },
+      "profile_completion_prompt": {
+        "heading": "Complete your profile to reach students",
+        "body": "Students can discover and connect with you only once your profile is live. Add your details below to start getting learners."
+      },
       "id": "tutor",
       "card": {
         "title_field": "name",
@@ -340,6 +348,10 @@
           }
         }
       },
+      "profile_completion_prompt": {
+        "heading": "Complete your profile to reach students",
+        "body": "Students can discover your center only once your profile is live. Add your details below to start enrolling learners."
+      },
       "id": "coaching_center",
       "card": {
         "title_field": "name",
@@ -388,6 +400,10 @@
           ],
           "to_network": "yellow_dot",
           "to_domain": "tutor",
+          "column_fields": {
+            "from": [],
+            "to": ["subjects", "experience_years", "teaching_mode"]
+          },
           "to_items": [
             "profile_1.0"
           ],
@@ -443,6 +459,10 @@
           ],
           "to_network": "yellow_dot",
           "to_domain": "coaching_center",
+          "column_fields": {
+            "from": [],
+            "to": ["city", "programs", "seats_available"]
+          },
           "to_items": [
             "profile_1.0"
           ],
@@ -503,6 +523,10 @@
           ],
           "to_network": "blue_dot",
           "to_domain": "provider",
+          "column_fields": {
+            "from": [],
+            "to": []
+          },
           "to_items": [
             "job_posting_1.0",
             "job_posting_1.1"

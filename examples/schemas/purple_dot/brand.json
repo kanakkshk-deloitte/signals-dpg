@@ -1,4 +1,7 @@
 {
+  "footerLogo": "/brand/ekstep.png",
+  "footerLogoLight": "/brand/ekstep.png",
+  "logoShape": "lockup",
   "brand": {
     "name": "purple dots AI",
     "wordmark": "purple dots AI",

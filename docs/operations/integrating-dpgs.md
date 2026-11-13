@@ -36,42 +36,256 @@ Notes on `auth_middleware`:
 - The middleware is gated by `AUTH_MIDDLEWARE_ENABLED` (defaults to `true`).
   See `docs/operations/secrets.md` for the env knob.
 
+## Migrating to Keycloak client-credentials (in progress)
+
+`x-api-key` is being replaced by a standard OAuth2 **client-credentials**
+bearer token, as part of the Keycloak migration
+(`docs/superpowers/plans/2026-07-23-keycloak-migration-design.md` §5).
+
+**Signals accepts both during the transition.** That compatibility window
+exists precisely because aggregator-dpg and voice-dpg live in separate repos
+and cannot cut over in the same deploy. `x-api-key` keeps working until every
+partner reports zero traffic on it (rollout step R6), and is only removed at
+R8. **Nothing about the old path changes today — no action is required to keep
+working.**
+
+### What changes, and what does not
+
+| | Today | After |
+|---|---|---|
+| Who is calling | `x-api-key: <key>` | `Authorization: Bearer <access token>` |
+| Who they act for | `x-acting-org-id: <org_id>` | **unchanged** — acting-org is orthogonal to authentication |
+| `request.user` / `request.acting_org` | — | **unchanged shape**, so every route behaves identically |
+
+Only the first row changes. The second header stays, and so does the mental
+model: the credential says who the messenger is, the header says who they are
+speaking for.
+
+### Obtaining a token
+
+Each integrating DPG gets its own **confidential client** in the shared
+`bluedots` realm and exchanges its client secret for an access token:
+
+```bash
+curl -X POST "$KEYCLOAK_URL/realms/bluedots/protocol/openid-connect/token" \
+  -d grant_type=client_credentials \
+  -d client_id=aggregator-dpg \
+  -d client_secret="$AGGREGATOR_DPG_CLIENT_SECRET"
+# -> { "access_token": "eyJ...", "expires_in": 300, ... }
+```
+
+Then call signals exactly as before, swapping the credential header:
+
+```bash
+curl -X POST http://localhost:2742/api/v1/admin/aggregator/upsert \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H 'x-acting-org-id: <aggregator-dpg network_service org id>' \
+  -H 'Content-Type: application/json' \
+  -d '{ "external_id": "agg_bbmp_001", "name": "BBMP", "slug": "bbmp" }'
+```
+
+Cache and reuse the token until shortly before `expires_in`; do not fetch one
+per request.
+
+### How a client maps to a service user
+
+**By convention: the Keycloak client id must equal the `organization.slug` of
+that DPG's service org in signals.** There is no new table and no extra claim
+— the client id is looked up as a slug, and the org's member with
+`role='service'` is the identity the request runs as. That is the same
+`organization` / `member` / `user` triple the seed script already creates, so
+an existing deployment needs no data migration; the service user id an
+integrating DPG resolves to is identical on both credentials.
+
+If the slugs and client ids do not line up, signals returns
+`403 SERVICE_ACCOUNT_NOT_PROVISIONED` and logs the client id it could not
+resolve.
+
+### Signals-side configuration
+
+Two env vars gate this (both in `packages/config/src/secrets.ts`):
+
+| Var | Meaning |
+|---|---|
+| `AUTH_PROVIDER` | `keycloak` is the only value (`dual` and `betterauth` have both been removed — #517). Bearer service auth is therefore **unconditionally live**; it is no longer gated behind a provider flip. |
+| `KEYCLOAK_SERVICE_CLIENT_IDS` | Comma-separated client ids allowed on the service path, e.g. `aggregator-dpg,voice-dpg`. **Empty by default**, so no client can use service auth until an operator names it. |
+
+`KEYCLOAK_SERVICE_CLIENT_IDS` is deliberately separate from
+`KEYCLOAK_ACCEPTED_CLIENT_IDS` (the human/session clients). Because signals
+shares one realm with aggregator, keeping the two lists apart is what stops a
+token from the public `signals-ui` client being honoured as a service account,
+and stops an integrating DPG's token being provisioned as a human user.
+
+### Failure codes on the bearer path
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 401 | `TOKEN_EXPIRED` | Token past `exp`. Fetch a new one. |
+| 401 | `UNAUTHORIZED` | Malformed token, bad signature, or wrong issuer. |
+| 403 | `TOKEN_CLIENT_REJECTED` | Valid realm token, but the client is not one signals serves. |
+| 403 | `SERVICE_CLIENT_NOT_ALLOWED` | Client is not in `KEYCLOAK_SERVICE_CLIENT_IDS`. |
+| 403 | `SERVICE_ACCOUNT_NOT_PROVISIONED` | No service org/user matches the client id (see the slug convention above). |
+| 503 | `IDENTITY_PROVIDER_UNAVAILABLE` | Signals could not reach Keycloak to verify. **Retryable** — this is not an auth failure. |
+
+Treat `503` differently from `401`: it means the token was never judged, so a
+retry with the *same* token is correct.
+
+### If both credentials are sent
+
+`x-api-key` wins. Precedence is unchanged from before the window, so a partner
+mid-migration sees identical behaviour on the old path. Send one or the other.
+
+## Acting org: the header is becoming a token-verified assertion
+
+**Nothing about the `x-acting-org-id` header changes** — same name, same value,
+still sent on every acting-org call. What changes is that signals will stop
+taking it on trust.
+
+### Why
+
+`acting_org_preHandler` today validates that the asserted org exists and is an
+allowed type, and that the caller is a member of *some* org. It never checks
+membership of the **asserted** org. Since `POST /api/v1/admin/participant/decrypt`
+scopes decrypted participant PII by `user.onboarded_by_org_id == acting_org.org_id`,
+a caller asserting another aggregator's org id reads that aggregator's
+participants. That has been held together by the trusted-intermediary model; a
+bearer token lets signals verify it instead, because a claim cannot be forged by
+the caller whereas a header can.
+
+### The model
+
+Your token carries **`signals_acting_orgs`** — the set of org ids you may act
+for. The header still selects which one a given request uses, and signals rejects
+any header value outside the set.
+
+| Your token's grant | `x-acting-org-id` | Result |
+|---|---|---|
+| `["*"]` | any existing org | allowed (today's behaviour) |
+| `["org_a","org_b"]` | `org_a` | allowed |
+| `["org_a","org_b"]` | `org_c` | **`403 ACTING_ORG_NOT_GRANTED`** |
+| `["org_a"]` | *omitted* | allowed — a single-org grant needs no header |
+| `["*"]` | *omitted* | `400 MISSING_ACTING_ORG` — a wildcard names no specific org |
+| *no claim* | `org_a` | allowed under `claim_preferred`; refused under `claim_required` |
+
+The grant authorises **which** org you may act for, not **what** you may do
+there — the `organization.type` capability gate still applies exactly as today.
+
+### Rollout: `ACTING_ORG_SOURCE`
+
+Signals-side flag, mirroring `AUTH_PROVIDER`:
+
+| Value | Behaviour |
+|---|---|
+| `header` | **Default today.** The header authorises itself; the grant is ignored even if present. Nothing to do. |
+| `claim_preferred` | The grant is enforced **when the token carries one**; a token without one falls back to the header. **This is the window** — adopt at your own pace. |
+| `claim_required` | A token with no grant is refused on acting-org routes. Terminal. |
+
+Because `claim_preferred` falls back, **you do not need to coordinate a
+simultaneous deploy.** An `x-api-key` caller carries no grant, so the old path
+keeps working until `claim_required`.
+
+### What you need to do
+
+Nothing, until signals moves off `header`. When it does:
+
+- Your Keycloak client needs a `signals_acting_orgs` mapper. Both DPG clients
+  currently ship with a hardcoded `"*"` — see
+  `infra/keycloak/realms/bluedots-realm.json` and
+  `infra/keycloak/init/apply-user-profile.sh`.
+- **`"*"` is provisional.** It preserves today's reach as an explicit, auditable
+  grant rather than an unstated default, but it should be narrowed to the orgs
+  each DPG legitimately serves. Tell us that set and we will enumerate it.
+- Keep sending `x-acting-org-id` exactly as you do now. Only drop it if your
+  grant names exactly one org.
+
+### New failure codes
+
+| Status | `code` | Meaning |
+|---|---|---|
+| 403 | `ACTING_ORG_NOT_GRANTED` | The asserted org is outside your token's grant. Not retryable — fix the grant or the assertion. |
+| 403 | `ACTING_ORG_CLAIM_MISSING` | `claim_required` is on and your token carries no grant. Add the mapper. |
+
+The existing `400 MISSING_ACTING_ORG`, `404 ACTING_ORG_NOT_FOUND` and
+`403 ACTING_ORG_TYPE_NOT_ALLOWED` are unchanged.
+
 ## Organization types
 
-The `organization.type` text column on the better-auth `organization` table
-carries one of three values in this model:
+The `organization.type` text column on the `organization` table carries one of
+two values in this model:
 
-- `network_service` — the integrating DPGs themselves
-  (`aggregator-dpg`, `voice-dpg`). Their service users are members of these
-  orgs. Created by the seed script.
+- `network_service` — the integrating DPGs themselves (`aggregator-dpg`, the
+  Raya voice bot). Their service users are members of these orgs. Created by
+  the seed script locally, and by `provision_service_users.sql` in production.
 - `aggregator` — every aggregator that has registered with aggregator-dpg,
   mirrored into Signals via `POST /api/v1/admin/aggregator/upsert`.
-- `voice` — same shape as `aggregator` but for voice-hosted instances
-  (future expansion; the preHandler already accepts the type).
 
-The `acting_org` preHandler accepts all three as valid `x-acting-org-id`
-targets. Individual routes can narrow further — e.g.
+The `acting_org` preHandler accepts both as valid `x-acting-org-id` targets.
+Individual routes can narrow further — e.g.
 `POST /api/v1/admin/aggregator/upsert` rejects with
 `403 NOT_NETWORK_SERVICE` if the acting org's type is not `network_service`.
+
+> **A third value, `voice`, was retired by #518.** It reached exactly as far as
+> `network_service` — the ownership check runs only for `aggregator`, so every
+> other admitted type got network-wide scope — which made it a synonym rather
+> than a distinct authority, and a reviewer had to check both to learn they
+> were the same. The voice bot's org is a `network_service` like any other.
+>
+> **The channel is now told apart by the Keycloak client id (`azp`), not the
+> org type.** `request.service_client_id` carries it, and it is bound onto the
+> request logger. Use it for audit and triage; never for authorization — that
+> conflation is what the retired type got wrong.
+>
+> `organization.type` is plain nullable text, so the TypeScript union is a claim
+> about the data rather than a guarantee from the database. Migration `0019`
+> closes that with a `CHECK` constraint — `organization_type_allowed` — so a
+> retired or unknown type is rejected at INSERT rather than surfacing later as a
+> `403 ACTING_ORG_TYPE_NOT_ALLOWED` far from whoever caused it. `NULL` remains
+> permitted; the preHandler refuses a null type on its own.
+>
+> **Before deploying `0019` to an instance, check the column's actual domain:**
+>
+> ```sql
+> SELECT type, count(*) FROM organization GROUP BY type;
+> ```
+>
+> Expect only `aggregator`, `network_service` and possibly `NULL`. Postgres
+> validates a `CHECK` against existing rows when the constraint is added, so a
+> single surviving `voice` row **fails the deploy migrate-Job** with
+> `check constraint ... is violated by some row`. Retype the row before
+> deploying; the constraint is not the place to discover it.
 
 ## Local dev setup
 
 ```bash
 docker compose up -d db redis
-pnpm db:push:api          # apply better-auth + Drizzle schema to Postgres
+pnpm db:push:api          # apply the Drizzle schema to Postgres
 pnpm db:init:api          # apply the non-Drizzle SQL bootstrap (items / actions / events)
-pnpm db:seed:services:api # create aggregator-dpg + voice-dpg service users and apikeys
+pnpm db:seed:services:api # create the integrating-DPG service user and apikey
 ```
 
 The seed script (`apps/api/scripts/seed_service_users.ts`) is idempotent —
-re-running it does not mint new keys. For each of `aggregator-dpg` and
-`voice-dpg` it ensures:
+re-running it does not mint new keys. For each entry in its `SERVICES` list it
+ensures:
 
 1. An `organization` row with `type='network_service'` and the service slug.
 2. A `user` row for the service identity (e.g. `aggregator-dpg-svc@signals.local`).
 3. A `member` row linking that user to its network-service org with
    `role='service'`.
 4. An `apikey` row (prefix `sk_signals_`) owned by that user.
+
+> **`SERVICES` contains `aggregator-dpg` and `raya-voice-bot`** (#518), matching
+> the production `provision_service_users.sql`, which also provisions
+> `signals-search-client`.
+>
+> **Mind the two names for the voice bot.** Its organization slug is
+> `raya-voice-bot`; its Keycloak client is `voice-dpg`. They were chosen
+> independently and nothing enforces that they agree — which matters because
+> `resolveServiceAccount` maps a client-credentials token to a service user by
+> looking the **client id up as an organization slug**. A bearer token from the
+> `voice-dpg` client therefore finds no org and fails
+> `SERVICE_ACCOUNT_NOT_PROVISIONED`. That is latent rather than breaking today,
+> because `KEYCLOAK_SERVICE_CLIENT_IDS` is empty by default and the voice bot
+> authenticates with `x-api-key`. Reconciling the two names is its own change.
 
 The minted apikeys print to stdout **on the first run only** — capture them
 then. If you lose a key, the recovery path is to delete the corresponding
@@ -121,11 +335,13 @@ use to create or update participants. The behavior splits by the
 |------------------------|---------------------|------------------|----------------------------------------------------------------|----------------|------------------------|
 | Ecosystem manager      | network_service     | yes              | yes (full list, served-domain scoped)                          | yes (`item_id`)| yes (omit `item_id`)   |
 | Aggregator             | aggregator          | yes              | yes — but **only own users** (cross-aggregator returns `items:[]`) | no             | no                     |
-| Voice (future)         | voice               | (rejected today) | (rejected)                                                     | (rejected)     | (rejected)             |
 
-The future voice tier will piggyback on the aggregator behavior: when a
-voice instance is delegated to an aggregator, voice-dpg simply starts
-asserting the aggregator's `x-acting-org-id` — no code change needed.
+There is no third tier. The voice bot acts at the ecosystem-manager tier,
+because its org is a `network_service` (#518 retired the `voice` type that used
+to sit here as "future"). When a voice instance is instead delegated to an
+aggregator, it simply asserts that aggregator's `x-acting-org-id` and picks up
+the aggregator row above — no code change and no extra type needed, which is
+the whole reason the third type was never required.
 
 ### Request
 
@@ -147,6 +363,7 @@ content-type: application/json
   "channel": "bulk",
   "item_state": { ... item-schema-validated payload ... },
   "item_id": "optional-uuid-for-update-only",
+  "item_locations": [{ "lat": 12.9251, "lng": 77.5938, "label": "Jayanagar" }],
   "network": "blue_dot",
   "domain": "seeker",
   "item_type": "profile_1.0"
@@ -154,6 +371,40 @@ content-type: application/json
 ```
 
 Identity rule: at least one of `email` or `phone_number` must be provided.
+
+**Coordinates (`item_locations`).** Optional. Send it when your own form
+already resolved the participant's address to an exact point — e.g. they picked
+a suggestion from a Places autocomplete, so you hold the lat/lng the geocoder
+returned for that exact suggestion, which is better than anything Signals can
+recover from the address text alone.
+
+- **Omitted or `[]`** — Signals geocodes the item schema's primary location
+  field out of `item_state`, exactly as it always has. This is the default and
+  nothing changes for callers that don't send the field.
+- **Non-empty** — the supplied points are stored and the address text is *not*
+  geocoded over.
+- On an update (`item_id`), supplied coordinates win over re-geocoding an
+  edited address, and may be sent **without** `item_state` to move a profile's
+  point without re-sending its fields. Echoing back the coordinates Signals
+  already stored is a no-op rather than a fresh write.
+- Privacy is unaffected by which path produced the point: if the domain
+  declares its primary location field private, the coordinate is jittered
+  100–250 m before storage either way. You can never persist an exact private
+  address by sending it here.
+- **Country check (#789).** When the instance sets `GEOCODING_COUNTRY` (e.g.
+  `IN`) and mounts that country's boundary (`GEOCODING_BOUNDARY_PATH`), every
+  supplied point must fall inside the country, or within 15 km of its drawn
+  border (the default outline is coarse enough that real border towns sit a
+  few km outside it).
+  A point outside it fails the whole write with
+  `400 { "error": "LOCATION_OUTSIDE_COUNTRY", "message": "Location <lat>, <lng> is outside the allowed region (IN)." }`
+  and nothing is stored. The message names the point so a bulk operator can find
+  the row. Echoed-back coordinates are not re-checked. Geocoded points are not
+  checked either, because the geocoder is already restricted to the same country.
+
+Each entry is `{ lat, lng, label? }`; `lat` must be -90..90 and `lng`
+-180..180, both as JSON numbers (a stringified coordinate is a 400, not a
+coercion).
 
 **Consent (`compliance`).** Each entry names a consent the channel captured
 from the user; only `value: true` is recorded, into the `consent_record`
@@ -188,8 +439,19 @@ for validation rules, age requirements, and how a profile gets promoted to
 
 `onboarded_at` is set only when this call created a new user; null
 otherwise. `items` is scoped to the networks this Signals instance
-serves. `lifecycle_status` tells the caller whether the profile is
-usable (`live`) or still incomplete/gated (`draft`, `paused`).
+serves, and is **ordered newest first** by `created_at` (ties broken by
+`item_id`) — a participant accumulates profiles, because a POST without
+`item_id` inserts a new one every call, so a caller that reads only the
+head of the list gets their most recent one. Two limits to know before
+relying on that: it is **`created_at`, not `updated_at`**, so editing an
+old profile does not lift it to the head (`updated_at` also moves for
+writes the participant never made — lifecycle transitions, consent
+promotion, the retire scrub — which would reshuffle the list invisibly);
+and `created_at` is a millisecond-resolution default with a random-UUID
+tiebreaker, so profiles written in the *same millisecond* come back in a
+stable but arbitrary order rather than a genuinely newest-first one. `lifecycle_status` tells
+the caller whether the profile is usable (`live`) or still
+incomplete/gated (`draft`, `paused`).
 `consent_recorded` is the number of `consent_record` rows written by
 this call from the `compliance` array (0 when `compliance` was absent
 or every entry was `false`/unrecognised).
@@ -209,21 +471,70 @@ or every entry was `false`/unrecognised).
 - **Activation:** target an existing profile with `item_id` (no `item_state`
   needed) to add `profile_creation` and/or `age` and promote it. A user-level
   call with `age` and no item promotes all the user's eligible drafts.
-- The legacy `terms_accepted` / `privacy_accepted` booleans are accepted but
-  ignored (deprecated, #309).
-- `GET /admin/participant` returns `user_consent { terms_accepted,
-  privacy_accepted, has_age }` and per-item `profile_consent_accepted`
-  + `lifecycle_status` so callers can see what's outstanding and which profile
-  is usable.
+- The legacy `terms_accepted` / `privacy_accepted` booleans have been **removed**
+  (#692). They were ignored from #309 onward, but the docs still presented them
+  as a way to record consent, so a caller sending them got `200` with
+  `consent_recorded: 0` and no ledger row. Removal is non-breaking: the request
+  body is not strict, so they are stripped rather than rejected — but they do
+  nothing, and `compliance` is the only mechanism.
+- `GET /admin/participant` returns `compliance: [{key, value}]` — the same shape
+  the POST accepts, with keys `user_terms`, `user_privacy` and `has_age` — plus
+  per-item `profile_consent_accepted` + `lifecycle_status`, so callers can see
+  what's outstanding and which profile is usable. It replaced
+  `user_consent { terms_accepted, … }` in #692.
+- **Every consent flag is version-scoped** (#692). `value` is `true` only when
+  the consent was accepted at the document version this instance currently
+  serves — resolved with the **same three discriminators the write side uses**:
+  network, the participant's document set (`u18_documents` for a minor,
+  `documents` otherwise), and the **brand stored on each row**, so a brand whose
+  counter has diverged from the network default is answered against its own
+  document rather than the default's. A participant who accepted an earlier version reports `false` and must
+  be re-prompted — previously any accepted version counted, so a participant on
+  a superseded document read as consented forever while the portal correctly
+  re-prompted them, and the channel had no way to tell. `has_age` is unrelated to
+  document versions.
+- **Minors are rejected on the read too** (#692): `400 U18_NOT_ALLOWED` for
+  `network_service` callers, matching the POST. `aggregator` callers
+  are unaffected, because their use of this endpoint is a read-only identity
+  probe that never reads consent. Minors onboard through the portal.
+- `?network=` selects which network's consent documents define "current". It is
+  optional and defaults to the served network; it is required only on an
+  instance whose `SERVED_DOMAINS` spans more than one network, where there is no
+  single current version to compare against (`400 NETWORK_REQUIRED`). A value
+  the instance does not serve is **refused** (`400 NETWORK_NOT_SERVED`) rather
+  than answered: an unknown network has no consent config, so every flag would
+  come back `false` — indistinguishable from "not consented", which would make a
+  channel re-collect consent the participant already gave.
 
 ### Error matrix (additions)
 
 | Caller shape | HTTP | error | When |
 |---|---|---|---|
 | acting_org missing | 403 | `INVALID_ACTING_ORG` | request reached the handler without acting_org |
-| acting_org_type == 'voice' (or anything not in aggregator/network_service) | 403 | `ACTING_ORG_TYPE_NOT_ALLOWED` | not allowed today |
+| acting_org_type is anything other than `aggregator` / `network_service` — including the retired `voice` (#518) | 403 | `ACTING_ORG_TYPE_NOT_ALLOWED` | the column is plain text, so an unknown or retired type is refused at the preHandler |
 | network_service + invalid `item_id` (doesn't belong to user) | 403 | `ITEM_NOT_OWNED_BY_USER` | item ownership check failed |
 | email + phone race | 409 | `USER_ALREADY_EXISTS` | another caller created the same identity between SELECT and signUp |
+| aggregator + participant already locked to another domain | 403 | `DOMAIN_LOCKED` | **not additive.** An account holds profiles in exactly ONE domain (`assertSingleDomain`). A previously-succeeding call now fails if `domain` (or its `'seeker'` default) differs from the domain the participant already holds. Body carries `locked_domain` / `requested_domain`. Per-row, so a batch is unaffected — the row does not land. |
+| `GET /admin/participant` + minor, caller is `network_service` | 400 | `U18_NOT_ALLOWED` | **not additive (#692).** The read now matches the POST: minors onboard through the portal. `aggregator` callers are exempt — their probe never reads consent. Reported only after the disclosure check, so it cannot reveal minor status to a caller not entitled to the user. |
+| `GET /admin/participant` on a multi-network instance with no `?network=` | 400 | `NETWORK_REQUIRED` | **not additive (#692).** Consent documents are per-network, so version comparison needs one named. Single-network instances (all of them today) are unaffected — the served network is used. |
+| `GET /admin/participant` + `?network=` naming an unserved network | 400 | `NETWORK_NOT_SERVED` | **not additive (#692).** A typo (`blue-dot`) previously returned 200 with every flag `false`. Callers that omit `?network=` are unaffected. |
+| `item_state` fails the item schema | 400 | `INVALID_ITEM_STATE` | **additive (#785).** `message` names each failing field (`Invalid item_state: mobile_number: Enter a 10-digit mobile number, ncsJobId: is not an allowed field`), and the body carries the same as `fields: { "<field>": "<message>" }` (nested fields dotted, e.g. `address.city`). A failed `pattern` uses the field's `x-error-message` from `network.json`, else `Please enter a valid <title>.`, and never the raw regex; an `enum` lists its allowed values. Map `fields` keys straight onto your form inputs or CSV columns. |
+| supplied `item_locations` point outside the instance's country | 400 | `LOCATION_OUTSIDE_COUNTRY` | see **Coordinates** above (#789). |
+
+### `POST /api/v1/admin/participant/decrypt` — error matrix (additions)
+
+| Caller shape | HTTP | error | When |
+|---|---|---|---|
+| aggregator whose org declares no `metadata.domains` | 400 | `NO_DOMAINS_CONFIGURED` | **not additive.** Decrypt is now scoped to the acting org's declared domains and fails closed when there are none, matching `GET /aggregator/dashboard` and `/dashboard/export`. Affects only orgs mirrored before `domains` was sent; re-upsert with a non-empty `domains` array. The same requirement is now enforced when an org is nominated as a **default aggregator** (migration 0017), so the two cannot disagree. |
+| aggregator requesting an item outside its declared domains | 200 | — | the id lands in `skipped`, undifferentiated from not-found, so nothing leaks about its existence. |
+
+**Ordering.** In `user_id` mode `profiles` is ordered **newest first** by
+`created_at` (ties broken by `item_id`), the same ordering GET/POST
+`/admin/participant` use — the three share one `ORDER BY` in code, so they
+cannot drift. In `item_ids` mode there is **no ordering at all**: rows come back
+in whatever order Postgres produces, which is neither the requested id order nor
+`created_at`. Correlate by the `item_id` on each row rather than by position;
+every in-repo consumer already does.
 
 ### Migration from `/admin/onboard_participant`
 
@@ -535,7 +846,7 @@ every `/api/v1/admin/*` route. Its checks (in order):
 | `x-acting-org-id` header missing or blank | 400 | `MISSING_ACTING_ORG` | header not sent or empty after trim |
 | `request.user` not set | 401 | `UNAUTHENTICATED` | apikey auth did not run (no `x-api-key`) |
 | `acting_org_id` does not match any `organization` row | 404 | `ACTING_ORG_NOT_FOUND` | unknown org id |
-| Org exists but `organization.type` is null/unknown | 403 | `ACTING_ORG_TYPE_NOT_ALLOWED` | type is not `aggregator`, `voice`, or `network_service` |
+| Org exists but `organization.type` is null/unknown/retired | 403 | `ACTING_ORG_TYPE_NOT_ALLOWED` | type is not `aggregator` or `network_service` — includes the `voice` type retired by #518 |
 | Caller's service user is not a member of any org | 403 | `SERVICE_USER_NOT_REGISTERED` | no `member` row for `request.user.id` |
 
 On success the preHandler attaches:
@@ -543,7 +854,7 @@ On success the preHandler attaches:
 ```ts
 request.acting_org = {
   org_id: string,
-  org_type: 'aggregator' | 'voice' | 'network_service',
+  org_type: 'aggregator' | 'network_service',
   service_user_id: string,
 };
 ```
@@ -551,18 +862,23 @@ request.acting_org = {
 and Fastify continues to the route handler. The `FastifyRequest` type
 augmentation is declared in `apps/api/types.d.ts`.
 
+On the client-credentials path the request also carries
+`request.service_client_id` — the Keycloak client id (`azp`) the token was
+issued to. Since every service org is a `network_service`, `acting_org` says
+the caller is a service and this says *which* service. Audit only.
+
 ## Deferred: per-org allowlist
 
-Today's preHandler accepts **any** `aggregator` / `voice` / `network_service`
+Today's preHandler accepts **any** `aggregator` / `network_service`
 org id from **any** service user that is a member of at least one org.
 Tightening to "service user X can only assert orgs Y and Z" is intentionally
 deferred.
 
 The intended path when this is picked up:
 
-- Encode the allowlist in the better-auth `member.permissions` text column
-  (or a sibling table, depending on how granular the policy turns out to
-  need to be).
+- Encode the allowlist in a new column on `member` (today it carries only
+  `role` and `team_id` — there is no permissions column) or a sibling table,
+  depending on how granular the policy turns out to need to be.
 - Add the membership-vs-acting-org check between the org-lookup and
   member-lookup steps in `acting_org.ts`.
 - Surface a new error code (e.g. `SERVICE_USER_NOT_AUTHORIZED_FOR_ORG`,
@@ -571,8 +887,8 @@ The intended path when this is picked up:
 This is safe to defer because:
 
 - Apikeys are only minted by the seed script (operator-controlled).
-- `aggregator` and `voice` orgs are only created via the
-  `network_service`-gated upsert endpoint.
+- `aggregator` orgs are only created via the `network_service`-gated upsert
+  endpoint.
 - The blast radius of a leaked service apikey is "can act for any
   aggregator on this instance", which an operator already needs to assume
   as part of treating the key as a secret.
@@ -586,10 +902,10 @@ Two `acting_org.org_type` values may use `acting_as_user_id` on
   (`user.onboarded_by_org_id === acting_org.org_id`). For
   counsellor-driven applications, future delegation models, etc.
 - **`network_service`** — unrestricted; may act for any user in the
-  network. Today's voice-DPG runs at this tier (network-hosted service).
+  network. The Raya voice bot runs at this tier (network-hosted service).
 
-Voice-type acting_orgs are rejected with `403 ACTING_ORG_TYPE_NOT_ALLOWED`
-(placeholder; no voice-typed orgs exist in production today).
+These are the only two. Every other `organization.type` — including the `voice`
+type retired by #518 — is rejected with `403 ACTING_ORG_TYPE_NOT_ALLOWED`.
 
 `POST /api/v1/action/update-status` is **self-acted only** — the caller
 must be the target item's owner. There is no `acting_as_user_id` field
@@ -627,7 +943,7 @@ effective actor — `403 SOURCE_ITEM_NOT_OWNED_BY_ACTOR` otherwise.
 | `network_service` apikey + acting_org | absent | `400 MISSING_ACTING_AS_USER_ID` |
 | `network_service` apikey + acting_org | present, user not found | `404 USER_NOT_FOUND` |
 | `network_service` apikey + acting_org | present, user exists | `201` |
-| `voice` acting_org | (any) | `403 ACTING_ORG_TYPE_NOT_ALLOWED` |
+| any other org type, including the retired `voice` (#518) | (any) | `403 ACTING_ORG_TYPE_NOT_ALLOWED` |
 
 ### Audit columns
 
@@ -639,6 +955,14 @@ caller:
 - `network_service` org_id → voice / ecosystem-manager-driven action.
 - `aggregator` org_id → counsellor / aggregator-DPG-driven action.
 - `NULL` → self-acted (UI session or apikey-as-self).
+
+These columns identify the **tier**, not the service: every integrating DPG
+holds a `network_service` org, so `performed_by_org_id` cannot by itself tell
+the voice bot from aggregator-dpg. On the client-credentials path that
+distinction lives in `request.service_client_id` (`azp`), which is bound onto
+the request logger rather than persisted — so today it is recoverable from logs,
+not by querying `item_actions`. Persisting it is a follow-up if audit ever needs
+to query on it.
 
 There are no indexes on these columns today — query via
 `WHERE performed_by_org_id = $1` sequentially when needed.
@@ -656,16 +980,18 @@ either:
 
 ## Voice DPG follows the same pattern
 
-Voice-dpg uses its own apikey from the seed and asserts `x-acting-org-id`
-set to either:
+The voice bot uses its own apikey from the seed (org slug `raya-voice-bot`) and
+asserts `x-acting-org-id` set to either:
 
 - the aggregator org id when voice is hosted per-aggregator
   (e.g. BBMP runs its own voice instance for itself); or
-- a designated network-voice org when voice is network-hosted with no
-  aggregator behind it (the org would be created with `type='voice'`).
+- its own `network_service` org when voice is network-hosted with no
+  aggregator behind it. Before #518 this was described as an org with
+  `type='voice'`; that type is retired, and the network-hosted case is served
+  by the `network_service` org it already has.
 
-The Signals-side handler logic does not change — `voice` and `aggregator`
-are interchangeable consumers from Signals' point of view. Routes that
+The Signals-side handler logic does not change — the voice bot and an
+aggregator are interchangeable consumers from Signals' point of view. Routes that
 need to discriminate (like the aggregator upsert) do so via
 `request.acting_org.org_type`.
 

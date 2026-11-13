@@ -8,6 +8,8 @@ import type { Item } from '@/lib/item-api';
 import { useMatchScore } from '@/hooks/use-match-score';
 import { MatchScoreModal } from '@/components/match-score/match-score-modal';
 import { ItemCard } from '@/components/cards/item-card';
+import { ShareProfileButton } from '@/components/share/share-profile-button';
+import { formatDomainLabel } from '@/lib/domain-icons';
 
 interface PrecisionInfo {
   labelKey: string;
@@ -24,7 +26,6 @@ export function getPrecisionInfo(precision: string): PrecisionInfo {
   }
 }
 
-const titleCase = (s: string) => s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
 
 interface MarkerPopupCardProps {
   marker: MapMarker;
@@ -33,6 +34,10 @@ interface MarkerPopupCardProps {
   actions?: DotActionSchema[];
   /** Initiate the connect flow for this marker. */
   onConnect?: () => void;
+  /** Disable the connect CTA (an action is already open for this pair). */
+  connectDisabled?: boolean;
+  /** Shown on hover when the connect CTA is disabled. */
+  connectDisabledReason?: string;
   /** Local (own) profile item — required for match score. */
   localItem?: Item | null;
   /** Full network Item for this marker — required for match score. */
@@ -41,6 +46,13 @@ interface MarkerPopupCardProps {
   schema?: RJSFSchema | null;
   /** Per-domain card config from network.json. */
   cardConfig?: DotCardConfig | null;
+  /** Network domains, for display labels (`provider` to "Service Provider"). Without it the domain is title-cased. */
+  domains?: ReadonlyArray<{ id: string; label?: string }> | null;
+  /**
+   * `'popup'` is the compact card for a map bubble; `'list'` is the full-size
+   * browse card, for the phone map's bottom sheet.
+   */
+  cardVariant?: 'popup' | 'list';
 }
 
 export function MarkerPopupCard({
@@ -48,11 +60,15 @@ export function MarkerPopupCard({
   onViewDetails,
   actions = [],
   onConnect,
+  connectDisabled = false,
+  connectDisabledReason,
   localItem,
   networkItem,
   schema,
   cardConfig,
-}: MarkerPopupCardProps) {
+  domains,
+  cardVariant = 'popup',
+}: Readonly<MarkerPopupCardProps>) {
   const { t } = useTranslation();
   const precisionInfo = getPrecisionInfo(marker.precision);
   const [modalOpen, setModalOpen] = React.useState(false);
@@ -87,10 +103,21 @@ export function MarkerPopupCard({
           </Button>
         )}
         {canConnect && (
-          <Button size="sm" className="flex-1" onClick={onConnect}>
-            <Plug className="mr-1.5 h-3.5 w-3.5" />
-            {actionLabel}
-          </Button>
+          // A native-title span, because a disabled button shows no hover title.
+          <span
+            className="flex-1"
+            title={connectDisabled ? connectDisabledReason : undefined}
+          >
+            <Button
+              size="sm"
+              className="w-full"
+              disabled={connectDisabled}
+              onClick={onConnect}
+            >
+              <Plug className="mr-1.5 h-3.5 w-3.5" />
+              {actionLabel}
+            </Button>
+          </span>
         )}
       </>
     ) : onViewDetails ? (
@@ -107,15 +134,21 @@ export function MarkerPopupCard({
   return (
     <>
       <ItemCard
-        variant="popup"
+        variant={cardVariant}
         className="shadow-none"
         schema={schema}
         cardConfig={cardConfig}
         data={marker.data}
         title={marker.label}
-        domainLabel={marker.domain ? titleCase(marker.domain) : undefined}
+        domainLabel={marker.domain ? formatDomainLabel(marker.domain, domains) : undefined}
         precisionLabel={t(precisionInfo.labelKey)}
         actions={actionButtons}
+        headerAction={
+          <ShareProfileButton
+            item={networkItem}
+            className="flex h-7 w-7 items-center justify-center rounded-full text-white hover:bg-white/25"
+          />
+        }
       />
 
       {canMatch && (
@@ -128,7 +161,7 @@ export function MarkerPopupCard({
           networkItemName={marker.label}
           onRecalculate={() => void recalculate()}
           onProceed={
-            canConnect
+            canConnect && !connectDisabled
               ? () => {
                   setModalOpen(false);
                   onConnect?.();

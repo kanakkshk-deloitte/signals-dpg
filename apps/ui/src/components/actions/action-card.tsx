@@ -17,6 +17,9 @@ import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import type { Action } from '@/lib/action-api';
 import { ProfileCardModal } from '@/components/actions/profile-card-modal';
+import { MatchScoreBadge } from '@/components/match-score/match-score-badge';
+import { formatDomainLabel } from '@/lib/domain-icons';
+import { useNetworkConfig } from '@/hooks/use-network-config';
 
 interface ActionCardProps {
   action: Action;
@@ -33,24 +36,26 @@ type StatusStyleShape = {
   icon: React.ReactNode;
 };
 
-// Status pill: dot + label on a soft tint. Semantic colours (not brand) so
-// state reads consistently across networks. Labels are i18n keys; the
-// component resolves them via t() so non-English locales render correctly.
+// Status pills use semantic colours, not brand, so state reads the same on
+// every network.
 const statusStyles: Record<string, StatusStyleShape> = {
-  created: { labelKey: 'actions.status_pill_pending', cls: 'bg-amber-50 text-amber-700', dot: 'bg-amber-500', icon: <Clock className="h-3 w-3" /> },
-  pending: { labelKey: 'actions.status_pill_pending', cls: 'bg-amber-50 text-amber-700', dot: 'bg-amber-500', icon: <Clock className="h-3 w-3" /> },
+  created: { labelKey: 'actions.status_pill_pending', cls: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300', dot: 'bg-amber-500', icon: <Clock className="h-3 w-3" /> },
+  pending: { labelKey: 'actions.status_pill_pending', cls: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300', dot: 'bg-amber-500', icon: <Clock className="h-3 w-3" /> },
+  // Still waiting on the receiver, like `created` — own labels, pending colour.
+  submitted: { labelKey: 'actions.status_pill_submitted', cls: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300', dot: 'bg-amber-500', icon: <Clock className="h-3 w-3" /> },
+  invited: { labelKey: 'actions.status_pill_invited', cls: 'bg-amber-50 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300', dot: 'bg-amber-500', icon: <Clock className="h-3 w-3" /> },
   new: { labelKey: 'actions.status_pill_new', cls: 'bg-primary/10 text-primary', dot: 'bg-primary', icon: <Sparkles className="h-3 w-3" /> },
-  accepted: { labelKey: 'actions.status_pill_accepted', cls: 'bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500', icon: <Check className="h-3 w-3" /> },
-  completed: { labelKey: 'actions.status_pill_completed', cls: 'bg-emerald-50 text-emerald-700', dot: 'bg-emerald-500', icon: <CheckCircle2 className="h-3 w-3" /> },
-  rejected: { labelKey: 'actions.status_pill_rejected', cls: 'bg-red-50 text-red-700', dot: 'bg-red-500', icon: <X className="h-3 w-3" /> },
-  cancelled: { labelKey: 'actions.status_pill_cancelled', cls: 'bg-slate-100 text-slate-600', dot: 'bg-slate-400', icon: <AlertCircle className="h-3 w-3" /> },
+  accepted: { labelKey: 'actions.status_pill_accepted', cls: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300', dot: 'bg-emerald-500', icon: <Check className="h-3 w-3" /> },
+  completed: { labelKey: 'actions.status_pill_completed', cls: 'bg-emerald-50 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300', dot: 'bg-emerald-500', icon: <CheckCircle2 className="h-3 w-3" /> },
+  rejected: { labelKey: 'actions.status_pill_rejected', cls: 'bg-red-50 text-red-700 dark:bg-red-500/15 dark:text-red-300', dot: 'bg-red-500', icon: <X className="h-3 w-3" /> },
+  cancelled: { labelKey: 'actions.status_pill_cancelled', cls: 'bg-slate-100 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300', dot: 'bg-slate-400', icon: <AlertCircle className="h-3 w-3" /> },
 };
 
-function getStatusStyle(status: string): StatusStyleShape {
+export function getStatusStyle(status: string): StatusStyleShape {
   return (
     statusStyles[status] ?? {
       labelKey: null,
-      cls: 'bg-slate-100 text-slate-600',
+      cls: 'bg-slate-100 text-slate-600 dark:bg-slate-500/20 dark:text-slate-300',
       dot: 'bg-slate-400',
       icon: null,
     }
@@ -63,6 +68,10 @@ function formatItemLocations(locs: Array<{ lat: number; lng: number; label?: str
   return labels.length > 0 ? labels.join(', ') : `${locs.length} location${locs.length > 1 ? 's' : ''}`;
 }
 
+function formatDistanceKm(distanceM: number): string {
+  return `${(distanceM / 1000).toFixed(1)} km`;
+}
+
 function formatRequirementValue(value: unknown): string {
   if (value == null) return '—';
   if (Array.isArray(value)) return value.map((v) => String(v)).join(', ');
@@ -71,7 +80,7 @@ function formatRequirementValue(value: unknown): string {
 }
 
 const titleCase = (s: string) =>
-  s.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase());
+  s.replaceAll('_', ' ').replaceAll(/\b\w/g, (c) => c.toUpperCase());
 
 export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMode = false }: ActionCardProps) {
   const { t } = useTranslation();
@@ -80,30 +89,30 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
 
   const status = getStatusStyle(action.action_status);
 
-  // Resolve the "other party" vs "me" from ownership.
   const otherParty =
     ownershipRole === 'initiated'
       ? {
-        name: action.target_item_name,
-        itemId: action.target_item_id,
-        domain: action.target_item_domain,
-        itemType: action.target_item_type,
-        network: action.target_item_network,
-        locations: action.target_item_locations,
-      }
+          name: action.target_item_name,
+          itemId: action.target_item_id,
+          domain: action.target_item_domain,
+          itemType: action.target_item_type,
+          network: action.target_item_network,
+          locations: action.target_item_locations,
+        }
       : {
-        name: action.source_item_name,
-        itemId: action.source_item_id,
-        domain: action.source_item_domain,
-        itemType: action.source_item_type,
-        network: action.source_item_network,
-        locations: action.source_item_locations,
-      };
+          name: action.source_item_name,
+          itemId: action.source_item_id,
+          domain: action.source_item_domain,
+          itemType: action.source_item_type,
+          network: action.source_item_network,
+          locations: action.source_item_locations,
+        };
   const myDomain =
     ownershipRole === 'initiated' ? action.source_item_domain : action.target_item_domain;
 
-  const otherRole = titleCase(otherParty.domain);
-  const myRole = titleCase(myDomain);
+  const { data: acNetworkConfig } = useNetworkConfig(otherParty.network ?? null);
+  const otherRole = formatDomainLabel(otherParty.domain, acNetworkConfig?.domains);
+  const myRole = formatDomainLabel(myDomain, acNetworkConfig?.domains);
   const hasRealName = !!otherParty.name && otherParty.name !== otherParty.itemId;
   const rawName = hasRealName
     ? otherParty.name!
@@ -111,9 +120,7 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
   // Avatar: first letter of a real name, else the role's initial.
   const initial = (hasRealName ? rawName : otherRole).charAt(0).toUpperCase() || '?';
 
-  // Both sides format as "<Subject> (<Role>)" so the brackets consistently
-  // contain the role on each end — avoids the mismatch where "You (Seeker)"
-  // had role-in-brackets while "Provider (Name)" had name-in-brackets.
+  // Both sides read "<Subject> (<Role>)".
   const meLabel = t('actions.you_label', { role: myRole });
   const otherLabel = `${rawName} (${otherRole})`;
   const fromLabel = ownershipRole === 'initiated' ? meLabel : otherLabel;
@@ -127,8 +134,6 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
   const canReject = ownershipRole === 'received' && isPending;
   const canComplete = ownershipRole === 'received' && action.action_status === 'accepted';
   const canCancel = ownershipRole === 'initiated' && isPending;
-  const canGiveFeedback =
-    ownershipRole === 'initiated' && action.action_status === 'completed';
 
   // Message + structured requirement fields split out of the snapshot.
   const reqEntries = Object.entries(action.requirements_snapshot);
@@ -151,6 +156,21 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
               <span className={`h-1.5 w-1.5 rounded-full ${status.dot}`} />
               {status.labelKey ? t(status.labelKey) : action.action_status}
             </span>
+            {action.match_score != null ? (
+              // A connect-time snapshot of the profile match. The column is
+              // 0-10 (compute_match_score); the pill takes 0-100.
+              <span data-tour="match-score" className="inline-flex">
+                <MatchScoreBadge
+                  metric={{ kind: 'relevance', percent: action.match_score * 10 }}
+                  basis="profile"
+                  size="sm"
+                />
+              </span>
+            ) : (
+              <span data-tour="match-score" className="inline-flex items-center rounded-full bg-slate-100 px-2.5 py-1 text-[11px] font-medium text-slate-500">
+                {t('actions.not_scored_yet', 'Not scored yet')}
+              </span>
+            )}
           </div>
           <span className="whitespace-nowrap text-xs font-medium text-muted-foreground">
             {formatDistanceToNow(new Date(action.created_at), { addSuffix: true })}
@@ -240,9 +260,9 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
           </>
         )}
 
-        {/* Reason attached to a rejected/cancelled action — the actor's remark,
-            or a system remark (e.g. counterparty retired, #347). Rendered at the
-            card level so it shows even when the action has no requirements. */}
+        {/* The remark on a rejected or cancelled action (the actor's, or a
+            system one such as a retired counterparty), shown even without
+            requirements. */}
         {action.remarks && (
           <div className="mb-3 rounded-xl border border-border bg-muted/40 p-3.5">
             <p className="mb-0.5 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
@@ -261,53 +281,53 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
           </div>
         )}
 
+        {action.distance_m != null && (
+          <div data-tour="action-distance" className="mb-3 flex items-center gap-1.5 text-xs text-muted-foreground">
+            <MapPin className="h-3 w-3" />
+            <span>{formatDistanceKm(action.distance_m)}</span>
+          </div>
+        )}
+
         {/* Actions */}
         {!selectionMode && (
-          <div className="flex flex-wrap items-center gap-2 border-t pt-3">
-            {/* Always available (both roles, every status): the counterparty's
-              profile — masked while pending, unmasked once PII is revealed
-              (accepted/completed). Handled inside ProfileCardModal. */}
-            <Button
-              size="sm"
-              variant="outline"
-              className="flex-1"
-              onClick={() => setShowProfile(true)}
-            >
-              <UserRound className="mr-1.5 h-3.5 w-3.5" />
-              {t('actions.btn_view_profile')}
-            </Button>
+        <div data-tour="action-respond" className="flex flex-wrap items-center gap-2 border-t pt-3">
+          {/* Always available: the counterparty's profile, masked or revealed
+              as ProfileCardModal decides. */}
+          <Button
+            size="sm"
+            variant="outline"
+            className="flex-1"
+            onClick={() => setShowProfile(true)}
+          >
+            <UserRound className="mr-1.5 h-3.5 w-3.5" />
+            {t('actions.btn_view_profile')}
+          </Button>
 
-            {canAccept && (
-              <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'accepted')}>
-                <Check className="mr-1.5 h-3.5 w-3.5" />
-                {t('actions.btn_accept')}
-              </Button>
-            )}
-            {canReject && (
-              <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'rejected')}>
-                <X className="mr-1.5 h-3.5 w-3.5" />
-                {t('actions.btn_reject')}
-              </Button>
-            )}
-            {canComplete && (
-              <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'completed')}>
-                <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
-                {t('actions.btn_complete')}
-              </Button>
-            )}
-            {canCancel && (
-              <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'cancelled')}>
-                <X className="mr-1.5 h-3.5 w-3.5 text-destructive" />
-                {t('actions.btn_cancel')}
-              </Button>
-            )}
-            {canGiveFeedback && (
-              <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'completed')}>
-                <MessageSquare className="mr-1.5 h-3.5 w-3.5" />
-                {t('actions.btn_feedback', 'Give feedback')}
-              </Button>
-            )}
-          </div>
+          {canAccept && (
+            <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'accepted')}>
+              <Check className="mr-1.5 h-3.5 w-3.5" />
+              {t('actions.btn_accept')}
+            </Button>
+          )}
+          {canReject && (
+            <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'rejected')}>
+              <X className="mr-1.5 h-3.5 w-3.5" />
+              {t('actions.btn_reject')}
+            </Button>
+          )}
+          {canComplete && (
+            <Button size="sm" className="flex-1 shadow-sm" onClick={() => onStatusUpdate?.(action, 'completed')}>
+              <CheckCircle2 className="mr-1.5 h-3.5 w-3.5" />
+              {t('actions.btn_complete')}
+            </Button>
+          )}
+          {canCancel && (
+            <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'cancelled')}>
+              <X className="mr-1.5 h-3.5 w-3.5 text-destructive" />
+              {t('actions.btn_cancel')}
+            </Button>
+          )}
+        </div>
         )}
       </div>
 

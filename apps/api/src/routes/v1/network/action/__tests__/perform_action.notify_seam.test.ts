@@ -35,6 +35,16 @@ const { BASE_URL, notifySpy, insertActionEventSpy } = vi.hoisted(() => ({
 
 // Notifications are CONFIGURED here (unlike the other seam tests) so dispatch
 // actually runs and reaches the (throwing) notify client.
+// The route is peer-guarded (AUTH-VULN-05). These cases cover the notify /
+// match-score seams, not auth, so let every request through — the guard's own
+// wiring is asserted in the network route-registration test.
+vi.mock('@/middleware/peer_instance_guard', () => ({
+  peer_instance_guard: async () => {},
+  // The route uses the STRICT variant, which never honours permissive — stub it
+  // too, or every case here 401s before reaching the handler under test.
+  peer_instance_guard_strict: async () => {},
+}));
+
 vi.mock('@/config', () => ({
   apiConfig: {
     domain: BASE_URL,
@@ -51,6 +61,7 @@ vi.mock('@/config', () => ({
     NOTIFICATION_REPLY_TO: 'reply@test.local',
     FRONTEND_BASE_URL: 'http://fe.test',
   },
+  uiHostBindings: { byDomain: {}, warnings: [] },
 }));
 
 // Throwing notification client — the whole point of the test.
@@ -84,9 +95,12 @@ vi.mock('@/utils/action_event_runtime', async () => {
   return {
     ...actual,
     isCurrentInstanceItem: vi.fn(() => true),
-    fetchLocalItemSnapshot: vi.fn(async () => ({
-      created_by: 'usr_provider',
-      item_id: '22222222-2222-4222-8222-222222222222',
+    // Distinct owners per item so the self-action guard doesn't trip (source
+    // seeker vs target provider — a real cross-owner action).
+    fetchLocalItemSnapshot: vi.fn(async (_db: unknown, item: { item_id: string }) => ({
+      created_by:
+        item.item_id === '11111111-1111-4111-8111-111111111111' ? 'usr_seeker' : 'usr_provider',
+      item_id: item.item_id,
       item_locations: [],
       lifecycle_status: 'live',
     })),
@@ -113,6 +127,14 @@ vi.mock('@/services/consent_version', () => ({
 
 vi.mock('@api/db/postgres/drizzle_config', () => {
   const dbMock: Record<string, unknown> = {
+    // Pair-cap pre-pass (#370): advisory lock (execute) + open-action recount
+    // (select→from→where). 0 open → under the default cap of 1 → proceeds.
+    execute: vi.fn(async () => undefined),
+    select: vi.fn(() => ({
+      from: vi.fn(() => ({
+        where: vi.fn(async () => [{ open: 0 }]),
+      })),
+    })),
     insert: vi.fn(() => ({
       values: vi.fn(() => ({
         returning: vi.fn(async () => [

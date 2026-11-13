@@ -4,3 +4,44 @@ packages:
 allowBuilds:
   esbuild: true
   sharp: true
+
+# Security floors for vulnerable transitives (Trivy / GHSA). Range-scoped so only
+# the vulnerable copies move; already-patched consumers are untouched. Nothing here
+# is declared directly — fast-uri arrives via fastify/ajv and qs via the express
+# family — so Dependabot cannot raise these itself.
+#
+#   fast-uri 3.1.5 and 4.1.2 → four HIGH SSRF / host-confusion advisories:
+#     CVE-2026-75899, CVE-2026-75931, CVE-2026-75975, CVE-2026-76172.
+#     Fixed in 2.4.5 / 3.1.6 / 4.1.3. Both major lines are present in this tree,
+#     so both are floored separately rather than collapsed onto one version —
+#     forcing a single copy across a major boundary is how the duplicate-copy
+#     type breakage in aggregator-dpg#585 started.
+#     The replacement is an EXACT version, not `'>=3.1.6'`: an open-ended `>=`
+#     is not bounded by the selector's major, so `fast-uri@>=3.0.0 <3.1.6`
+#     resolving to `'>=3.1.6'` silently pulled the 3.x copy up to 4.1.4 —
+#     collapsing the two lines rather than patching each in place.
+#   qs 6.15.3 → CVE-2026-82417 (MED) and CVE-2026-82562 (LOW), both DoS in
+#     stringify / array-limit parsing. Fixed in 6.16.0.
+overrides:
+#   fast-uri 3.1.7 and 4.1.4 -> CVE-2026-86472 (host-case normalization bypass)
+#     and CVE-2026-86818 (mailto header injection via percent-encoded
+#     field-name desynchronization). Fixed in 2.4.7 / 3.1.8 / 4.1.5. Both
+#     selectors are widened to catch the versions the previous floors produced.
+#   source-map-js 1.2.1 -> CVE-2026-93749 (HIGH), DoS via malformed indexed
+#     source maps. Fixed in 1.2.2. Arrives via @tailwindcss/node and css-tree.
+#   fast-uri 3.1.8/4.1.5 -> CVE-2026-110180/110306/110095/110725 (host/XSS/
+#     path-traversal bypasses). Fixed in 3.1.9 / 4.2.3.
+#   follow-redirects 1.16.0 (via axios, apps/ui) -> CVE-2026-111755/111756
+#     (credential-header leaks). Fixed in 1.16.1.
+#   undici 7.29.1/8.11.2 (via @scalar/json-magic, jsdom) -> CVE-2026-109869/
+#     109841/109924 (DoS, SRI bypass). Fixed in 7.30.1 / 8.12.2.
+#   zod 4.6.5 (via @scalar/types) -> CVE-2023-54404, memory exhaustion on
+#     unbounded container schemas. Fixed in 4.6.6.
+  'fast-uri@>=3.0.0 <3.1.9': 3.1.9
+  'fast-uri@>=4.0.0 <4.2.3': 4.2.3
+  'source-map-js@<1.2.2': 1.2.2
+  'qs@<6.16.0': 6.16.0
+  'follow-redirects@<1.16.1': 1.16.1
+  'undici@>=7.0.0 <7.30.1': 7.30.1
+  'undici@>=8.0.0 <8.12.2': 8.12.2
+  'zod@>=4.0.0 <4.6.6': 4.6.6

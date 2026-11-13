@@ -2,30 +2,23 @@ import * as React from 'react';
 import type { WidgetProps } from '@rjsf/utils';
 import { Input } from '@/components/ui/input';
 import { cn } from '@/lib/utils';
+import { useSuggestionKeyboard } from './use-suggestion-keyboard';
 import { getRuntimeEnv } from '@/lib/runtime-env';
 
 /**
- * A schema-driven autocomplete backed by an EXTERNAL reference dataset rather
- * than an inline JSON-Schema `enum`. A field opts in via the custom
- * `x-reference-source` marker in network.json (e.g. `"colleges"`), which
- * `generateUiSchema` maps to this widget with `ui:options.source`. The widget
- * fetches `<base>/<dataset>.json` — `base` is `VITE_REFERENCE_BASE_URL`
- * (default the UI's own `/reference/`) and `dataset` is resolved from the source
- * (see `resolveDatasetId`) — so the — potentially huge — option list lives
- * outside network.json and can be updated without a schema change or redeploy.
+ * Autocomplete over an external reference dataset, for fields marked
+ * `x-reference-source` in network.json. Fetches `<base>/<dataset>.json` (see
+ * `referenceUrl` and `resolveDatasetId`), so large lists live outside
+ * network.json.
  *
- * The stored value is the plain option NAME (a string), so the field stays a
- * simple `type: "string"` and existing free-text values keep working.
+ * Stores the option name as a plain string, so free-text values still work.
+ * The marker is `"source"` or `{ source, subtitle }`, where `subtitle` lists
+ * the option fields (`district` | `state`) shown under the name; `[]` means
+ * name-only, and the default is `["district"]`.
  *
- * The marker may be a bare string (`"colleges"`) or an object carrying display
- * config: `{ source: "colleges", subtitle: ["district"] }`. `subtitle` is an
- * ordered list of option fields (`district` | `state`) rendered under the name;
- * omit or use `[]` for name-only. Defaults to `["district"]`.
- *
- * Supported dataset shapes (both flattened to `{ name, district?, state? }`):
- *   1. Hierarchical: `{ states: [{ name, districts: [{ name, organizations:
- *      [{ name, district, state, ... }] }] }] }` (the KA/UP institute lists).
- *   2. Flat: `[{ name, district?, state? }, ...]`.
+ * Dataset shapes, both flattened to `{ name, district?, state? }`:
+ *   1. `{ states: [{ name, districts: [{ name, organizations: [...] }] }] }`
+ *   2. `[{ name, district?, state? }, ...]`
  */
 
 interface ReferenceOption {
@@ -51,8 +44,8 @@ type HierarchicalDataset = {
 
 const MAX_SUGGESTIONS = 50;
 
-// Module-level cache so switching fields / re-mounting the form doesn't refetch
-// the (large) dataset. Keyed by source id; stores the in-flight promise.
+// Module-level cache of in-flight promises by source id, so remounts do not
+// refetch a large dataset.
 const datasetCache = new Map<string, Promise<ReferenceOption[]>>();
 
 function flatten(raw: unknown): ReferenceOption[] {
@@ -90,12 +83,9 @@ function flatten(raw: unknown): ReferenceOption[] {
 }
 
 /**
- * Resolve a network.json `x-reference-source` value to the concrete dataset
- * file id (served from `public/reference/<id>.json`). `colleges` is
- * region-scoped: the state is chosen PER-DEPLOYMENT via `VITE_COLLEGE_DATASET`,
- * a short region code (`ka` | `up`), which maps to `colleges-<code>`. So one
- * build serves any state without a schema change. Any other source id is used
- * verbatim. Defaults to region `ka` when the env var is unset.
+ * Maps a source to its dataset id. `colleges` is region-scoped per deployment
+ * via `VITE_COLLEGE_DATASET` (`ka` | `up`, default `ka`), giving
+ * `colleges-<code>`. Other sources are used verbatim.
  */
 function resolveDatasetId(source: string): string {
   if (source === 'colleges') {
@@ -106,13 +96,10 @@ function resolveDatasetId(source: string): string {
 }
 
 /**
- * Base URL the reference datasets are served from. Defaults to the UI's own
- * `/reference/` (files baked into the image), but is overridable per-deployment
- * via `VITE_REFERENCE_BASE_URL` — set from a ConfigMap through
- * `window.__DPG_UI_CONFIG__` — so the lists can be hosted alongside network.json
- * (registry / CDN / API) and updated without a UI rebuild. Absolute URLs are
- * used as-is; a relative value resolves against the UI origin. Remote hosts must
- * send permissive CORS headers since the browser fetches directly.
+ * Dataset URL. The base is the UI's own `/reference/` unless the runtime
+ * `VITE_REFERENCE_BASE_URL` overrides it; a relative value resolves against
+ * the UI origin. A remote host must send CORS headers, since the browser
+ * fetches directly.
  */
 function referenceUrl(id: string): string {
   const raw = getRuntimeEnv('VITE_REFERENCE_BASE_URL') || '/reference/';
@@ -152,9 +139,8 @@ export function ReferenceAutocompleteWidget({
     | { source?: string; subtitleFields?: string[] }
     | undefined;
   const source = opts?.source;
-  // Validate configured fields against the allowed set (unknown values dropped);
-  // an explicit (possibly empty) list wins, a missing config falls back to the
-  // default. `[]` therefore means name-only.
+  // Unknown fields are dropped; an explicit list (even `[]`) wins over the
+  // default.
   const subtitleFields: SubtitleField[] = Array.isArray(opts?.subtitleFields)
     ? opts.subtitleFields.filter((f): f is SubtitleField =>
         (SUBTITLE_FIELDS as readonly string[]).includes(f),
@@ -165,7 +151,7 @@ export function ReferenceAutocompleteWidget({
   const [open, setOpen] = React.useState(false);
   const blurRef = React.useRef<number | undefined>(undefined);
 
-  // Keep the input in sync when RJSF pushes a new value (edit-mode prefill).
+  // Sync the input when RJSF pushes a new value.
   React.useEffect(() => {
     setText((value as string) ?? '');
   }, [value]);
@@ -178,8 +164,7 @@ export function ReferenceAutocompleteWidget({
         if (live) setDataset(opts);
       })
       .catch(() => {
-        // Load failure leaves the field as a plain text input (dataset stays
-        // empty, no suggestions) — the typed value is still captured.
+        // On failure the field stays a plain text input.
         if (live) setDataset([]);
       });
     return () => {
@@ -214,14 +199,24 @@ export function ReferenceAutocompleteWidget({
   }
 
   function subtitle(o: ReferenceOption): string | null {
-    // Ordered per the marker's `subtitle` config (default: district only). Note
-    // that when the dataset is state-scoped by deployment, `state` is constant
-    // across options, so `["district"]` is usually the useful choice.
     const parts = subtitleFields
       .map((f) => o[f])
       .filter((v): v is string => typeof v === 'string' && v.length > 0);
     return parts.length > 0 ? parts.join(', ') : null;
   }
+
+  const { activeIndex, setActiveIndex, optionId, activeDescendantId, listboxId, onKeyDown } =
+    useSuggestionKeyboard({
+      items: suggestions,
+      open,
+      onOpen: () => setOpen(true),
+      onClose: () => setOpen(false),
+      onSelect: (index) => {
+        const option = suggestions[index];
+        if (option) choose(option);
+      },
+      idPrefix: id,
+    });
 
   return (
     <div className="relative space-y-2">
@@ -231,32 +226,48 @@ export function ReferenceAutocompleteWidget({
         disabled={disabled || readonly}
         autoComplete="off"
         placeholder={placeholder}
+        role="combobox"
+        aria-expanded={open && suggestions.length > 0}
+        aria-controls={listboxId}
+        aria-autocomplete="list"
+        aria-activedescendant={activeDescendantId}
         className={cn(rawErrors && rawErrors.length > 0 && 'border-destructive')}
         onChange={(e) => handleInput(e.target.value)}
+        onKeyDown={onKeyDown}
         onFocus={() => setOpen(suggestions.length > 0)}
         onBlur={() => {
           blurRef.current = window.setTimeout(() => setOpen(false), 150);
         }}
       />
       {open && suggestions.length > 0 && (
-        <ul className="absolute z-50 mt-1 max-h-72 w-full overflow-auto rounded-md border bg-popover shadow-md">
+        <ul
+          id={listboxId}
+          role="listbox"
+          className="absolute z-50 mt-1 max-h-72 w-full overflow-auto rounded-md border bg-popover shadow-md"
+        >
           {suggestions.map((o, i) => {
             const sub = subtitle(o);
             return (
-              <li key={`${o.name}-${i}`}>
-                <button
-                  type="button"
-                  className="block w-full px-3 py-2 text-left text-sm hover:bg-accent"
-                  onMouseDown={(e) => {
-                    e.preventDefault();
-                    choose(o);
-                  }}
-                >
-                  <span className="block">{o.name}</span>
-                  {sub && (
-                    <span className="block text-xs text-muted-foreground">{sub}</span>
-                  )}
-                </button>
+              // `role="option"` on the item; see LocationAutocompleteWidget.
+              <li
+                key={`${o.name}-${i}`}
+                id={optionId(i)}
+                role="option"
+                aria-selected={i === activeIndex}
+                className={cn(
+                  'cursor-pointer px-3 py-2 text-sm',
+                  i === activeIndex ? 'bg-accent' : 'hover:bg-accent',
+                )}
+                onMouseDown={(e) => {
+                  e.preventDefault();
+                  choose(o);
+                }}
+                onMouseEnter={() => setActiveIndex(i)}
+              >
+                <span className="block">{o.name}</span>
+                {sub && (
+                  <span className="block text-xs text-muted-foreground">{sub}</span>
+                )}
               </li>
             );
           })}

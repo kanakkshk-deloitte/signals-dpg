@@ -360,7 +360,13 @@ function SidebarSeparator({
     <Separator
       data-slot="sidebar-separator"
       data-sidebar="separator"
-      className={cn("mx-2 w-auto bg-sidebar-border", className)}
+      // Prefixed `w-auto`: the Separator's `data-[orientation=horizontal]:w-full`
+      // outranks a bare `.w-auto`, and full width plus `mx-2` overflows the
+      // sidebar.
+      className={cn(
+        "mx-2 data-[orientation=horizontal]:w-auto bg-sidebar-border",
+        className
+      )}
       {...props}
     />
   )
@@ -597,17 +603,26 @@ function SidebarMenuBadge({
   )
 }
 
+// Varied-looking placeholder widths (50–90%) for the skeleton rows. Picked by
+// the row's index rather than at random so the value is stable across renders
+// and identical on server and client (no hydration mismatch).
+const SKELETON_WIDTHS = ["72%", "54%", "86%", "63%", "78%", "50%", "68%", "90%"]
+
 function SidebarMenuSkeleton({
   className,
   showIcon = false,
+  index = 0,
   ...props
 }: React.ComponentProps<"div"> & {
   showIcon?: boolean
+  /** Position of this row in the skeleton list; selects its placeholder width. */
+  index?: number
 }) {
-  // Random width between 50 to 90%.
-  const width = React.useMemo(() => {
-    return `${Math.floor(Math.random() * 40) + 50}%`
-  }, [])
+  const width =
+    SKELETON_WIDTHS[
+      ((index % SKELETON_WIDTHS.length) + SKELETON_WIDTHS.length) %
+        SKELETON_WIDTHS.length
+    ]
 
   return (
     <div

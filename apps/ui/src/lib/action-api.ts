@@ -1,9 +1,6 @@
 import axios from 'axios';
 import { createApiClient } from './api-client';
 import { unwrapBulkSingle, postBulkEnvelope, type BulkEnvelope } from './bulk';
-import { getAuthToken } from './auth-token';
-
-// ─── Contact-details types ────────────────────────────────────────
 
 export type ContactDetailsErrorCode =
   | 'UNAUTHORIZED'
@@ -45,7 +42,7 @@ export interface ContactDetailsResponse {
   };
 }
 
-/** Error thrown by getActionContactDetails on non-2xx responses */
+/** Error thrown by getActionContactDetails on a non-2xx response. */
 export interface ContactDetailsError extends Error {
   status: number;
   code: ContactDetailsErrorCode;
@@ -54,29 +51,15 @@ export interface ContactDetailsError extends Error {
 const apiClient = createApiClient();
 
 /**
- * Create an API client for a specific instance URL
+ * Actions always go to the same-origin API: the session is an origin-scoped
+ * cookie, so a request to the item's recorded `item_instance_url` would carry no
+ * session and return 401. `POST /action/perform` needs the source item to be
+ * local anyway; the API forwards cross-instance hops to the target instance over
+ * the HMAC-signed peer route, since the browser holds no peer credential.
  */
-function createInstanceApiClient(instanceUrl: string) {
-  const client = axios.create({
-    baseURL: instanceUrl,
-    withCredentials: true,
-    headers: {
-      'Content-Type': 'application/json',
-    },
-  });
-
-  client.interceptors.request.use((config) => {
-    const token = getAuthToken();
-    if (token) {
-      config.headers.Authorization = `Bearer ${token}`;
-    }
-    return config;
-  });
-
-  return client;
+function actionClient() {
+  return apiClient;
 }
-
-// ─── Types ───────────────────────────────────────────────────────
 
 export interface ItemRef {
   item_network: string;
@@ -90,16 +73,14 @@ export interface TargetItemRef extends ItemRef {
 }
 
 /**
- * Sentinel key used by ActionModal to smuggle the consent block through the
- * onSubmit(formData) signature into the parent's PerformActionPayload assembly
- * (see action-modal.tsx producer + home-page.tsx consumer).
+ * Key ActionModal uses to pass the consent block through `onSubmit(formData)`
+ * into the caller's PerformActionPayload (see action-modal.tsx and home-page.tsx).
  */
 export const ACTION_CONSENT_SENTINEL = '__consent' as const;
 
 /**
- * Payload for performing an action (initiated by source user)
- * Sent as a single object to POST /api/v1/action/perform
- * For bulk actions, use performActionsBulk which posts to /api/v1/action/perform/bulk
+ * Body for `POST /api/v1/action/perform`. Use `performActionsBulk` for
+ * `/api/v1/action/perform/bulk`.
  */
 export interface PerformActionPayload {
   action_type: string;
@@ -109,9 +90,6 @@ export interface PerformActionPayload {
   consent?: { acknowledged: true; version: number; brand?: string | null };
 }
 
-/**
- * Response from perform action API
- */
 export interface PerformActionResponse {
   action_id: string;
   action_type: string;
@@ -121,10 +99,7 @@ export interface PerformActionResponse {
   target_item_id: string;
 }
 
-/**
- * Payload for updating action status (target user response)
- * Matches the actual API schema: POST /api/v1/action/update-status
- */
+/** Body for `POST /api/v1/action/update-status` (target user's response). */
 export interface UpdateActionStatusPayload {
   action_id: string;
   action_status: string;
@@ -132,9 +107,6 @@ export interface UpdateActionStatusPayload {
   consent?: { acknowledged: true; version: number; brand?: string | null };
 }
 
-/**
- * Response from update action status API
- */
 export interface UpdateActionStatusResponse {
   action_id: string;
   action_type: string;
@@ -142,22 +114,28 @@ export interface UpdateActionStatusResponse {
   update_count: number;
 }
 
-/**
- * Query parameters for fetching actions
- */
 export interface FetchMyActionsQuery {
   action_id?: string;
-  action_type?: string;
-  action_status?: string;
+  // One value or several (OR'd); the server normalizes both to an array.
+  action_type?: string | string[];
+  action_status?: string | string[];
   item_id?: string;
+  /** Several of the caller's profiles; omitted = all of them. */
+  item_ids?: string[];
   ownership_role?: 'all' | 'initiated' | 'received';
+  /** Search on unmasked names only (see the server's `q`). */
+  q?: string;
+  /** Opt-in response parts. */
+  include?: Array<'counts' | 'column_fields'>;
+  // Server default is 'recent'.
+  sort?: 'recent' | 'oldest' | 'match_score' | 'distance';
+  // Non-PII item_state facet selections on the counterparty item (OR within a
+  // field, AND across fields). `domain` limits a selection to that domain.
+  facets?: Array<{ domain?: string; field: string; values: string[] }>;
   limit?: number;
   offset?: number;
 }
 
-/**
- * Action with ownership roles returned from API
- */
 export interface Action {
   action_id: string;
   action_type: string;
@@ -176,33 +154,46 @@ export interface Action {
   target_item_owner: string | null;
   target_item_locations?: Array<{ lat: number; lng: number; label?: string }>;
   requirements_snapshot: Record<string, unknown>;
-  // Reason attached when the action was rejected/cancelled — the actor's own
-  // remark, or a system remark (e.g. when the counterparty retired, #347).
+  // The actor's remark, or a system remark (e.g. the counterparty retired).
   remarks?: string | null;
   created_at: string;
   updated_at: string;
   ownership_roles: ('initiated' | 'received')[];
-  // Human-readable names resolved server-side from each item's
-  // display_name_field (falls back to the item id when unavailable).
+  // Resolved server-side from each item's display_name_field; falls back to the item id.
   source_item_name?: string | null;
   target_item_name?: string | null;
+  // Null when not computed for this row (e.g. no location on one side for
+  // distance, or the score service was not consulted).
+  match_score?: number | null;
+  distance_m?: number | null;
+  /** `include=column_fields` only — non-private fields, no personal data. */
+  counterparty?: {
+    network: string;
+    domain: string;
+    item_type: string;
+    column_fields: Record<string, unknown>;
+  } | null;
 }
 
-/**
- * Response from fetch actions API
- */
+/** `include=counts`: totals for the My Actions saved views. */
+export interface OwnedActionCounts {
+  all: number;
+  needs_response: number;
+  ready_to_export: number;
+  sent: number;
+}
+
 export interface FetchMyActionsResponse {
   meta: {
     total: number;
     limit: number;
     offset: number;
+    counts?: OwnedActionCounts;
   };
   actions: Action[];
 }
 
-/**
- * Action event (status history)
- */
+/** Action event (status history). */
 export interface ActionEvent {
   event_id: string;
   action_type: string;
@@ -228,9 +219,6 @@ export interface ActionEvent {
   ownership_roles: ('initiated' | 'received')[];
 }
 
-/**
- * Response from fetch action events API
- */
 export interface FetchActionEventsResponse {
   meta: {
     total: number;
@@ -240,9 +228,6 @@ export interface FetchActionEventsResponse {
   events: ActionEvent[];
 }
 
-/**
- * Query parameters for fetching action events
- */
 export interface FetchActionEventsQuery {
   action_type: string;
   action_id: string;
@@ -251,12 +236,9 @@ export interface FetchActionEventsQuery {
   offset?: number;
 }
 
-// ─── Guardian OTP (U18) ─────────────────────────────────────────────
-
 /**
- * Machine-readable error codes the guardian-OTP challenge/response flow can
- * surface on a bulk result entry's `error` field (perform_action /
- * update_action_status), so `action-modal` can branch on them.
+ * Guardian-OTP error codes a bulk result entry's `error` can carry
+ * (perform_action / update_action_status), so `action-modal` can branch on them.
  */
 export type GuardianOtpErrorCode =
   | 'GUARDIAN_OTP_REQUIRED'
@@ -273,23 +255,18 @@ const GUARDIAN_OTP_ERROR_CODES: readonly GuardianOtpErrorCode[] = [
   'OTP_PROVIDER_UNAVAILABLE',
 ];
 
-/**
- * Classifies a bulk result entry's `error` field (e.g. from
- * `BulkEnvelope.results[i]` or a thrown `BulkSingleError`) as a
- * `GuardianOtpErrorCode`, or `null` if it isn't one of those codes (including
- * a success entry with no `error` field at all).
- */
-// The profile-consent guardian OTP routes (/u18/profile-consent/*) use
-// different code strings than the action routes; map them to the shared set so
-// GuardianOtpDialog shows the right message (e.g. INVALID_OTP -> "Incorrect code"
-// instead of a generic error).
+// The profile-consent guardian OTP routes (/u18/profile-consent/*) use different
+// code strings; map them to the shared set so GuardianOtpDialog shows the right message.
 const GUARDIAN_OTP_CODE_ALIASES: Record<string, GuardianOtpErrorCode> = {
   INVALID_OTP: 'GUARDIAN_OTP_INVALID',
   OTP_VERIFY_THROTTLED: 'GUARDIAN_OTP_THROTTLED',
   OTP_RATE_LIMITED: 'GUARDIAN_OTP_RATE_LIMITED',
   OTP_PROVIDER_UNAVAILABLE: 'OTP_PROVIDER_UNAVAILABLE',
 };
-
+/**
+ * Classifies a bulk result entry's `error` as a `GuardianOtpErrorCode`, or
+ * `null` if it is not one (including a success entry with no `error`).
+ */
 export function guardianOtpErrorOf(
   entry: { error?: string } | null | undefined,
 ): GuardianOtpErrorCode | null {
@@ -302,12 +279,9 @@ export function guardianOtpErrorOf(
 }
 
 /**
- * Classifies a *thrown* error as a `GuardianOtpErrorCode`, or `null` if it
- * isn't one. Single-item calls (`performAction`/`updateActionStatus`) throw a
- * `BulkSingleError` (via `unwrapBulkSingle`) carrying the machine code on
- * `.code`; a raw axios error carries it on `response.data.error`. This lets
- * `action-modal`/`action-handler`/`action-status-updater` share one place
- * that knows how to pull the code out of a caught error regardless of shape.
+ * Classifies a thrown error as a `GuardianOtpErrorCode`, or `null`. Single-item
+ * calls throw a `BulkSingleError` with the code on `.code`; a raw axios error
+ * carries it on `response.data.error`.
  */
 export function guardianOtpErrorFromThrown(err: unknown): GuardianOtpErrorCode | null {
   if (axios.isAxiosError(err)) {
@@ -317,48 +291,33 @@ export function guardianOtpErrorFromThrown(err: unknown): GuardianOtpErrorCode |
   return guardianOtpErrorOf({ error: code });
 }
 
-// ─── API Functions ────────────────────────────────────────────────
-
 /**
- * Perform an action (initiate cross-instance action)
- * Source user calls this to start an action with a target item
- * 
- * Note: This MUST be called on the SOURCE instance (where source item exists).
- * The source instance validates the source item exists, then forwards to target.
- * 
- * @param payload - The action payload
- * @param sourceInstanceUrl - Optional: URL of the source instance.
- *   If not provided, uses default API. Should be the instance where source item exists.
- * @param guardianOtp - Optional: guardian OTP code to resubmit this same action with,
- *   after a prior call returned a `GUARDIAN_OTP_REQUIRED` per-item error. Sent as
- *   `guardian_otp` on the payload.
+ * Starts an action on the source item's instance, which forwards it to the target.
+ *
+ * @param _sourceInstanceUrl - Ignored; the action always goes to this origin
+ *   (see `actionClient`).
+ * @param guardianOtp - Guardian OTP to resubmit with after a
+ *   `GUARDIAN_OTP_REQUIRED` per-item error. Sent as `guardian_otp`.
  */
 export async function performAction(
   payload: PerformActionPayload,
-  sourceInstanceUrl?: string,
+  _sourceInstanceUrl?: string,
   guardianOtp?: string,
 ): Promise<PerformActionResponse> {
-  // Use source instance URL if provided, otherwise fall back to default API client
-  const client = sourceInstanceUrl
-    ? createInstanceApiClient(sourceInstanceUrl)
-    : apiClient;
+  const client = actionClient();
 
   const body = guardianOtp ? { ...payload, guardian_otp: guardianOtp } : payload;
 
   return unwrapBulkSingle(
-    // Feature #293: single-object body to /perform. `body` carries guardian_otp
-    // when resubmitting a minor's action after a GUARDIAN_OTP_REQUIRED.
     client.post<BulkEnvelope<PerformActionResponse>>('/api/v1/action/perform', body),
   );
 }
 
 /**
- * Update action status (target user response)
- * Target user calls this to accept, reject, or complete an action
+ * Target user's response to an action (accept, reject, complete).
  *
- * @param guardianOtp - Optional: guardian OTP code to resubmit this same action with,
- *   after a prior call returned a `GUARDIAN_OTP_REQUIRED` per-item error. Sent as
- *   `guardian_otp` on the payload.
+ * @param guardianOtp - Guardian OTP to resubmit with after a
+ *   `GUARDIAN_OTP_REQUIRED` per-item error. Sent as `guardian_otp`.
  */
 export async function updateActionStatus(
   payload: UpdateActionStatusPayload,
@@ -371,33 +330,26 @@ export async function updateActionStatus(
 }
 
 /**
- * Perform multiple actions in one bulk call. All payloads share the same source
- * instance (the source item's instance), so a single array POST is correct; the
- * backend loops per-item over the peer endpoint. Returns the full envelope so
- * callers can surface partial-success (207).
+ * Performs several actions in one call to `/perform/bulk`. Returns the full
+ * envelope so callers can surface partial success (207).
  */
 export async function performActionsBulk(
   payloads: PerformActionPayload[],
-  sourceInstanceUrl?: string,
+  _sourceInstanceUrl?: string,
   guardianOtp?: string,
 ): Promise<BulkEnvelope<PerformActionResponse>> {
-  const client = sourceInstanceUrl
-    ? createInstanceApiClient(sourceInstanceUrl)
-    : apiClient;
+  const client = actionClient();
   const body = guardianOtp
     ? payloads.map((payload) => ({ ...payload, guardian_otp: guardianOtp }))
     : payloads;
   return postBulkEnvelope<PerformActionResponse>(
-    // Feature #293: array goes to the dedicated /perform/bulk route. `body`
-    // carries guardian_otp on each payload when set.
     client.post<BulkEnvelope<PerformActionResponse>>('/api/v1/action/perform/bulk', body),
   );
 }
 
 /**
- * Update multiple action statuses in one bulk call. All target actions are
- * self-owned and live on the caller's instance, so a single array POST is
- * correct. Returns the full envelope.
+ * Updates several action statuses in one call; all are on the caller's
+ * instance. Returns the full envelope.
  */
 export async function updateActionStatusBulk(
   payloads: UpdateActionStatusPayload[],
@@ -407,29 +359,56 @@ export async function updateActionStatusBulk(
     ? payloads.map((payload) => ({ ...payload, guardian_otp: guardianOtp }))
     : payloads;
   return postBulkEnvelope<UpdateActionStatusResponse>(
-    // `body` carries the single guardian OTP on each payload when set, so a
-    // minor's whole accept batch clears with one code (#393).
+    // One guardian OTP on every payload clears a minor's whole batch.
     apiClient.post<BulkEnvelope<UpdateActionStatusResponse>>('/api/v1/action/update-status', body),
   );
 }
 
 /**
- * Fetch my actions with filtering and pagination
- * Use ownership_role to filter: 'initiated' | 'received' | 'all'
+ * Appends a single-or-array param as repeated keys, which the server
+ * normalizes to an array.
  */
+function appendRepeated(params: URLSearchParams, key: string, value: string | string[] | undefined) {
+  if (value === undefined) return;
+  for (const v of Array.isArray(value) ? value : [value]) {
+    params.append(key, v);
+  }
+}
+
+/**
+ * Appends `facets` in the `qs` bracket notation `/action/fetch` parses
+ * (`facets[0][field]=..&facets[0][values][0]=..`) via `fastify-qs`. Do not
+ * JSON-encode it: the query string parser would not read it.
+ */
+function appendFacets(params: URLSearchParams, facets: FetchMyActionsQuery['facets']) {
+  if (!facets?.length) return;
+  facets.forEach((facet, i) => {
+    if (facet.domain) params.append(`facets[${i}][domain]`, facet.domain);
+    params.append(`facets[${i}][field]`, facet.field);
+    facet.values.forEach((v, j) => {
+      params.append(`facets[${i}][values][${j}]`, v);
+    });
+  });
+}
+
+/** Fetches the caller's actions; `ownership_role` defaults to 'all'. */
 export async function fetchMyActions(
   query: FetchMyActionsQuery = {},
   signal?: AbortSignal
 ): Promise<FetchMyActionsResponse> {
   const params = new URLSearchParams();
 
-  // Always set ownership_role, default to 'all'
   params.set('ownership_role', query.ownership_role ?? 'all');
 
   if (query.action_id) params.set('action_id', query.action_id);
-  if (query.action_type) params.set('action_type', query.action_type);
-  if (query.action_status) params.set('action_status', query.action_status);
+  appendRepeated(params, 'action_type', query.action_type);
+  appendRepeated(params, 'action_status', query.action_status);
   if (query.item_id) params.set('item_id', query.item_id);
+  appendRepeated(params, 'item_ids', query.item_ids);
+  if (query.q?.trim()) params.set('q', query.q.trim());
+  appendRepeated(params, 'include', query.include);
+  if (query.sort) params.set('sort', query.sort);
+  appendFacets(params, query.facets);
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.offset !== undefined) params.set('offset', String(query.offset));
 
@@ -440,9 +419,6 @@ export async function fetchMyActions(
   return response.data;
 }
 
-/**
- * Fetch events/history for a specific action
- */
 export async function fetchActionEvents(
   query: FetchActionEventsQuery,
   signal?: AbortSignal
@@ -465,10 +441,8 @@ export async function fetchActionEvents(
 }
 
 /**
- * Fetch contact details for the other party in an accepted action.
- * Only succeeds when the action status has PII reveal enabled.
- *
- * @param actionId - The action UUID
+ * Contact details for the other party in an action. Succeeds only when the
+ * action status has PII reveal enabled; throws a `ContactDetailsError` otherwise.
  */
 export async function getActionContactDetails(
   actionId: string

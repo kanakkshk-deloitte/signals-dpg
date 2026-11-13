@@ -1,14 +1,25 @@
 import { and, eq } from 'drizzle-orm';
 
 import { db } from '@api/db/postgres/drizzle_config';
-import { user } from '@api/db/postgres/schema/auth';
+import { organization, user } from '@api/db/postgres/schema/auth';
 import { items } from '@dpg/database';
 
 /**
- * Resolves a local owner's email by better-auth user id. Returns null when the
- * user is unknown or has no email (phone-only). The email is used only to
- * address the notification-service request; it is never derived on the wire by
- * NS (which stays contact-blind).
+ * Placeholder address (`<uuid>@no-email.local`) that existing phone-only user
+ * rows may carry. Nothing mints it today, but it is undeliverable, so it counts
+ * as no email; sending to it would hard-bounce and hurt sender reputation.
+ */
+const SYNTHETIC_EMAIL_SUFFIX = '@no-email.local';
+
+/** A deliverable email, or null for a missing or placeholder address. */
+function deliverableEmail(email: string | null | undefined): string | null {
+  if (!email) return null;
+  return email.toLowerCase().endsWith(SYNTHETIC_EMAIL_SUFFIX) ? null : email;
+}
+
+/**
+ * Resolves a local user's deliverable email, or null when the user is unknown
+ * or has none. notification-service never looks up contacts itself.
  */
 export async function resolveOwnerEmail(userId: string): Promise<string | null> {
   const rows = await db
@@ -16,16 +27,39 @@ export async function resolveOwnerEmail(userId: string): Promise<string | null> 
     .from(user)
     .where(eq(user.id, userId))
     .limit(1);
-  return rows[0]?.email ?? null;
+  return deliverableEmail(rows[0]?.email);
+}
+
+/** Resolves an owner's display name and deliverable email in one lookup. */
+export async function resolveOwnerNameEmail(
+  userId: string,
+): Promise<{ found: boolean; name: string | null; email: string | null }> {
+  const rows = await db
+    .select({ name: user.name, email: user.email })
+    .from(user)
+    .where(eq(user.id, userId))
+    .limit(1);
+  const row = rows[0];
+  // `found` separates a phone-only owner (benign skip) from a missing row (a
+  // defect, such as a broken `created_by`); the caller logs them differently.
+  return { found: !!row, name: row?.name ?? null, email: deliverableEmail(row?.email) };
+}
+
+/** Resolves an org's display name by id; null when unknown or blank. */
+export async function resolveOrgName(orgId: string): Promise<string | null> {
+  const rows = await db
+    .select({ name: organization.name })
+    .from(organization)
+    .where(eq(organization.id, orgId))
+    .limit(1);
+  const name = rows[0]?.name;
+  return typeof name === 'string' && name.trim() ? name : null;
 }
 
 /**
- * Resolves a provider item's public service name (`jobProviderName`) by item id.
- * Used to substitute `{name}` in seeker-facing action emails. Returns null when
- * unknown. The field is public (not a masked PII field).
- *
- * `network` is the item's partition key — filtering on it lets the planner
- * prune to the right partition instead of scanning every network's items.
+ * Resolves a provider item's public service name (`jobProviderName`, not a
+ * PII field), or null. `network` is the partition key, so the planner prunes
+ * to one partition.
  */
 export async function resolveProviderServiceName(
   itemId: string,

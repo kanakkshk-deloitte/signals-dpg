@@ -1,6 +1,6 @@
 type ActingOrg = {
   org_id: string;
-  org_type: 'aggregator' | 'voice' | 'network_service';
+  org_type: 'aggregator' | 'network_service';
   service_user_id: string;
 };
 
@@ -22,26 +22,20 @@ export type ResolveUpsertActionInput = {
 };
 
 /**
- * Pure dispatcher for POST /api/v1/admin/participant. Captures the
- * authorization matrix in
- * docs/superpowers/specs/2026-05-23-admin-participant-upsert-design.md.
+ * Pure (no I/O) dispatcher for POST /api/v1/admin/participant. Authorization
+ * matrix: docs/superpowers/specs/2026-05-23-admin-participant-upsert-design.md.
  *
- * No DB, no I/O. The handler runs this synchronously and then dispatches
- * on the verdict.
- *
- * Semantics (#349): a create is ALWAYS an insert. Sending item_state without
- * item_id creates a NEW profile every call (a user may hold multiple profiles,
- * bounded by MAX_PROFILES_PER_USER enforced downstream). item_id targets a
- * specific existing item for an update. There is no dedup-to-update.
+ * A create is always an insert: item_state without item_id creates a new
+ * profile every call (bounded by MAX_PROFILES_PER_USER downstream); item_id
+ * targets an existing item. There is no dedup-to-update.
  *
  * Tail logic (user_exists && authorized):
  *   - item_id_in_body → update_item{item_id_in_body}   (with or without item_state)
  *   - has_item_state → insert_item   (always a new profile)
  *   - else → account_only
  *
- * The runtime check for "item belongs to this user" (which produces
- * ITEM_NOT_OWNED_BY_USER) lives in the handler AFTER the helper returns
- * `update_item` — keeping this function pure.
+ * The "item belongs to this user" check (ITEM_NOT_OWNED_BY_USER) runs in the
+ * handler after `update_item` is returned.
  */
 export const resolve_upsert_action = (input: ResolveUpsertActionInput): UpsertVerdict => {
   const { acting_org, user_exists, item_id_in_body, has_item_state, aggregator_owns_user } = input;
@@ -50,6 +44,12 @@ export const resolve_upsert_action = (input: ResolveUpsertActionInput): UpsertVe
     return { kind: 'rejected', status: 403, error: 'INVALID_ACTING_ORG' };
   }
 
+  // Only `aggregator` is bound by the ownership rule below; a `network_service`
+  // caller may upsert any user, as "the aggregator that onboarded this person"
+  // has no service-tier equivalent.
+  //
+  // Checked explicitly because `organization.type` is plain nullable text: a
+  // retired or unknown type reaches here at runtime and must be refused.
   if (
     acting_org.org_type !== 'aggregator' &&
     acting_org.org_type !== 'network_service'
@@ -66,9 +66,8 @@ export const resolve_upsert_action = (input: ResolveUpsertActionInput): UpsertVe
     return { kind: 'aggregator_owned_elsewhere' };
   }
 
-  // item_id targets an existing profile — with or without item_state (#309):
-  // a consent-only / DOB-only activation can update that profile without
-  // re-sending its fields. item_state without item_id is still a new insert.
+  // item_id targets an existing profile with or without item_state, so a
+  // consent-only / age-only activation need not re-send its fields.
   if (item_id_in_body) return { kind: 'update_item', item_id: item_id_in_body };
   if (has_item_state) return { kind: 'insert_item' };
   return { kind: 'account_only' };

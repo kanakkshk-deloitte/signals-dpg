@@ -4,6 +4,8 @@ import { useAuth } from '@/contexts/auth-context';
 import type { DotNetworkSchema } from '@/engine/types';
 import { queryKeys } from '@/lib/query-keys';
 
+const NO_ITEMS: Item[] = [];
+
 interface UseMyItemsResult {
   data: Item[];
   isLoading: boolean;
@@ -11,12 +13,9 @@ interface UseMyItemsResult {
 }
 
 /**
- * Fetch the current user's items (`created_by_me`) across every domain of a
- * network and flatten them. Used by the profile form's single-domain lock and
- * (Plan 2b-iv) the home-page "my profiles" list. Own-data tier: 60 s staleTime;
- * invalidate-on-write is wired in 2b-iv. A per-domain fetch that rejects
- * contributes an empty list (a partial failure never fails the whole query),
- * matching the page's prior `.catch(() => [])` behavior.
+ * The current user's items (`created_by_me`) across every domain of a network,
+ * flattened. Own-data tier: 60s staleTime plus invalidate-on-write. A domain
+ * whose fetch rejects contributes an empty list rather than failing the query.
  */
 export function useMyItems(network: DotNetworkSchema | null): UseMyItemsResult {
   const { user } = useAuth();
@@ -49,5 +48,5 @@ export function useMyItems(network: DotNetworkSchema | null): UseMyItemsResult {
     staleTime: 60 * 1000,
   });
 
-  return { data: data ?? [], isLoading, isFetched };
+  return { data: data ?? NO_ITEMS, isLoading, isFetched };
 }

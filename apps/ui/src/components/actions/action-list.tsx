@@ -1,9 +1,18 @@
-import * as React from 'react';
 import { useTranslation } from 'react-i18next';
 import { Button } from '@/components/ui/button';
 import { Skeleton } from '@/components/ui/skeleton';
-import { RefreshCw, Inbox, Send, AlertCircle, CheckSquare } from 'lucide-react';
+import {
+  RefreshCw,
+  Inbox,
+  Send,
+  AlertCircle,
+  CheckSquare,
+  Loader2,
+  Download,
+  X,
+} from 'lucide-react';
 import { ActionCard } from './action-card';
+import { ActionToolbar, type ActionStatusFilter, type ActionSort, type ActiveFacet } from './action-toolbar';
 import { SelectableCard } from '@/components/selection/selectable-card';
 import { BulkActionBar } from '@/components/selection/bulk-action-bar';
 import type { CardSelection } from '@/hooks/use-card-selection';
@@ -12,6 +21,10 @@ import type { Action } from '@/lib/action-api';
 interface ActionListProps {
   initiatedActions: Action[];
   receivedActions: Action[];
+  // Tab badge counts: the server-side total per tab, not the loaded rows.
+  // Falls back to the loaded length when undefined.
+  initiatedTotal?: number;
+  receivedTotal?: number;
   isLoading: boolean;
   isError: boolean;
   error: Error | null;
@@ -20,39 +33,70 @@ interface ActionListProps {
   onStatusUpdate: (action: Action, targetStatus: string) => void;
   onRefresh: () => void;
   isRefetching: boolean;
-  /** Selection state owned by the page (drives bulk accept/reject/cancel). */
+  /** Selection state owned by the page. */
   selection: CardSelection;
   /** Open the bulk confirm dialog for the given target status. */
   onBulkAction: (targetStatus: string) => void;
+  /**
+   * Bulk export is enabled for the viewer's domain: cards in an exportable
+   * status become selectable on both tabs, and `exportControls` are shown.
+   */
+  exportEnabled?: boolean;
+  /**
+   * Action statuses the viewer may export — the network's reveal statuses for
+   * the interactions their domain can export (e.g. accepted, completed).
+   */
+  exportStatuses?: readonly string[];
+  /** Every selected card can be bulk-completed (Received + accepted). */
+  canComplete?: boolean;
+  /** Download control, rendered in the bulk bar when `exportEnabled`. */
+  exportControls?: React.ReactNode;
+  /**
+   * Select every loaded exportable card on both tabs. When given (and export
+   * is enabled) the bulk bar offers "Select all loaded".
+   */
+  onSelectAllLoaded?: () => void;
+  /** How the (cross-tab) selection splits between the Sent and Received tabs. */
+  selectionSplit?: { sent: number; received: number };
+  // Toolbar: state and URL wiring live on the page; forwarded to `ActionToolbar`.
+  toolbarStatus: ActionStatusFilter;
+  toolbarSort: ActionSort;
+  activeFacets: ActiveFacet[];
+  onStatusChange: (status: ActionStatusFilter) => void;
+  onSortChange: (sort: ActionSort) => void;
+  onOpenFilters: () => void;
+  onRemoveFacet: (field: string, value: string) => void;
+  onClearFilters: () => void;
+  // Infinite scroll. The server filters, so every row given is rendered.
+  hasNextPage: boolean;
+  isFetchingNextPage: boolean;
+  onLoadMore: () => void;
 }
 
-const FILTERS = ['All', 'Pending', 'Accepted', 'Rejected'] as const;
-type Filter = (typeof FILTERS)[number];
-
-// Maps a filter chip to the raw action_status values it should match.
-const FILTER_STATUSES: Record<Filter, string[] | null> = {
-  All: null,
-  Pending: ['created', 'pending'],
-  Accepted: ['accepted', 'completed'],
-  Rejected: ['rejected', 'cancelled'],
-};
-
-// The actionable "class" of a card for the current tab — used as the selection
-// lock group. null = not actionable (can't be selected). The first card picked
-// locks the class, so a batch is always homogeneous: on the Received tab you
-// bulk accept/reject a set of PENDING items OR bulk complete a set of ACCEPTED
-// items (never mixed); on the Initiated tab you bulk cancel PENDING items.
+// A card's actionable class for the tab, used as the selection lock group
+// (null means not selectable). The first pick locks the class, so a batch is
+// homogeneous: Received bulk accept/reject (pending) or complete (accepted),
+// Initiated bulk cancel (pending).
 type ActionClass = 'pending' | 'accepted';
 
-function actionClassFor(tab: 'initiated' | 'received', status: string): ActionClass | null {
+// With bulk export enabled, a card in any exportable status is selectable on
+// both tabs, in the 'accepted' group, so it can be downloaded.
+function actionClassFor(
+  tab: 'initiated' | 'received',
+  status: string,
+  exportStatuses: readonly string[] = [],
+): ActionClass | null {
   if (status === 'created' || status === 'pending') return 'pending';
   if (tab === 'received' && status === 'accepted') return 'accepted';
+  if (exportStatuses.includes(status)) return 'accepted';
   return null;
 }
 
 export function ActionList({
   initiatedActions,
   receivedActions,
+  initiatedTotal,
+  receivedTotal,
   isLoading,
   isError,
   error,
@@ -63,87 +107,172 @@ export function ActionList({
   isRefetching,
   selection,
   onBulkAction,
-}: ActionListProps) {
+  exportEnabled = false,
+  exportStatuses = [],
+  canComplete,
+  exportControls,
+  onSelectAllLoaded,
+  selectionSplit,
+  toolbarStatus,
+  toolbarSort,
+  activeFacets,
+  onStatusChange,
+  onSortChange,
+  onOpenFilters,
+  onRemoveFacet,
+  onClearFilters,
+  hasNextPage,
+  isFetchingNextPage,
+  onLoadMore,
+}: Readonly<ActionListProps>) {
   const { t } = useTranslation();
-  const [filter, setFilter] = React.useState<Filter>('All');
-
-  const filterLabels: Record<Filter, string> = {
-    All: t('actions.filter_all'),
-    Pending: t('actions.filter_pending'),
-    Accepted: t('actions.filter_accepted'),
-    Rejected: t('actions.filter_rejected'),
-  };
 
   const actions = activeTab === 'initiated' ? initiatedActions : receivedActions;
 
-  const visible = React.useMemo(() => {
-    const allowed = FILTER_STATUSES[filter];
-    if (!allowed) return actions;
-    return actions.filter((a) => allowed.includes(a.action_status));
-  }, [actions, filter]);
-
-  // A card is selectable when it has an actionable class for this tab. The
-  // lock group is that class, so the first pick fixes pending-vs-accepted.
-  const isSelectable = (a: Action) => actionClassFor(activeTab, a.action_status) !== null;
-  const hasSelectable = visible.some(isSelectable);
+  const isSelectable = (a: Action) =>
+    actionClassFor(activeTab, a.action_status, exportEnabled ? exportStatuses : []) !== null;
+  const hasSelectable = actions.some(isSelectable);
 
   const tabs = [
-    { id: 'initiated' as const, label: t('actions.tab_initiated'), Icon: Send, count: initiatedActions.length },
-    { id: 'received' as const, label: t('actions.tab_received'), Icon: Inbox, count: receivedActions.length },
+    {
+      id: 'initiated' as const,
+      label: t('actions.tab_initiated'),
+      Icon: Send,
+      count: initiatedTotal ?? initiatedActions.length,
+    },
+    {
+      id: 'received' as const,
+      label: t('actions.tab_received'),
+      Icon: Inbox,
+      count: receivedTotal ?? receivedActions.length,
+    },
   ];
   const activeIdx = tabs.findIndex((tab) => tab.id === activeTab);
 
+  // Extracted to avoid a nested ternary (typescript:S3358).
+  const emptyOrListContent =
+    actions.length === 0 ? (
+      <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed py-14 text-center">
+        <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/10 text-primary">
+          {activeTab === 'initiated' ? <Send className="h-6 w-6" /> : <Inbox className="h-6 w-6" />}
+        </div>
+        <h3 className="text-base font-bold text-foreground">
+          {activeTab === 'initiated' ? t('actions.empty_initiated_heading') : t('actions.empty_received_heading')}
+        </h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          {activeTab === 'initiated'
+            ? t('actions.empty_initiated_desc')
+            : t('actions.empty_received_desc')}
+        </p>
+      </div>
+    ) : (
+      <>
+        <div data-tour="action-list" className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+          {actions.map((action) => {
+            const cls = actionClassFor(
+              activeTab,
+              action.action_status,
+              exportEnabled ? exportStatuses : [],
+            );
+            return (
+              <SelectableCard
+                key={action.action_id}
+                id={action.action_id}
+                selectMode={selection.selectMode}
+                selected={selection.isSelected(action.action_id)}
+                selectable={cls !== null && selection.canSelect(cls)}
+                onToggle={(id) => selection.toggle(id, cls ?? '')}
+              >
+                <ActionCard
+                  action={action}
+                  ownershipRole={activeTab}
+                  onStatusUpdate={onStatusUpdate}
+                  selectionMode={selection.selectMode}
+                />
+              </SelectableCard>
+            );
+          })}
+        </div>
+        {hasNextPage && (
+          <div className="flex justify-center pt-2">
+            <Button
+              variant="outline"
+              data-testid="load-more-button"
+              onClick={onLoadMore}
+              disabled={isFetchingNextPage}
+            >
+              {isFetchingNextPage && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {isFetchingNextPage ? t('actions.loading_more') : t('actions.load_more')}
+            </Button>
+          </div>
+        )}
+      </>
+    );
+  const nonLoadingContent = isError ? (
+    <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed py-14 text-center">
+      <AlertCircle className="mb-3 h-10 w-10 text-destructive" />
+      <h3 className="text-lg font-semibold text-destructive">{t('actions.error_heading')}</h3>
+      <p className="mt-1.5 max-w-md text-sm text-muted-foreground">
+        {error?.message ?? t('actions.error_fallback')}
+      </p>
+    </div>
+  ) : (
+    emptyOrListContent
+  );
+
   return (
     <div className="w-full space-y-5">
-      {/* Toolbar: filter chips + refresh */}
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="inline-flex flex-wrap gap-1 rounded-xl border bg-card p-1">
-          {FILTERS.map((f) => (
-            <button
-              key={f}
-              type="button"
-              onClick={() => {
-                setFilter(f);
-                // Changing the filter can hide selected cards; drop out of
-                // select mode so the selection never goes invisible/stale.
-                selection.exitSelect();
-              }}
-              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition pointer-coarse:min-h-11 ${
-                filter === f
-                  ? 'bg-primary/10 text-primary'
-                  : 'text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              {filterLabels[f]}
-            </button>
-          ))}
-        </div>
+      {/* Toolbar: status, sort, filters, select, refresh */}
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <ActionToolbar
+          status={toolbarStatus}
+          sort={toolbarSort}
+          activeFacets={activeFacets}
+          onStatusChange={(status) => {
+            onStatusChange(status);
+            // A status change can hide selected cards, so leave select mode.
+            selection.exitSelect();
+          }}
+          onSortChange={onSortChange}
+          onOpenFilters={onOpenFilters}
+          onRemoveFacet={onRemoveFacet}
+          onClearFilters={onClearFilters}
+        />
 
-        {(hasSelectable || selection.selectMode) && (
-          <Button
-            variant={selection.selectMode ? 'default' : 'outline'}
-            size="sm"
-            onClick={() => (selection.selectMode ? selection.exitSelect() : selection.enterSelect())}
-          >
-            <CheckSquare className="mr-2 h-4 w-4" />
-            {selection.selectMode ? t('selection.done') : t('selection.select')}
+        <div className="flex items-center gap-2">
+          {/* Export starts selection; every selection action lives in the
+              bulk bar. */}
+          {selection.selectMode ? (
+            <Button variant="outline" size="sm" onClick={() => selection.exitSelect()}>
+              <X className="mr-2 h-4 w-4" />
+              {t('selection.cancel')}
+            </Button>
+          ) : (
+            <>
+              {exportEnabled && (
+                <Button variant="outline" size="sm" onClick={() => selection.enterSelect()}>
+                  <Download className="mr-2 h-4 w-4" />
+                  {t('actions.export_entry')}
+                </Button>
+              )}
+              {hasSelectable && (
+                <Button variant="outline" size="sm" onClick={() => selection.enterSelect()}>
+                  <CheckSquare className="mr-2 h-4 w-4" />
+                  {t('selection.select')}
+                </Button>
+              )}
+            </>
+          )}
+
+          <Button data-tour="action-refresh" variant="outline" size="sm" onClick={onRefresh} disabled={isRefetching}>
+            <RefreshCw className={`mr-2 h-4 w-4 ${isRefetching ? 'animate-spin' : ''}`} />
+            {t('actions.refresh')}
           </Button>
-        )}
-
-        <Button
-          variant="outline"
-          size="sm"
-          className="ml-auto"
-          onClick={onRefresh}
-          disabled={isRefetching}
-        >
-          <RefreshCw className={`mr-2 h-4 w-4 ${isRefetching ? 'animate-spin' : ''}`} />
-          {t('actions.refresh')}
-        </Button>
+        </div>
       </div>
 
       {/* Sliding-pill tabs */}
-      <div className="relative flex rounded-2xl border bg-muted/60 p-1.5">
+      <div data-tour="action-tabs" className="relative flex rounded-2xl border bg-muted/60 p-1.5">
         <div
           className="absolute bottom-1.5 top-1.5 rounded-xl bg-card shadow-sm transition-[left] duration-300"
           style={{ left: `calc(${activeIdx * 50}% + 6px)`, width: 'calc(50% - 12px)' }}
@@ -180,65 +309,46 @@ export function ActionList({
             <ActionCardSkeleton key={i} />
           ))}
         </div>
-      ) : isError ? (
-        <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed py-14 text-center">
-          <AlertCircle className="mb-3 h-10 w-10 text-destructive" />
-          <h3 className="text-lg font-semibold text-destructive">{t('actions.error_heading')}</h3>
-          <p className="mt-1.5 max-w-md text-sm text-muted-foreground">
-            {error?.message ?? t('actions.error_fallback')}
-          </p>
-        </div>
-      ) : visible.length === 0 ? (
-        <div className="flex flex-col items-center justify-center rounded-2xl border border-dashed py-14 text-center">
-          <div className="mb-3 flex h-14 w-14 items-center justify-center rounded-2xl bg-primary/10 text-primary">
-            {activeTab === 'initiated' ? <Send className="h-6 w-6" /> : <Inbox className="h-6 w-6" />}
-          </div>
-          <h3 className="text-base font-bold text-foreground">
-            {activeTab === 'initiated' ? t('actions.empty_initiated_heading') : t('actions.empty_received_heading')}
-          </h3>
-          <p className="mt-1 text-sm text-muted-foreground">
-            {activeTab === 'initiated'
-              ? t('actions.empty_initiated_desc')
-              : t('actions.empty_received_desc')}
-          </p>
-        </div>
       ) : (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
-          {visible.map((action) => {
-            const cls = actionClassFor(activeTab, action.action_status);
-            return (
-              <SelectableCard
-                key={action.action_id}
-                id={action.action_id}
-                selectMode={selection.selectMode}
-                selected={selection.isSelected(action.action_id)}
-                selectable={cls !== null && selection.canSelect(cls)}
-                onToggle={(id) => selection.toggle(id, cls ?? '')}
-              >
-                <ActionCard
-                  action={action}
-                  ownershipRole={activeTab}
-                  onStatusUpdate={onStatusUpdate}
-                  selectionMode={selection.selectMode}
-                />
-              </SelectableCard>
-            );
-          })}
-        </div>
+        nonLoadingContent
       )}
       {selection.selectMode && selection.selected.size > 0 && (
-        <BulkActionBar count={selection.selected.size} onClear={selection.clear}>
+        <BulkActionBar
+          count={selection.selected.size}
+          onClear={selection.clear}
+          detail={
+            selectionSplit && selection.lockKey === 'accepted'
+              ? t('actions.selection_split', selectionSplit)
+              : undefined
+          }
+          secondary={
+            exportEnabled && onSelectAllLoaded && selection.lockKey === 'accepted' ? (
+              <button
+                type="button"
+                onClick={onSelectAllLoaded}
+                className="rounded-lg border border-background/30 px-3 py-1.5 text-xs font-semibold text-background/80 transition hover:text-background"
+              >
+                {t('selection.select_all_loaded')}
+              </button>
+            ) : undefined
+          }
+        >
+          {exportEnabled && selection.lockKey === 'accepted' && exportControls}
           {selection.lockKey === 'accepted' ? (
-            // Received + accepted selection → bulk complete.
-            <button
-              type="button"
-              onClick={() => onBulkAction('completed')}
-              className="rounded-lg bg-emerald-600 px-4 py-1.5 text-xs font-bold text-white"
-            >
-              {t('actions.bulk_complete')}
-            </button>
+            // Bulk complete only when every selected card is Received +
+            // accepted, so it never acts on part of the selection. Without
+            // `canComplete`, falls back to "nothing from Sent is selected".
+            (canComplete ?? (selectionSplit?.sent ?? 0) === 0) && (
+              <button
+                type="button"
+                onClick={() => onBulkAction('completed')}
+                className="rounded-lg bg-emerald-600 px-4 py-1.5 text-xs font-bold text-white"
+              >
+                {t('actions.bulk_complete')}
+              </button>
+            )
           ) : activeTab === 'received' ? (
-            // Received + pending selection → bulk accept / reject.
+            // Received + pending: bulk accept / reject.
             <>
               <button
                 type="button"
@@ -256,7 +366,7 @@ export function ActionList({
               </button>
             </>
           ) : (
-            // Initiated + pending selection → bulk cancel.
+            // Initiated + pending: bulk cancel.
             <button
               type="button"
               onClick={() => onBulkAction('cancelled')}

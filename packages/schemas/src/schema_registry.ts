@@ -48,22 +48,41 @@ export class SchemaFetchError extends Error {
 
 export class fetchSchema {
   public readonly url: string;
-  public readonly ready: Promise<JsonValue | unknown>;
   public schema: JsonValue | unknown | null = null;
 
   private readonly fetchFn: FetchLike;
   private readonly resolveRefs: boolean;
   private readonly documentCache = new Map<string, Promise<JsonValue | unknown>>();
+  private pendingLoad: Promise<unknown> | null = null;
 
   constructor(url: string | URL, options: FetchSchemaOptions = {}) {
     this.url = url.toString();
     this.fetchFn = options.fetchFn ?? fetch;
     this.resolveRefs = options.resolveRefs ?? true;
-    this.ready = this.load();
   }
 
+  /**
+   * Starts the fetch on first access and memoises the promise, so the load
+   * runs once per instance. Not started in the constructor, where a failing
+   * fetch would become an unhandled rejection for a caller that only
+   * constructed the registry.
+   *
+   * Because construction does no I/O, call
+   * `await new fetchSchema(url).getSchema()` inside each `Promise.all` entry to
+   * keep fetches parallel. A failed load is memoised too and never retried;
+   * construct a new instance to retry.
+   */
+  public get ready(): Promise<unknown> {
+    this.pendingLoad ??= this.load();
+    return this.pendingLoad;
+  }
+
+  /**
+   * The resolved schema document; starts the load if `.ready` has not.
+   */
   public async getSchema(): Promise<JsonValue | unknown> {
-    return this.ready;
+    await this.ready;
+    return this.schema;
   }
 
   private async load(): Promise<JsonValue | unknown> {
@@ -202,7 +221,7 @@ export class fetchSchema {
       .slice(1)
       .split('/')
       .filter(Boolean)
-      .map((segment) => segment.replace(/~1/g, '/').replace(/~0/g, '~'));
+      .map((segment) => segment.replaceAll('~1', '/').replaceAll('~0', '~'));
 
     let currentValue: JsonValue | unknown = document;
 

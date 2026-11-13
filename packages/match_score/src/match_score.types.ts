@@ -15,21 +15,19 @@ export interface MatchScoreRequest {
   itemB: MatchScoreItem;
 }
 
+/**
+ * Result of one match-score call. /v1/relevance answers 404 (an item is not
+ * indexed yet, common because indexing is async) and 409 (embedded with
+ * different model versions); both are expected states, reported via
+ * `unavailable_reason` rather than as errors.
+ */
 export interface MatchScoreResult {
   provider: string;
+  /** 0-100. */
   score?: number;
-  band?: string;
-  confidence?: number;
   version?: string;
-  prompt_version?: string;
-  model_provider?: string;
-  model?: string;
-  reasoning?: string;
-  signals?: Array<{
-    name: string;
-    impact: string;
-    summary: string;
-  }>;
+  /** Why no score is available, for the two expected non-outage states. */
+  unavailable_reason?: 'not_indexed' | 'not_comparable';
   raw_response: unknown;
 }
 
@@ -39,9 +37,9 @@ export interface MatchScoreClient {
 
 export type MatchScoreProvider = 'signals_search';
 
-// signals-search's in-network relevance API (POST /v1/relevance). Authenticated
-// with a single x-api-key (validated against Signals' own apikey store).
-// `path` overrides the default 'v1/relevance'.
+// signals-search's relevance API (POST /v1/relevance), authenticated with an
+// x-api-key from the shared Signals apikey store. `path` overrides
+// 'v1/relevance'.
 export interface SignalsSearchClientConfig {
   baseUrl: string;
   apiKey: string;

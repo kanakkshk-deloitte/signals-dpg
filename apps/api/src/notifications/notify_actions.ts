@@ -1,28 +1,26 @@
 import type { FastifyBaseLogger } from 'fastify';
 
-import { instance, notification } from '@/config';
+import { instance, notification, uiHostBindings } from '@/config';
 import { getNetworkConfigById } from '@/network_configs';
 import { getNotificationClient } from '@/utils/notificationClient';
 
 import type { NotificationEvent, NotificationPlan } from './build_notifications';
-import { buildCtaUrl, resolveBrandName } from './brand';
+import { createCtaUrlResolver, resolveBrandName } from './brand';
 import { createDirectDispatcher } from './dispatcher';
-import type { NotifyRequest } from './dispatcher';
 import { resolveRecipientRole } from './action_copy';
+import { createEmailSender, getInstanceDefaultNetwork } from './email/dispatch_email';
+import type { EmailSender } from './email/dispatch_email';
+import { getEmailMessages } from './email/messages';
 import { resolveOwnerEmail, resolveProviderServiceName } from './resolve_owner';
 
 export interface NotifierConfig {
-  notify: (req: NotifyRequest) => Promise<unknown>;
-  fromEmail: string;
-  replyTo: string;
-  ctaUrl: string;
+  sender: EmailSender;
+  resolveCtaUrl: (domain: string) => string | undefined;
 }
 
 /**
- * Brand display name for the sign-off ("Team {name}"): the action network's
- * `display_name` (e.g. "Blue Dot"), falling back to INSTANCE_NAME when the
- * network config has none. Best-effort — never throws. Reused by the retire
- * notifier (#418).
+ * Brand display name: the network's `display_name`, else INSTANCE_NAME.
+ * Never throws.
  */
 export async function resolveNetworkBrandName(networkId: string): Promise<string> {
   try {
@@ -40,35 +38,46 @@ export async function resolveNetworkBrandName(networkId: string): Promise<string
 let cachedConfig: NotifierConfig | null | undefined;
 
 /**
- * Memoised notifier config (NS client + from/reply/cta). `null` when
- * notifications aren't configured. Shared with the retire notifier (#418) so
- * both read the same config + reset. */
+ * Memoised email sender and CTA resolver for action, retire and item-lifecycle
+ * emails. `null` unless a notification client, NOTIFICATION_FROM_EMAIL and at
+ * least one URL source (UI_HOST_BINDINGS or FRONTEND_BASE_URL) are configured.
+ */
 export function resolveNotifierConfig(): NotifierConfig | null {
   if (cachedConfig !== undefined) return cachedConfig;
 
   const nc = getNotificationClient();
   const fromEmail = notification.NOTIFICATION_FROM_EMAIL;
   const frontendBaseUrl = notification.FRONTEND_BASE_URL;
+  const hasAnyUrl =
+    !!frontendBaseUrl || Object.keys(uiHostBindings.byDomain).length > 0;
 
-  if (!nc || !fromEmail || !frontendBaseUrl) {
+  // A split deployment may set only UI_HOST_BINDINGS, so FRONTEND_BASE_URL alone is not required.
+  if (!nc || !fromEmail || !hasAnyUrl) {
     cachedConfig = null;
     return cachedConfig;
   }
 
   cachedConfig = {
-    notify: (req) => nc.notify(req),
-    fromEmail,
-    replyTo: notification.NOTIFICATION_REPLY_TO ?? fromEmail,
-    ctaUrl: buildCtaUrl(frontendBaseUrl),
+    sender: createEmailSender({
+      notify: (req) => nc.notify(req),
+      getMessages: getEmailMessages,
+      fromEmail,
+      defaultReplyTo: notification.NOTIFICATION_REPLY_TO ?? fromEmail,
+      defaultNetwork: getInstanceDefaultNetwork(),
+      teamName: instance.INSTANCE_NAME || 'DPG',
+      log: (message, meta) => console.warn(message, meta ?? {}),
+    }),
+    resolveCtaUrl: createCtaUrlResolver({
+      byDomain: uiHostBindings.byDomain,
+      fallbackBaseUrl: frontendBaseUrl,
+    }),
   };
   return cachedConfig;
 }
 
 /**
- * Fire-and-forget entry point used by the action route seams. Resolves
- * recipients, renders branded HTML, and posts to the notification service.
- * Never throws and never blocks the route. No-op when notifications are not
- * configured (missing NS client / from-email / frontend base URL).
+ * Entry point for action emails. Callers `void` it. No-op when notifications
+ * are not configured.
  */
 export async function dispatchActionNotifications(
   event: NotificationEvent,
@@ -77,26 +86,19 @@ export async function dispatchActionNotifications(
   const config = resolveNotifierConfig();
   if (!config) return;
 
-  // Brand name is per-network (the action's network display_name).
   const brandName = await resolveNetworkBrandName(event.target.network);
 
   const dispatcher = createDirectDispatcher({
-    notify: config.notify,
+    sendEmail: (args) => config.sender.dispatchEmail(args),
     resolveEmail: resolveOwnerEmail,
-    // Seeker-facing copy uses the provider's service name; provider-facing
-    // copy keeps the seeker generic. Use the same provider-like classification
-    // as the copy selection so the two never drift, and pass the counterparty's
-    // network so the item lookup can prune to its partition.
+    // Seeker-facing copy names the provider's service; provider-facing copy
+    // keeps the seeker generic. The network lets the lookup prune to one partition.
     resolveCounterpartyName: async (plan: NotificationPlan) =>
       resolveRecipientRole(plan.counterpartyDomain) === 'provider'
         ? resolveProviderServiceName(plan.counterpartyItemId, plan.counterpartyNetwork)
         : null,
-    brand: {
-      brandName,
-      fromEmail: config.fromEmail,
-      replyTo: config.replyTo,
-      ctaUrl: config.ctaUrl,
-    },
+    brand: { brandName },
+    resolveCtaUrl: config.resolveCtaUrl,
     log: (message, meta) => log.warn(meta ?? {}, message),
     onSkip: (reason) => log.info({ reason }, 'action notification skipped'),
   });

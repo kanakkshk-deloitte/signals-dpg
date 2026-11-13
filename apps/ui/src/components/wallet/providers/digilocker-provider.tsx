@@ -6,7 +6,22 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { registerWalletProvider } from '@/engine/wallet/wallet-registry';
 import type { WalletImportProviderProps, WalletProvider } from '@/engine/wallet/types';
-import { digiLockerApi, isDigiLockerConfigured } from '@/lib/digilocker-api';
+import {
+  digiLockerApi,
+  getDigiLockerCallbackOrigins,
+  isDigiLockerConfigured,
+} from '@/lib/digilocker-api';
+
+/**
+ * Shape of an OAuth 2.0 authorization code, so a malformed or hostile
+ * cross-window payload is not forwarded to the agent.
+ *
+ * RFC 6749 allows space (`VSCHAR = %x20-7E`); `[!-~]` excludes it because a
+ * space here is almost always a `+` that `URLSearchParams.get()` decoded. The
+ * length bound is a sanity limit on untrusted input (neither Meri Pehchaan nor
+ * DigiLocker publishes a maximum), set far above a realistic code.
+ */
+const AUTH_CODE_PATTERN = /^[!-~]{1,4096}$/;
 
 function extractCode(value: string): string {
   const trimmed = value.trim();
@@ -45,6 +60,11 @@ function detectCodeFromMessage(data: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+/** Whether a code lifted out of a bridge message is shaped like an auth code. */
+function isAuthCodeShaped(code: string): boolean {
+  return AUTH_CODE_PATTERN.test(code);
 }
 
 function DigiLockerProvider({ onSuccess, onCancel }: WalletImportProviderProps) {
@@ -104,10 +124,18 @@ function DigiLockerProvider({ onSuccess, onCancel }: WalletImportProviderProps) 
   );
 
   React.useEffect(() => {
+    // Any window can postMessage to us, so the payload is only trusted when it
+    // came from an origin the DigiLocker callback can legitimately run on.
+    const allowedOrigins = new Set(getDigiLockerCallbackOrigins());
     const handleMessage = (event: MessageEvent) => {
+      if (!allowedOrigins.has(event.origin)) return;
       const detectedCode = detectCodeFromMessage(event.data);
       if (!detectedCode) return;
+      // Fill the field either way: a code that fails the shape check is not
+      // auto-submitted but stays visible for the manual path, instead of the
+      // panel waiting until the ten-minute timeout.
       setAuthCode(detectedCode);
+      if (!isAuthCodeShaped(detectedCode)) return;
       cleanupPopup(true);
       void completeImport(detectedCode);
     };

@@ -1,9 +1,11 @@
 import {
   ApiSecretsSchema,
+  assertAuthProviderSupported,
   AuthSecretsSchema,
   DatabaseSecretsSchema,
   GeocodingSecretsSchema,
   InstanceSecretsSchema,
+  KeycloakSecretsSchema,
   MatchScoreSecretsSchema,
   NetworkRuntimeSecretsSchema,
   NotificationSecretsSchema,
@@ -13,9 +15,14 @@ import {
 } from '@dpg/config';
 
 export function loadEnv() {
+  // Before any schema parse, so an unsupported AUTH_PROVIDER gets an
+  // actionable error instead of Zod's bare "Invalid input".
+  assertAuthProviderSupported(process.env.AUTH_PROVIDER);
+
   const instance = InstanceSecretsSchema.parse(process.env);
   const api = ApiSecretsSchema.parse(process.env);
   const auth = AuthSecretsSchema.parse(process.env);
+  const keycloak = KeycloakSecretsSchema.parse(process.env);
   const databases = DatabaseSecretsSchema.parse(process.env);
   const notification = NotificationSecretsSchema.parse(process.env);
   const matchScore = MatchScoreSecretsSchema.parse(process.env);
@@ -28,6 +35,7 @@ export function loadEnv() {
     instance,
     api,
     auth,
+    keycloak,
     databases,
     notification,
     matchScore,

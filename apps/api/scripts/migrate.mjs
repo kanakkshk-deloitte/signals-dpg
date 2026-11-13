@@ -27,6 +27,17 @@ try {
 
 const { Client, Pool } = pg;
 
+// Guard: the fallback below defaults POSTGRES_HOST to 127.0.0.1, so a
+// postgres.enabled=false misconfig would silently dial localhost. The runtime
+// image has no shell, so this lives here rather than in the deploy Job. Unset
+// and empty both fail; skipped when POSTGRES_URL supplies the whole DSN.
+if (!process.env.POSTGRES_URL && !process.env.POSTGRES_HOST) {
+  console.error(
+    'db:migrate:deploy failed: POSTGRES_HOST is missing — refusing to fall back to 127.0.0.1. Set POSTGRES_HOST, or POSTGRES_URL for a full connection string.'
+  );
+  process.exit(1);
+}
+
 const pgUrl =
   process.env.POSTGRES_URL ??
   `postgres://${process.env.POSTGRES_USER}:${process.env.POSTGRES_PASSWORD}@${process.env.POSTGRES_HOST ?? '127.0.0.1'}:${process.env.POSTGRES_PORT ?? process.env.DATABASE_PORT ?? '5432'}/${process.env.POSTGRES_DB}`;

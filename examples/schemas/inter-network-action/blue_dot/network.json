@@ -156,6 +156,10 @@
           }
         }
       },
+      "profile_completion_prompt": {
+        "heading": "Complete your profile to get discovered",
+        "body": "Employers can find and connect with you only once your profile is live. Fill in the details below to start getting job opportunities."
+      },
       "id": "seeker",
       "card": {
         "title_field": "name",
@@ -218,6 +222,10 @@
           }
         }
       },
+      "profile_completion_prompt": {
+        "heading": "Complete your profile to start hiring",
+        "body": "Seekers can see and apply to your postings only once your profile is live. Add the details below to reach candidates."
+      },
       "id": "provider",
       "card": {
         "title_field": "company_name",
@@ -267,6 +275,10 @@
           ],
           "to_network": "blue_dot",
           "to_domain": "provider",
+          "column_fields": {
+            "from": [],
+            "to": ["company_name", "role", "city", "employment_type"]
+          },
           "to_items": [
             "job_posting_1.0",
             "job_posting_1.1"
@@ -329,6 +341,10 @@
           ],
           "to_network": "blue_dot",
           "to_domain": "provider",
+          "column_fields": {
+            "from": [],
+            "to": ["company_name", "role", "city", "employment_type"]
+          },
           "to_items": [
             "job_posting_1.0",
             "job_posting_1.1"

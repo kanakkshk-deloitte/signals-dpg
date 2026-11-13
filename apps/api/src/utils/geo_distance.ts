@@ -1,7 +1,6 @@
-// Pure geo-distance helpers used by the cross-instance merge (#203 §4.4).
-// No DB, no Fastify, no side effects — only inputs in, numbers out.
+// Pure geo-distance helpers.
 
-/** Mean earth radius in meters, matching apps/api/src/services/geocoding conventions. */
+/** Mean earth radius in meters (the same sphere as Postgres earth_distance). */
 const EARTH_RADIUS_METERS = 6371000;
 
 export interface LatLng {
@@ -43,6 +42,27 @@ export function nearestLocationMeters(
   for (const loc of locations) {
     const d = haversineMeters(center, loc);
     if (d < min) min = d;
+  }
+  return min;
+}
+
+/**
+ * Minimum distance over every pair of points from two location sets. Returns
+ * `null`, not `Infinity`, when either side has no locations, so "unknown" is
+ * distinguishable from a real distance and never sorts as a value.
+ */
+export function nearestDistanceMeters(
+  as: readonly LatLng[] | null | undefined,
+  bs: readonly LatLng[] | null | undefined
+): number | null {
+  if (!as || as.length === 0 || !bs || bs.length === 0) return null;
+
+  let min = Infinity;
+  for (const a of as) {
+    for (const b of bs) {
+      const d = haversineMeters(a, b);
+      if (d < min) min = d;
+    }
   }
   return min;
 }

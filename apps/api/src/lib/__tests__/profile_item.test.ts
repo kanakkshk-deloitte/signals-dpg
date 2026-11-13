@@ -1,0 +1,152 @@
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// --- mocks (hoisted) -------------------------------------------------------
+const { createItemInternal, resolveLocationsForCreate, assertSuppliedLocationsInCountry } =
+  vi.hoisted(() => ({
+    createItemInternal: vi.fn(),
+    resolveLocationsForCreate: vi.fn(),
+    assertSuppliedLocationsInCountry: vi.fn(),
+  }));
+
+vi.mock('@/services/item_service', () => ({
+  createItemInternal: (...a: unknown[]) => createItemInternal(...a),
+  assertSuppliedLocationsInCountry: (...a: unknown[]) => assertSuppliedLocationsInCountry(...a),
+}));
+
+vi.mock('@/services/geocoding/resolve_locations_for_create', () => ({
+  resolveLocationsForCreate: (...a: unknown[]) =>
+    resolveLocationsForCreate(...a),
+}));
+
+import { create_profile_item } from '../profile_item';
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const tx = { marker: 'the-caller-transaction' } as any;
+
+const input = {
+  tx,
+  user_id: 'u1',
+  network: 'blue_dot',
+  domain: 'seeker',
+  item_type: 'profile_1.0',
+  payload: { fullName: 'Ada', address: '1 Main St' },
+};
+
+describe('create_profile_item', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resolveLocationsForCreate.mockResolvedValue([{ lat: 1, lon: 2 }]);
+    createItemInternal.mockResolvedValue({ itemId: 'item-1' });
+    assertSuppliedLocationsInCountry.mockResolvedValue(undefined);
+  });
+
+  it('holds caller-supplied coordinates to the configured country (#789)', async () => {
+    const item_locations = [{ lat: 12.9251, lng: 77.5938 }];
+    await create_profile_item({ ...input, item_locations });
+    expect(assertSuppliedLocationsInCountry).toHaveBeenCalledWith(item_locations);
+  });
+
+  it('creates nothing when a supplied coordinate is outside the country (#789)', async () => {
+    const err = Object.assign(new Error('outside'), {
+      statusCode: 400,
+      errorCode: 'LOCATION_OUTSIDE_COUNTRY',
+    });
+    assertSuppliedLocationsInCountry.mockRejectedValue(err);
+    await expect(
+      create_profile_item({ ...input, item_locations: [{ lat: 23.81, lng: 90.41 }] }),
+    ).rejects.toBe(err);
+    expect(resolveLocationsForCreate).not.toHaveBeenCalled();
+    expect(createItemInternal).not.toHaveBeenCalled();
+  });
+
+  it('returns the created item id', async () => {
+    await expect(create_profile_item(input)).resolves.toEqual({
+      item_id: 'item-1',
+    });
+  });
+
+  it("geocodes the profile payload so admin-onboarded items aren't stored without coordinates", async () => {
+    await create_profile_item(input);
+
+    expect(resolveLocationsForCreate).toHaveBeenCalledWith({
+      item_network: 'blue_dot',
+      item_domain: 'seeker',
+      item_type: 'profile_1.0',
+      item_state: input.payload,
+      provided: undefined,
+    });
+  });
+
+  it('forwards caller-supplied coordinates as `provided`, so the address text is not geocoded over', async () => {
+    const item_locations = [{ lat: 12.9251, lng: 77.5938, label: 'Jayanagar' }];
+
+    await create_profile_item({ ...input, item_locations });
+
+    expect(resolveLocationsForCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ provided: item_locations }),
+    );
+  });
+
+  it('still geocodes when the caller supplies an empty coordinate array', async () => {
+    // Empty must behave exactly like absent: resolveLocationsForCreate only
+    // short-circuits on a NON-empty `provided`.
+    await create_profile_item({ ...input, item_locations: [] });
+
+    expect(resolveLocationsForCreate).toHaveBeenCalledWith(
+      expect.objectContaining({ provided: [], item_state: input.payload }),
+    );
+  });
+
+  it('passes the resolved locations through to the item-create service', async () => {
+    await create_profile_item(input);
+
+    expect(createItemInternal).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({ item_locations: [{ lat: 1, lon: 2 }] }),
+    );
+  });
+
+  it('creates the item inside the CALLER-supplied transaction (atomic with the user insert)', async () => {
+    await create_profile_item(input);
+
+    expect(createItemInternal.mock.calls[0][0]).toBe(tx);
+  });
+
+  it('makes the participant the author of their own row', async () => {
+    await create_profile_item(input);
+
+    expect(createItemInternal).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({ created_by: 'u1' }),
+    );
+  });
+
+  it('forwards the network/domain/item_type and payload verbatim', async () => {
+    await create_profile_item(input);
+
+    expect(createItemInternal).toHaveBeenCalledWith(
+      tx,
+      expect.objectContaining({
+        item_network: 'blue_dot',
+        item_domain: 'seeker',
+        item_type: 'profile_1.0',
+        item_state: input.payload,
+      }),
+    );
+  });
+
+  it('propagates a geocoding failure rather than silently creating an unplaced item', async () => {
+    resolveLocationsForCreate.mockRejectedValue(new Error('geocoder down'));
+
+    await expect(create_profile_item(input)).rejects.toThrow('geocoder down');
+    expect(createItemInternal).not.toHaveBeenCalled();
+  });
+
+  it('propagates a create failure from the item service', async () => {
+    createItemInternal.mockRejectedValue(new Error('validation failed'));
+
+    await expect(create_profile_item(input)).rejects.toThrow(
+      'validation failed',
+    );
+  });
+});

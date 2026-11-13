@@ -11,21 +11,22 @@ export interface ActionableTagsInput {
   schema: ActionableTagsSchema;
 }
 
+/** Trimmed by index rather than /^_+|_+$/g, which backtracks quadratically on a long run. */
+const trimUnderscores = (s: string): string => {
+  let start = 0;
+  let end = s.length;
+  while (start < end && s[start] === '_') start++;
+  while (end > start && s[end - 1] === '_') end--;
+  return s.slice(start, end);
+};
+
 const slugify = (s: string): string =>
-  s
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '');
+  trimUnderscores(s.trim().toLowerCase().replaceAll(/[^a-z0-9]+/g, '_'));
 
 /**
- * Schema-derived `missing_<required_field>` tags only.
- *
- * Network-specific business tags (`all_applications_rejected`,
- * `no_recent_activity`, `no_applications_yet`, `decisions_overdue`) are
- * removed — those names baked Jobs vocabulary into Signals. If a future
- * product need calls for business tags, add them via a config-driven
- * `tag_rules` array reusing the status-rule DSL.
+ * Schema-derived `missing_<required_field>` tags only. Network-specific
+ * business tags do not belong here; they would need config-driven rules so no
+ * network's vocabulary is baked into Signals.
  */
 export const compute_actionable_tags = (i: ActionableTagsInput): string[] => {
   const tags: string[] = [];

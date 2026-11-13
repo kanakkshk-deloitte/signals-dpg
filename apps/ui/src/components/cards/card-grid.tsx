@@ -1,4 +1,5 @@
 import type React from 'react';
+import type { BrowseSort } from '@/lib/browse-discover';
 import type { RJSFSchema } from '@rjsf/utils';
 import type { DotActionSchema, DotCardConfig } from '@/engine/types';
 import { DomainCard } from './domain-card';
@@ -26,6 +27,15 @@ interface CardGridProps {
   localItem?: Item | null;
   networkId?: string;
   selectedDomain?: string | null;
+  /**
+   * Item ids the active profile has an open action with, in either
+   * direction. Their CTA is disabled: one open action per pair.
+   */
+  openActionItemIds?: Set<string>;
+  openActionReason?: string;
+  /** The sort the server applied, so each card's pill shows what ordered it. */
+  sortApplied?: BrowseSort;
+  relevanceBasis?: 'profile' | 'search' | null;
   /** Selection mode passthrough (browse bulk connect). */
   selection?: {
     selectMode: boolean;
@@ -51,8 +61,12 @@ export function CardGrid({
   localItem,
   networkId = '',
   selectedDomain,
+  openActionItemIds,
+  openActionReason,
   selection,
-}: CardGridProps) {
+  sortApplied,
+  relevanceBasis,
+}: Readonly<CardGridProps>) {
   const gridRef = useEqualRowHeights<HTMLDivElement>();
 
   if (loading) {
@@ -75,12 +89,10 @@ export function CardGrid({
   }
 
   return (
-    <div ref={gridRef} className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 lg:grid-cols-3">
+    <div ref={gridRef} data-tour="card-grid" className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 lg:grid-cols-3">
       {items.map((item) => {
-        // Find the full Item object if available
         const fullItem = fullItems.find((i) => i.item_id === item.id);
 
-        // Create a fallback item if full item not available
         const networkItem = fullItem || {
           item_id: item.id,
           item_network: networkId,
@@ -93,6 +105,8 @@ export function CardGrid({
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString(),
         };
+
+        const actionsDisabled = openActionItemIds?.has(item.id) ?? false;
 
         const cardElement =
           shouldRenderMatchScoreCard(localItem, networkItem) ? (
@@ -108,6 +122,10 @@ export function CardGrid({
               onClick={() => onItemClick?.(item.id)}
               localItem={localItem ?? null}
               networkItem={networkItem}
+              actionsDisabled={actionsDisabled}
+              actionsDisabledReason={openActionReason}
+              sortApplied={sortApplied}
+              relevanceBasis={relevanceBasis}
             />
           ) : (
             <DomainCard
@@ -120,6 +138,15 @@ export function CardGrid({
               selectionMode={selection?.selectMode ?? false}
               onAction={(type, actionSchema) => onAction?.(item.id, type, actionSchema)}
               onClick={() => onItemClick?.(item.id)}
+              shareItem={networkItem}
+              actionsDisabled={actionsDisabled}
+              actionsDisabledReason={openActionReason}
+              // Viewers without a profile still get the sort, so a distance or
+              // age can render.
+              networkItem={networkItem}
+              localItem={localItem ?? null}
+              sortApplied={sortApplied}
+              relevanceBasis={relevanceBasis}
             />
           );
 
@@ -129,7 +156,9 @@ export function CardGrid({
             id={item.id}
             selectMode={selection?.selectMode ?? false}
             selected={selection?.isSelected(item.id) ?? false}
-            selectable={selection?.canSelect(selectedDomain ?? '') ?? true}
+            // Not selectable when an action is already open for the pair, like
+            // the CTA.
+            selectable={(selection?.canSelect(selectedDomain ?? '') ?? true) && !actionsDisabled}
             onToggle={(id) => selection?.toggle(id, selectedDomain ?? '')}
           >
             {cardElement}

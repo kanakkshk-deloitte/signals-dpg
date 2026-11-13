@@ -28,6 +28,9 @@ export interface FetchItemsQuery {
   item_instance_url?: string;
   item_schema_url?: string;
   created_by_me?: boolean;
+  /** Include retired profiles (excluded by default), so the login redirect does
+   * not treat a retired-only user as profile-less. */
+  include_retired?: boolean;
   limit?: number;
   offset?: number;
 }
@@ -44,16 +47,9 @@ export interface Item {
   created_at: string;
   updated_at: string;
   lifecycle_status?: 'draft' | 'live' | 'paused' | 'retired';
-  // #394: only populated on items returned by the discover BFF
-  // (`fetchDiscover` in `@/lib/network-api`, `DiscoverResponse.items`) — the
-  // SAME cosine-similarity relevance score `/api/v1/match-score/calculate`
-  // computes via signals-search `/v1/relevance`, but raw ~0-1 (unscaled),
-  // whereas the match-score UI's internal scale is 0-10
-  // (`MatchScoreResult.score`). `useMatchScore` multiplies by 10 to seed an
-  // upfront badge from this value instead of requiring a click. Absent on
-  // native-fetched items (`fetchItems`/`fetchNetworkItems`), which never set
-  // it. `distanceMeters` is unused today but carried for parity with the
-  // discover response shape.
+  // Set only on discover BFF items: the cosine relevance score, rescaled by
+  // `fetchDiscover` from the wire's ~0-1 to 0-100 (see `toPercentScale`).
+  // `distanceMeters` mirrors the discover response shape and is unused.
   score?: number;
   distanceMeters?: number;
 }
@@ -63,12 +59,8 @@ export interface FetchItemsResponse {
     total: number;
     limit: number;
     offset: number;
-    // Only populated by the inter-instance network fetch
-    // (`/api/v1/network/item/fetch`, see `fetchNetworkItems` in
-    // `@/lib/network-api`) — `true` when a peer instance didn't answer in
-    // time and the merged result is known-incomplete (#203 §6). The
-    // instance-local `/api/v1/item/fetch` (`fetchItems` below) never sets
-    // these, hence optional here rather than widening every caller.
+    // Set only by the inter-instance network fetch (`fetchNetworkItems`):
+    // `partial` is true when a peer instance did not answer in time.
     partial?: boolean;
     unavailable_instances?: string[];
   };
@@ -107,6 +99,7 @@ export async function fetchItems(query: FetchItemsQuery, signal?: AbortSignal): 
   if (query.item_instance_url) params.set('item_instance_url', query.item_instance_url);
   if (query.item_schema_url) params.set('item_schema_url', query.item_schema_url);
   if (query.created_by_me) params.set('created_by_me', 'true');
+  if (query.include_retired) params.set('include_retired', 'true');
   if (query.limit !== undefined) params.set('limit', String(query.limit));
   if (query.offset !== undefined) params.set('offset', String(query.offset));
 
@@ -127,10 +120,10 @@ export interface ItemLifecycleResponse {
 }
 
 /**
- * Change a profile's lifecycle. `pause` (only valid on `live`) / `unpause`
- * re-validate completeness (#346). `retire` (#347) is TERMINAL and
- * irreversible: it wipes PII, cancels open connections, de-indexes the profile
- * and removes it from the owner's list — there is no transition back.
+ * Changes a profile's lifecycle. `pause` is valid only on `live`; `unpause`
+ * recomputes draft/live from the current data. `retire` is terminal: it wipes
+ * PII, cancels open connections, de-indexes the profile and removes it from the
+ * owner's list.
  */
 export async function setItemLifecycle(
   itemId: string,
@@ -143,7 +136,6 @@ export async function setItemLifecycle(
   return response.data;
 }
 
-// Re-export action-related types and functions from action-api.ts
 export {
   type ItemRef,
   type TargetItemRef,

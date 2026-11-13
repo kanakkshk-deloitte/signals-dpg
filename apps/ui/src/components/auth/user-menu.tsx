@@ -10,6 +10,7 @@ import {
 import { LogOut, LifeBuoy, Bell } from 'lucide-react';
 import { toast } from 'sonner';
 import { SupportDialog } from '@/components/support/support-dialog';
+import { useSupportConfig } from '@/hooks/use-support-config';
 import { LanguageSwitcher } from '@/components/layout/language-switcher';
 import { ThemeModeToggle } from '@/components/layout/theme-mode-toggle';
 import { usePendingActionsCount } from '@/hooks/use-actions';
@@ -19,6 +20,8 @@ export function UserMenu() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [supportOpen, setSupportOpen] = useState(false);
+  // Shared with the support dialog by query key, so menu opens do not refetch.
+  const { config: supportConfig } = useSupportConfig();
   const [popoverOpen, setPopoverOpen] = useState(false);
   const { data: pendingCount = 0 } = usePendingActionsCount();
 
@@ -95,9 +98,7 @@ export function UserMenu() {
               )}
             </div>
           </div>
-          {/* Mobile-only: Notifications, Language and Theme normally live
-              inline in the top bar, but are hidden there below `md` to keep
-              the bar from overflowing — they're reachable here instead. */}
+          {/* Below `md` these are hidden in the top bar, so they live here. */}
           <div className="border-t p-1 md:hidden">
             <button
               type="button"
@@ -121,16 +122,21 @@ export function UserMenu() {
               <ThemeModeToggle />
             </div>
           </div>
-          <div className="border-t p-1">
-            <button
-              type="button"
-              onClick={() => setSupportOpen(true)}
-              className="flex w-full items-center gap-2 rounded-sm px-3 py-2 text-sm hover:bg-accent"
-            >
-              <LifeBuoy className="h-4 w-4" />
-              {t('menu.contact_support')}
-            </button>
-          </div>
+          {/* Hidden when the instance has no SUPPORT_EMAIL, since every submit
+              would 503. The fallback config is `enabled: true`, so a failed
+              config fetch does not hide a working form. */}
+          {supportConfig.enabled && (
+            <div className="border-t p-1">
+              <button
+                type="button"
+                onClick={() => setSupportOpen(true)}
+                className="flex w-full items-center gap-2 rounded-sm px-3 py-2 text-sm hover:bg-accent"
+              >
+                <LifeBuoy className="h-4 w-4" />
+                {t('menu.contact_support')}
+              </button>
+            </div>
+          )}
           <div className="border-t p-1">
             <button
               onClick={handleSignOut}

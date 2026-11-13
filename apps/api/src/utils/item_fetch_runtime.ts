@@ -3,6 +3,7 @@ import { db } from '@api/db/postgres/drizzle_config';
 import { items } from '@dpg/database';
 import { decryptItemPrivate } from './item_decrypt';
 import { getNetworkConfigById } from '@/network_configs';
+import { splitLngRange } from '@/utils/lng_chunks';
 
 /** Minimal pino-compatible surface (`request.log`) for debug-level diagnostics. */
 export interface ItemFetchLog {
@@ -18,49 +19,27 @@ export type ItemFetchFilters = {
   item_instance_url?: string | null;
   item_schema_url?: string | null;
   /**
-   * Per-field `item_state` filter values. Both a **scalar** value (string/
-   * number/boolean) and an **array** value are facet filters applied via the
-   * SAME guarded path: a scalar `v` is normalized to `[v]`, then every value
-   * set (single or multi) is applied as `item_state->>'field' = ANY(values)`
-   * (#203 Task 3, closing the "documented follow-up" noted at
-   * `apps/ui/src/lib/network-api.ts`'s `item_state[field]` comment), which
-   * only Task 1's per-field expression btree indexes accelerate (a `@>`
-   * containment check cannot express "any of these values" for one key).
-   * SECURITY (#394): a value is only honored when the field is declared in
-   * the network config's schema `properties` AND not `private: true` for the
-   * item's domain — see `resolveAllowedFacetFields` below — otherwise it is
-   * dropped silently (never surfaced as a 4xx) so a caller can't use
-   * found/not-found responses to enumerate a private/undeclared field's
-   * values. This guard used to apply ONLY to array values; a scalar value
-   * went through an unguarded `item_state @> {...}` containment check
-   * instead, which let a single-value filter enumerate a private/undeclared
-   * field — #394 closed that hole by unifying both shapes onto this one
-   * guarded `= ANY` path, with no remaining unguarded branch. (There used to
-   * be an additional `filterable: true` marker gating this further; a prior
-   * #394 change dropped it — every declared, non-private field is a filter
-   * again. The proper schema-driven search/filter declaration is tracked in
-   * #360.)
+   * Per-field facet filter; a scalar is treated as a one-element array.
+   * Only declared, non-private fields are applied; others are dropped
+   * silently so a caller cannot enumerate private values.
+   * Design: docs/architecture/api-fetch-native-filters.md
    */
   item_state?: Record<string, unknown>;
   /**
-   * Free-text value-match search (#394 map native text search). `q` is the
-   * raw search term; `fields` is the SERVER-resolved allowlist of non-private
-   * `item_state` field keys to match against — resolved by the route handler
-   * via `resolveAllowedFacetFields` (facet_guard.ts) from the network
-   * config, never from the client. `buildWhereClause` below ANDs this into
-   * whatever bbox/radius condition is already present, so a text match is
-   * inherently viewport-scoped — no separate geo logic needed here. An empty
-   * `fields` (no non-private field declared for the domain/item_type) makes
-   * the match unsatisfiable by design rather than matching everything.
+   * Free-text substring match. `fields` is the server-resolved allowlist of
+   * non-private field keys, never client input; empty `fields` matches nothing.
    */
   text_search?: { q: string; fields: string[] };
   item_latitude?: number;
   item_longitude?: number;
   radius_meters?: number;
-  // Bounding-box viewport search (#203 Task 2 schema, Task 3 SQL), mutually
-  // exclusive with the radius-center params above — see
-  // withGeoSearchRefinement in packages/schemas/src/api/item_schemas.ts.
-  // Consumed by buildWhereClause below (Option B: item_search.geo join).
+  /**
+   * `'distance'` needs coordinates; `'created_at'` ignores them so an area
+   * filter can narrow without reordering. Omitted: coordinates present means
+   * nearest first (`/network/item/fetch` and markers rely on this).
+   */
+  order_by?: 'distance' | 'created_at';
+  // Bounding-box search, mutually exclusive with the radius params above.
   min_lat?: number;
   min_lng?: number;
   max_lat?: number;
@@ -79,10 +58,9 @@ export type ItemFetchFilters = {
    */
   lifecycle_filter?: 'live_only' | 'all';
   /**
-   * When true, excludes `retired` items (#347). Set by the owner "My Profiles"
-   * fetch so a retired profile never lists there. Other reads (e.g. the
-   * contact-details masked view) must still be able to see a retired item to
-   * message the counterparty, so this is opt-in — NOT a blanket filter.
+  /**
+   * Excludes `retired` items. Opt-in, because contact-details must still
+   * resolve a retired item to message the counterparty.
    */
   exclude_retired?: boolean;
 };
@@ -104,27 +82,10 @@ const itemResponseColumns = {
 };
 
 /**
- * #203 Task 3 security guard: resolves the set of `item_state` field names a
- * caller is allowed to facet-filter on for a given network/domain — every
- * schema property (across every item_type declared for the domain) that is
- * declared at all AND NOT `private: true`. Sourced from the network config
- * (the same `getNetworkConfigById` cache used elsewhere in the app), never
- * from the request — a client cannot expand its own allowed facet set by
- * naming more fields.
- *
- * #394: this used to additionally require `filterable: true` (a per-field
- * marker in network.json). That gate has been removed — every declared,
- * non-private enum field is a filter again in both the map and list views
- * (restoring pre-Map-PR behavior). The `private !== true` check below is the
- * enumeration guard and MUST stay: it is the only thing standing between a
- * client and using found/not-found responses to enumerate a private field's
- * values. The proper long-term schema-driven search/filter declaration is
- * tracked in #360 — this function is the code to revisit when that lands.
- *
- * Fails closed: an unconfigured network/domain (bad `item_network`/
- * `item_domain`, or a network config load error) yields an empty set, so
- * every facet filter for that request is dropped rather than applied
- * unvalidated.
+ * Fields a caller may facet-filter on for a network/domain: every declared
+ * item-schema property that is not `private: true`, read from network config,
+ * never from the request. The private check is the enumeration guard.
+ * Fails closed: an unknown network/domain or config error yields an empty set.
  */
 async function resolveAllowedFacetFields(
   networkId: string,
@@ -162,6 +123,28 @@ async function resolveAllowedFacetFields(
   return allowed;
 }
 
+/**
+ * Whether the signals-search worker has indexed anything for this
+ * network+domain. `item_search` is empty where no worker runs, and the bbox
+ * branch would then exclude every item. Index-only probe, cheap enough to run
+ * per call without a cache.
+ */
+async function hasSearchIndexRows(
+  item_network: string,
+  item_domain: string
+): Promise<boolean> {
+  const result = await db.execute<{ has_rows: boolean }>(sql`
+    SELECT EXISTS (
+      SELECT 1 FROM item_search
+      WHERE item_network = ${item_network} AND item_domain = ${item_domain}
+    ) AS has_rows
+  `);
+  const rows: Array<{ has_rows: boolean }> = Array.isArray(result)
+    ? (result as Array<{ has_rows: boolean }>)
+    : ((result as { rows?: Array<{ has_rows: boolean }> }).rows ?? []);
+  return rows[0]?.has_rows === true;
+}
+
 async function buildWhereClause(
   filters: Omit<ItemFetchFilters, 'limit' | 'offset'>,
   log?: ItemFetchLog
@@ -175,11 +158,7 @@ async function buildWhereClause(
   conditions.push(eq(items.item_network, filters.item_network));
   conditions.push(eq(items.item_domain, filters.item_domain));
 
-  // A retired profile is permanently removed (#347). Opt-in exclusion — the
-  // owner "My Profiles" fetch sets this so a retired profile never lists there.
-  // Not blanket: contact-details must still resolve a retired item to message
-  // the counterparty. Discovery paths already restrict to live via
-  // lifecycle_filter, so they're unaffected either way.
+  // Opt-in: contact-details must still resolve a retired item.
   if (filters.exclude_retired) {
     conditions.push(ne(items.lifecycle_status, 'retired'));
   }
@@ -201,23 +180,8 @@ async function buildWhereClause(
   }
 
   if (filters.item_state) {
-    // Every requested item_state entry — scalar or array — is normalized to
-    // an array and routed through the SAME guarded `= ANY` path (#394 fix): a
-    // scalar `v` becomes `[v]`, which matches exactly like the old
-    // `@> {field: v}` containment check for an allowed field, but (unlike the
-    // old unguarded scalar branch) is dropped when the field isn't declared
-    // and non-private for this domain. Single- and multi-value facets are
-    // therefore identical from here on — there is no separate scalar
-    // containment branch any more.
-    //
-    // Caveat: "matches exactly" holds for STRING values — every configured
-    // facet today is a string enum, and `->> field` extracts JSON text, so
-    // `= ANY(ARRAY[...])` compares text to text just like the old containment
-    // check did. A numeric or boolean scalar facet would NOT be exact: `->>`
-    // still yields text (e.g. `'true'`, `'42'`), so the comparison becomes a
-    // text comparison rather than the JSON-typed equality `@>` used to do.
-    // Not an issue while facets stay string enums; revisit if a non-string
-    // facet is ever declared.
+    // Scalars are normalised to one-element arrays; every entry goes through
+    // the same guarded path.
     const facetEntries: Array<[string, unknown[]]> = Object.entries(
       filters.item_state
     ).map(([field, value]) => [field, Array.isArray(value) ? value : [value]]);
@@ -252,8 +216,20 @@ async function buildWhereClause(
           values.map((value) => sql`${value}`),
           sql.raw(', ')
         );
+
+        // `->>` equality covers scalar fields (btree expression indexes); `@>`
+        // covers array-typed fields, where `->>` yields the whole array as text
+        // (GIN index). One `@>` per value, OR'd: a multi-element `@>` would
+        // mean "contains all".
+        const arrayContainment = sql.join(
+          values.map(
+            (value) => sql`${items.item_state} -> ${field} @> to_jsonb(${value}::text)`
+          ),
+          sql.raw(' OR ')
+        );
+
         conditions.push(
-          sql`${items.item_state} ->> ${field} = ANY(ARRAY[${valuesArrayLiteral}])`
+          sql`(${items.item_state} ->> ${field} = ANY(ARRAY[${valuesArrayLiteral}]) OR ${arrayContainment})`
         );
       }
     }
@@ -263,14 +239,10 @@ async function buildWhereClause(
     const { q, fields } = filters.text_search;
 
     if (fields.length === 0) {
-      // No non-private field is declared for this domain/item_type (e.g. an
-      // unconfigured item_type, or a schema with no public fields at all) —
-      // the match is unsatisfiable rather than silently matching every row.
+      // No non-private field to match against: unsatisfiable, not match-all.
       conditions.push(sql`false`);
     } else {
-      // Escape LIKE/ILIKE metacharacters (`\`, `%`, `_`) in the raw user
-      // query so `q` can never inject its own wildcards into the pattern —
-      // only a literal substring match is ever performed.
+      // Escape LIKE metacharacters so `q` is always a literal substring.
       const likePattern = `%${q.replace(/[\\%_]/g, (char) => `\\${char}`)}%`;
       const fieldsArrayLiteral = sql.join(
         fields.map((field) => sql`${field}`),
@@ -315,35 +287,50 @@ async function buildWhereClause(
     filters.max_lat !== undefined &&
     filters.max_lng !== undefined
   ) {
-    // #203 Task 3 — bbox viewport search (Option B): join the GiST-indexed
-    // `item_search.geo` (geography MultiPoint) rather than filtering
-    // `items.item_locations` directly. `&&` (bounding-box overlap) is what
-    // `item_search_geo_gist` accelerates, but `&&` only compares the
-    // ENVELOPE of `geo` (the bbox around every point of a multi-location
-    // item) against the viewport envelope — for a multi-location item whose
-    // individual points straddle the viewport such that their aggregate
-    // envelope overlaps it but no single point actually falls inside, `&&`
-    // alone false-positives (wrong pin + inflated meta.total). `&&` stays as
-    // the index-served pre-filter; `ST_Intersects` is the exact recheck that
-    // corrects it to genuine "any location in the box" — the same guarantee
-    // the radius branch above already gives via per-location `earth_box`/
-    // `earth_distance`. Single-location items were already exact under `&&`
-    // alone (a single point's envelope IS the point), so this only changes
-    // behavior for multi-location items.
+    // `&&` is the GiST pre-filter on the envelope; `ST_Intersects` is the exact
+    // recheck for multi-location items. Design: docs/architecture/api-fetch-native-filters.md
     if (filters.min_lat >= filters.max_lat || filters.min_lng >= filters.max_lng) {
-      // Inverted/degenerate box (e.g. swapped corners): defined as an empty
-      // result rather than an error, so a malformed viewport never 500s —
-      // it just shows no markers.
+      // Inverted/degenerate box: empty result rather than an error.
       conditions.push(sql`false`);
-    } else {
+    } else if (await hasSearchIndexRows(filters.item_network, filters.item_domain)) {
+      // `::geography` resolves a span wider than 180° as the complement of the
+      // box, so longitude is split into narrower chunks, OR'd.
+      const lngChunks = splitLngRange(filters.min_lng, filters.max_lng);
+      const chunkClauses = lngChunks.map(
+        (chunk) => sql`(
+          s.geo && ST_MakeEnvelope(${chunk.minLng}, ${filters.min_lat!}, ${chunk.maxLng}, ${filters.max_lat!}, 4326)::geography
+          AND ST_Intersects(s.geo, ST_MakeEnvelope(${chunk.minLng}, ${filters.min_lat!}, ${chunk.maxLng}, ${filters.max_lat!}, 4326)::geography)
+        )`
+      );
+      // Seeded with `false` so an empty chunk list cannot make `reduce` throw.
+      const geoClause = chunkClauses.reduce(
+        (acc, clause) => sql`${acc} OR ${clause}`,
+        sql`false`
+      );
       conditions.push(
         sql`
           EXISTS (
             SELECT 1 FROM item_search s
             WHERE s.item_network = ${items.item_network} AND s.item_id = ${items.item_id}
               AND s.lifecycle_status = 'live'
-              AND s.geo && ST_MakeEnvelope(${filters.min_lng}, ${filters.min_lat}, ${filters.max_lng}, ${filters.max_lat}, 4326)::geography
-              AND ST_Intersects(s.geo, ST_MakeEnvelope(${filters.min_lng}, ${filters.min_lat}, ${filters.max_lng}, ${filters.max_lat}, 4326)::geography)
+              AND (${geoClause})
+          )
+        `
+      );
+    } else {
+      // Fallback when item_search has no rows for this network+domain: a
+      // numeric range check on items.item_locations. It has no lifecycle
+      // predicate; callers wanting live-only must pass `lifecycle_filter`.
+      log?.debug(
+        { item_network: filters.item_network, item_domain: filters.item_domain },
+        'bbox: item_search has no rows for this network+domain — falling back to items.item_locations'
+      );
+      conditions.push(
+        sql`
+          EXISTS (
+            SELECT 1 FROM jsonb_array_elements(${items.item_locations}) loc
+            WHERE (loc->>'lat')::float8 BETWEEN ${filters.min_lat} AND ${filters.max_lat}
+              AND (loc->>'lng')::float8 BETWEEN ${filters.min_lng} AND ${filters.max_lng}
           )
         `
       );
@@ -369,28 +356,37 @@ export async function countLocalItems(
 }
 
 /**
- * §4.1/§4.3 shared ORDER BY: nearest-first when a lat/lng center is present
- * (ties broken by created_at DESC; no-location rows sort last), otherwise
- * plain created_at DESC. Shared by fetchLocalItems and fetchLocalMarkers so
- * the ordering behavior can never drift between the two projections.
+ * ORDER BY shared by fetchLocalItems and fetchLocalMarkers so the two cannot
+ * drift. An explicit `order_by` wins; when omitted, coordinates present means
+ * distance order (callers other than discover depend on that).
  */
 function buildDistanceOrderBy(
-  filters: Pick<ItemFetchFilters, 'item_latitude' | 'item_longitude'>
+  filters: Pick<ItemFetchFilters, 'item_latitude' | 'item_longitude' | 'order_by'>
 ) {
-  return filters.item_latitude !== undefined && filters.item_longitude !== undefined
-    ? sql`
-        (
-          SELECT MIN(
-            earth_distance(
-              ll_to_earth(${filters.item_latitude}, ${filters.item_longitude}),
-              ll_to_earth((loc->>'lat')::float8, (loc->>'lng')::float8)
-            )
-          )
-          FROM jsonb_array_elements(${items.item_locations}) loc
-        ) ASC NULLS LAST,
-        ${items.created_at} DESC
-      `
-    : sql`${items.created_at} DESC`;
+  const hasCenter =
+    filters.item_latitude !== undefined && filters.item_longitude !== undefined;
+  const byDistance =
+    filters.order_by === 'distance' || (filters.order_by === undefined && hasCenter);
+
+  // A distance order without coordinates degrades to recency rather than
+  // emitting SQL that cannot run.
+  if (!byDistance || !hasCenter) {
+    return sql`${items.created_at} DESC, ${items.item_id} ASC`;
+  }
+
+  return sql`
+    (
+      SELECT MIN(
+        earth_distance(
+          ll_to_earth(${filters.item_latitude}, ${filters.item_longitude}),
+          ll_to_earth((loc->>'lat')::float8, (loc->>'lng')::float8)
+        )
+      )
+      FROM jsonb_array_elements(${items.item_locations}) loc
+    ) ASC NULLS LAST,
+    ${items.created_at} DESC,
+    ${items.item_id} ASC
+  `;
 }
 
 const markerColumns = {
@@ -407,9 +403,8 @@ export async function fetchLocalItems(filters: ItemFetchFilters, log?: ItemFetch
     .select(itemResponseColumns)
     .from(items)
     .where(whereClause)
-    // Live profiles first, then the shared distance/created ordering within each
-    // group — so a live profile floats to the top of "My Profiles" while
-    // discovery (live_only) is unaffected (the first key is a no-op there).
+    // Live items first, so a live profile leads "My Profiles"; a no-op for
+    // live-only discovery.
     .orderBy(sql`(${items.lifecycle_status} = 'live') DESC, ${buildDistanceOrderBy(filters)}`)
     .limit(filters.limit)
     .offset(filters.offset);
@@ -437,10 +432,7 @@ export async function fetchLocalItems(filters: ItemFetchFilters, log?: ItemFetch
 }
 
 /**
- * §4.3 slim projection for map markers: item_id/item_domain/item_instance_url/
- * item_locations only. Same WHERE + ORDER BY as fetchLocalItems (via
- * buildWhereClause / buildDistanceOrderBy) so filtering and nearest-first
- * ordering behave identically — just without the heavier item_state payload.
+ * Slim marker projection with the same WHERE and ORDER BY as fetchLocalItems.
  */
 export async function fetchLocalMarkers(filters: ItemFetchFilters, log?: ItemFetchLog) {
   const whereClause = await buildWhereClause(filters, log);

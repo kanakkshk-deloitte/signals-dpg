@@ -8,6 +8,12 @@ name: signals-dpg
 #
 #   Infra    postgres (pgvector + postgis), redis (password-protected)
 #   signals  signals-bootstrap (one-shot: schema + init) -> signals-api -> signals-ui
+#   search   signals-search api + worker + a TEI embedding server  (--profile search)
+#
+# signals-search is OPT-IN behind `--profile search` rather than always-on. The
+# embedding server alone wants 3-8 GB (bge-m3 loads a ~2.3 GB ONNX model on CPU),
+# which would roughly double this stack's memory floor for a developer who only
+# wants the API and UI. See LOCAL_SETUP.md §7.
 #
 # This file lives at signals-dpg/local-setup/ and builds only THIS repo, so its
 # build contexts are `..` (the repo root). No sibling repos required.
@@ -20,12 +26,23 @@ name: signals-dpg
 #     cp .env.example .env            # set SIGNALS_PII_KEY (see LOCAL_SETUP.md §2)
 #     docker compose up -d --build
 #
+# ── Build from source vs. pull prebuilt (signals-api / signals-ui) ──────────
+# Both declare `build:` and `image:`. The `--build` flag is the toggle:
+#     docker compose up -d --build   builds from your checked-out source
+#     docker compose up -d           skips the build and pulls the tag below from
+#                                     GHCR instead — faster, but not your local source
+# Override via SIGNALS_API_IMAGE / SIGNALS_UI_IMAGE in .env to pin a different tag.
+#
 # ── Host ports ──────────────────────────────────────────────────────────────
 #   Signals UI    http://localhost:5173   (must be 5173 — API CORS allow-list)
-#   Signals API   http://localhost:2742   (Swagger at /reference)
+#   Signals API   http://localhost:2742   (Swagger at /api/reference)
 #   Postgres      localhost:5432
 #   Metabase      http://localhost:3030   (override with METABASE_PORT)
 #   Redis         localhost:5555          (password-protected)
+#   Keycloak      localhost:8080          (opt-in: --profile keycloak)
+#   Mailpit UI    localhost:8025          (opt-in: catches email OTPs)
+#   Search API    localhost:3100          (opt-in: --profile search)
+#   Embeddings    (internal only)         (opt-in: --profile search)
 # ═══════════════════════════════════════════════════════════════════════════
 
 services:
@@ -93,6 +110,172 @@ services:
       timeout: 3s
       retries: 20
 
+  # Keycloak — behind the `keycloak` profile, and REQUIRED since #517 retired
+  # better-auth. AUTH_PROVIDER has one value now, so a plain
+  # `docker compose up -d` brings up an API with no identity provider to talk to
+  # and every login fails. Bring the profile up:
+  #
+  #     docker compose --profile keycloak up -d
+  #
+  # (It stays a profile rather than becoming a default service so the db/redis-only
+  # workflow — migrations, seeds, unit tests — does not have to pay for it.)
+  #
+  # Imports infra/keycloak/realms/bluedots-realm.json and mounts the custom
+  # email/phone OTP authenticator SPI from infra/keycloak/providers/, so this is
+  # the real production login experience — not Keycloak's stock browser flow.
+  # `start-dev` indexes the mounted provider jar at boot. See
+  # ../infra/keycloak/README.md.
+  #
+  # Phone OTP goes to the Keycloak log by default (KC_SPI_SMS_PROVIDER=log) —
+  # grep the container logs for the code. Email OTP needs reachable SMTP.
+  #
+  # Storage is the dev-mode embedded database (no KC_DB), persisted in a volume
+  # so realm edits survive a restart. Local dev only.
+  keycloak:
+    profiles: ["keycloak"]
+    image: quay.io/keycloak/keycloak:26.5.5
+    container_name: signals-keycloak
+    restart: unless-stopped
+    entrypoint: ["/opt/keycloak/render-realm.sh"]
+    command: ["start-dev", "--import-realm"]
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      # Defaulted, NOT required (`:?`). Compose interpolates the whole file
+      # before it applies profile filters, so a required variable here would
+      # break the plain `docker compose up -d` for everyone who never intends
+      # to run Keycloak. Local-dev only — this whole file is plain HTTP on
+      # localhost — but override it anywhere the host is reachable.
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:-admin}
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      KC_HEALTH_ENABLED: "true"
+      # Substituted into the realm JSON at boot (redirectUris, webOrigins,
+      # post.logout.redirect.uris). Must be the browser-facing UI base URL.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:5173}
+      # Browser-facing base URL of the signals API. Keycloak redirects the
+      # browser to the API's BFF callback, so the API origin has to be a
+      # registered redirect URI. Defaults to PUBLIC_BASE_URL when they share a
+      # host; locally they do not.
+      API_BASE_URL: ${API_BASE_URL:-http://localhost:2742}
+      # ── OTP SPI (infra/keycloak/providers/keycloak-otp-*.jar) ────────────
+      # Phone channel. 'log' writes the code to the Keycloak container log,
+      # which is what you want locally — no SMS account needed:
+      #   docker compose logs -f keycloak | grep -i otp
+      # Switch to twilio / sns / msg91 once credentials are configured.
+      KC_SPI_SMS_PROVIDER: ${KC_SPI_SMS_PROVIDER:-log}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER:-}
+      AWS_REGION: ${AWS_REGION:-ap-south-1}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      MSG91_AUTH_KEY: ${MSG91_AUTH_KEY:-}
+      MSG91_TEMPLATE_ID: ${MSG91_TEMPLATE_ID:-}
+      MSG91_SENDER_ID: ${MSG91_SENDER_ID:-}
+      MSG91_OTP_VAR_NAME: ${MSG91_OTP_VAR_NAME:-var}
+      # Email channel. render-realm.sh substitutes these into the realm's
+      # smtpServer block; keycloak-init re-applies them when the realm already
+      # exists. Without reachable SMTP, only the phone channel can deliver.
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_FROM: ${SMTP_FROM:-no-reply@bluedots.local}
+      SMTP_FROM_DISPLAY: ${SMTP_FROM_DISPLAY:-Blue Dots}
+      SMTP_AUTH: ${SMTP_AUTH:-false}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      SMTP_SSL: ${SMTP_SSL:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # ── OTP login theme branding (infra/keycloak/themes/otp) ─────────────
+      # theme.properties reads these via ${env.VAR:default}; the defaults it
+      # ships say "Aggregator", so signals sets its own.
+      BRAND_SHORT_NAME: ${BRAND_SHORT_NAME:-Blue Dots}
+      BRAND_LONG_NAME: ${BRAND_LONG_NAME:-Blue Dots}
+      BRAND_LOGO_SLUG: ${BRAND_LOGO_SLUG:-blue-dot}
+      HERO_TITLE_LEAD: ${HERO_TITLE_LEAD:-Welcome to}
+      HERO_TITLE_HIGHLIGHT: ${HERO_TITLE_HIGHLIGHT:-the Signals}
+      HERO_TITLE_TAIL: ${HERO_TITLE_TAIL:-network.}
+      HERO_SUBTITLE: ${HERO_SUBTITLE:-Sign in to discover and connect across the network.}
+    volumes:
+      - ../infra/keycloak/render-realm.sh:/opt/keycloak/render-realm.sh:ro
+      - ../infra/keycloak/realms:/opt/keycloak/data/import-template:ro
+      # The OTP authenticator SPI. `start-dev` indexes whatever is here at boot,
+      # so no image rebuild is needed to pick up a new provider jar.
+      - ../infra/keycloak/providers:/opt/keycloak/providers:ro
+      # Disk theme overrides the jar-baked one, so the BRAND_* env above takes
+      # effect without rebaking the provider.
+      - ../infra/keycloak/themes:/opt/keycloak/themes:ro
+      # Mounted at data/, NOT data/h2/. The container runs as uid 1000 and
+      # `/opt/keycloak/data` exists in the image owned 1000:0 and
+      # group-writable, so a fresh named volume inherits that ownership.
+      # `data/h2` does NOT exist in the image, so mounting there gives Docker
+      # nothing to copy ownership from — it creates the dir root:root 0755 and
+      # Keycloak dies with
+      #   AccessDeniedException: /opt/keycloak/data/h2/keycloakdb.trace.db
+      - signals-keycloak-data:/opt/keycloak/data
+    ports:
+      - "${KEYCLOAK_PORT:-8080}:8080"
+    depends_on:
+      mailpit:
+        condition: service_started
+    healthcheck:
+      # 26.x serves health on the management port (9000); no curl in the image.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && echo -e 'GET /health/ready HTTP/1.1\\r\\nHost: localhost\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q '\"UP\"' <&3"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 30s
+
+  # Mailpit — catches the email-OTP messages Keycloak sends, so the email
+  # channel actually works locally without real SMTP. Web UI on :8025.
+  # Part of the `keycloak` profile because nothing else in this stack sends mail
+  # (signals' own notifications go through the notification service).
+  mailpit:
+    profiles: ["keycloak"]
+    image: axllent/mailpit:latest
+    container_name: signals-mailpit
+    restart: unless-stopped
+    ports:
+      - "${MAILPIT_UI_PORT:-8025}:8025"
+    healthcheck:
+      # NOT /dev/tcp: that is a bash builtin, and this image ships sh without
+      # bash, so CMD-SHELL could never satisfy it and the container reported
+      # unhealthy forever. Nothing in normal dev use waits on health, so it
+      # went unnoticed until `docker compose up --wait`, which refuses to
+      # return. wget is present in the image and /readyz is mailpit's own
+      # readiness endpoint.
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8025/readyz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  # One-shot post-import fixup. NOT optional when running Keycloak: KC 26
+  # ignores `kc.user.profile.config` from a realm import, so `phoneNumber`
+  # writes are silently DROPPED until this runs — which would leave migrated
+  # phone users unable to receive an OTP, with nothing in the logs. Verified
+  # against 26.5.5. See ../infra/keycloak/init/apply-user-profile.sh.
+  keycloak-init:
+    profiles: ["keycloak"]
+    image: alpine:3.20
+    container_name: signals-keycloak-init
+    depends_on:
+      keycloak:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -lc
+      - |
+        apk add --no-cache curl jq >/dev/null
+        exec /init/apply-user-profile.sh
+    environment:
+      KC_URL: http://keycloak:8080
+      KC_REALM: ${KEYCLOAK_REALM:-bluedots}
+      KC_BOOTSTRAP_ADMIN_USERNAME: ${KC_BOOTSTRAP_ADMIN_USERNAME:-admin}
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KC_BOOTSTRAP_ADMIN_PASSWORD:-admin}
+      UNMANAGED_POLICY: ENABLED
+    volumes:
+      - ../infra/keycloak/init:/init:ro
+    restart: "no"
+
   # ───────────────────────────────────────────────────────────────────────
   # signals-dpg
   # ───────────────────────────────────────────────────────────────────────
@@ -126,6 +309,11 @@ services:
       AUTH_MIDDLEWARE_ENABLED: "true"
       CREATE_TEST_OTP: "true"
       SERVED_DOMAINS: ${SERVED_DOMAINS:-blue_dot/seeker,blue_dot/provider}
+      SELF_SIGNUP_MODE: ${SELF_SIGNUP_MODE:-allowed}
+      # Bulk export limits (optional; defaults match packages/config).
+      EXPORT_MAX_ROWS: ${EXPORT_MAX_ROWS:-10000}
+      EXPORT_TIMEZONE: ${EXPORT_TIMEZONE:-Asia/Kolkata}
+      EXPORT_RATE_LIMIT_PER_HOUR: ${EXPORT_RATE_LIMIT_PER_HOUR:-20}
       NETWORK_CONFIG_SOURCE: local
       # Relative to the container CWD (/app for the built API, /repo for the
       # bootstrap) — both have examples/ at that root.
@@ -142,6 +330,35 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       SIGNALS_PII_KEY: ${SIGNALS_PII_KEY:?SIGNALS_PII_KEY must be a base64-encoded 32-byte key}
+      # D6 inter-instance peer auth (HMAC). Required by NetworkRuntimeSecretsSchema
+      # (min 32 chars). Must be IDENTICAL across peers in a multi-instance setup.
+      # No default: since network/action/perform became peer-authenticated, this
+      # secret is the only thing standing between an anonymous caller and
+      # asserting another user's identity, so a shipped value would be a shipped
+      # credential on any dev-exposed instance. Generate with:
+      #   openssl rand -hex 32
+      INSTANCE_SHARED_SECRET: ${INSTANCE_SHARED_SECRET:?INSTANCE_SHARED_SECRET must be set (min 32 chars; openssl rand -hex 32)}
+      PEER_AUTH_MODE: ${PEER_AUTH_MODE:-permissive}
+      # Keycloak is the only provider (#517 removed better-auth). The KEYCLOAK_*
+      # values below are load-bearing, not inert, and the `keycloak` profile must
+      # be up. A stale 'betterauth' here kills the API at boot by design.
+      AUTH_PROVIDER: ${AUTH_PROVIDER:-keycloak}
+      # Acting-org authorisation source (§5.1). 'header' = today's behaviour;
+      # 'claim_preferred' enforces the token's signals_acting_orgs grant when
+      # present; 'claim_required' refuses a grantless token. Inert by default.
+      ACTING_ORG_SOURCE: ${ACTING_ORG_SOURCE:-header}
+      # Public issuer — must match the `iss` Keycloak mints, i.e. the URL the
+      # browser uses. Internal URL is the compose service name.
+      KEYCLOAK_BASE_URL: ${KEYCLOAK_BASE_URL:-http://localhost:8080}
+      KEYCLOAK_INTERNAL_BASE_URL: http://keycloak:8080
+      KEYCLOAK_REALM: ${KEYCLOAK_REALM:-bluedots}
+      # Advertised to the UI via GET /api/v1/auth/config.
+      KEYCLOAK_UI_CLIENT_ID: ${KEYCLOAK_UI_CLIENT_ID:-signals-ui}
+      KEYCLOAK_API_CLIENT_SECRET: ${KEYCLOAK_API_CLIENT_SECRET:-signals-api-dev-secret-change-me}
+      # Integrating DPGs allowed to use client-credentials service auth. Empty
+      # by default: service auth stays on x-api-key until named here. Each id
+      # must match the organization.slug seeded by db:seed:services.
+      KEYCLOAK_SERVICE_CLIENT_IDS: ${KEYCLOAK_SERVICE_CLIENT_IDS:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -153,11 +370,20 @@ services:
     build:
       context: ..
       dockerfile: apps/api/Dockerfile
-    image: signals-dpg/api:local
+    image: ${SIGNALS_API_IMAGE:-ghcr.io/blue-dots-economy/signals-dpg/api:main}
     container_name: signals-api
     restart: unless-stopped
     # Inherits the exact same env as the bootstrap step.
     environment: *signals-env
+    # signals-search wiring, and ONLY when the developer opts in: copy
+    # .env.search.example -> .env.search (LOCAL_SETUP.md §7.3). Deliberately a
+    # separate optional file rather than entries in the map above, because
+    # compose's mapping form has no way to omit a key when its value is empty,
+    # and MATCH_SCORE_PROVIDER is a Zod enum — an empty string fails validation
+    # and would break boot for everyone NOT running search.
+    env_file:
+      - path: .env.search
+        required: false
     ports:
       - "${API_PORT:-2742}:2742"
     depends_on:
@@ -175,13 +401,21 @@ services:
       args:
         VITE_API_URL: http://localhost:2742
         VITE_NETWORK_NAME: ${SIGNALS_NETWORK:-blue_dot}
-    image: signals-dpg/ui:local
+        # No VITE_AUTH_PROVIDER / VITE_KEYCLOAK_* here on purpose: the login
+        # screen and OIDC details are served by the API at runtime
+        # (GET /api/v1/auth/config), so switching providers needs no UI rebuild
+        # and the UI cannot disagree with the API. Set AUTH_PROVIDER on the API
+        # side instead.
+    image: ${SIGNALS_UI_IMAGE:-ghcr.io/blue-dots-economy/signals-dpg/ui:main}
     container_name: signals-ui
     restart: unless-stopped
     environment:
       UI_VARIANT: signals
     ports:
-      # MUST be 5173 — the Signals API's CORS allow-list is 3000/5173/2742 only.
+      # MUST be 5173 on the host — the Signals API's CORS allow-list is
+      # 3000/5173/2742 only. Container side stays 80: the hardened image runs
+      # as uid 65532, which can still bind 80 because the hosts set
+      # net.ipv4.ip_unprivileged_port_start=0 (see apps/ui/Dockerfile).
       - "5173:80"
     depends_on:
       signals-api:
@@ -195,7 +429,134 @@ networks:
     external: true
     name: shared-net
 
+  # ───────────────────────────────────────────────────────────────────────
+  # signals-search — OPT-IN: `docker compose --profile search up -d`
+  # ───────────────────────────────────────────────────────────────────────
+
+  # Embedding server. The image has BAAI/bge-m3 BAKED IN (signals-search
+  # docker/tei-bge-m3/Dockerfile), so nothing downloads the ~2.3 GB model at
+  # runtime and there is no HuggingFace dependency or rate limit. Public on
+  # GHCR — no login needed.
+  #
+  # This is the same model production runs. Do not swap it for another 1024-dim
+  # model "because the dimension matches": model_version feeds the ingest
+  # content hash, so a different model means local relevance scores that do not
+  # correspond to anything deployed.
+  tei-embeddings:
+    profiles: ["search"]
+    image: ghcr.io/blue-dots-economy/tei-bge-m3:cpu-1.7-bge-m3
+    # Both published images are amd64-only: signals-search's CI does not set
+    # `platforms:`, so it publishes just the ubuntu-latest runner's arch, and
+    # upstream HuggingFace TEI publishes no arm64 cpu-* tag at all. Without this
+    # line, `docker pull` on an arm64 machine (Apple Silicon) fails outright with
+    # "no matching manifest for linux/arm64/v8" and the profile cannot start.
+    #
+    # Emulation is viable, and measured, not assumed: on an M-series host this
+    # image loads bge-m3 and serves a 1024-dim embedding ~35s after start, and is
+    # not OOM-killed. Expect embeddings to be slower than on amd64 — fine for
+    # local development, and there is no native alternative to switch to.
+    platform: linux/amd64
+    container_name: tei-embeddings
+    restart: unless-stopped
+    command:
+      - "--model-id"
+      - "BAAI/bge-m3"
+      # MUST match the revision baked into the image: the image sets
+      # HF_HUB_OFFLINE=1, so TEI loads snapshots/<revision> from disk. Without a
+      # matching --revision it tries to resolve "main" offline and fails to boot.
+      - "--revision"
+      - "${BGE_M3_REVISION:-5617a9f61b028005a4858fdac845db406aefb181}"
+      - "--port"
+      - "80"
+      # NOT optional on CPU. At TEI's default 16384, bge-m3's fp32 warmup gets
+      # OOM-killed even with 8 GB available — the container dies during startup
+      # with no obvious cause. 4096 is ample for short search texts.
+      - "--max-batch-tokens"
+      - "4096"
+    # No host port: only the search api/worker talk to it.
+    expose:
+      - "80"
+
+  # Query API. Auth is the `apikey` table in the shared Signals DB — there is no
+  # API-key env var here; mint a key per LOCAL_SETUP.md §7.4.
+  signals-search-api:
+    profiles: ["search"]
+    image: ${SIGNALS_SEARCH_IMAGE:-ghcr.io/blue-dots-economy/signals-search:develop}
+    # amd64-only image (see the note on tei-embeddings). Overridable so a native
+    # build can be used instead of emulation on arm64:
+    #   SIGNALS_SEARCH_IMAGE=signals-search:local
+    #   SEARCH_PLATFORM=linux/arm64
+    # signals-search's Dockerfile builds cleanly on arm64, so that path is real.
+    platform: ${SEARCH_PLATFORM:-linux/amd64}
+    container_name: signals-search-api
+    restart: unless-stopped
+    environment: &search-env
+      # The SAME database signals-dpg uses: signals-search reads `apikey`,
+      # `items` and `item_search` from it. A separate DB silently yields 401s
+      # and an empty index.
+      DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-postgresdb}
+      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+      # Must end in /v1 — the client requests `${EMBEDDING_BASE_URL}/embeddings`.
+      EMBEDDING_BASE_URL: http://tei-embeddings:80/v1
+      EMBEDDING_MODEL: BAAI/bge-m3
+      # 1024 is not a free choice: it must equal both the model's native output
+      # dim AND item_search.embedding's vector(1024) column. The worker refuses
+      # to start otherwise. See LOCAL_SETUP.md §7.6.
+      EMBEDDING_DIM: "1024"
+      # A FILE, not a directory, and not a URL. Directory mode takes the LAST
+      # *.json for a duplicated `id`, which can silently shadow a good config.
+      NETWORK_CONFIG_PATH: /networks/network.json
+      # item_search's DDL is owned by signals-dpg and is already created by
+      # signals-bootstrap (db:init). Leave this off — the worker calls
+      # assertSchemaReady and fails fast if the table is genuinely missing.
+      RUN_MIGRATIONS: "false"
+      API_PORT: "3100"
+      # The reranker is off in production too, and would need its own ~4-6 GB.
+      RERANK_DEFAULT: "false"
+    volumes:
+      # The same network.json signals-api serves, so both agree on which
+      # domains exist and which interactions are permitted.
+      - ../examples/schemas/${SIGNALS_NETWORK:-blue_dot}/network.json:/networks/network.json:ro
+    ports:
+      - "${SEARCH_API_PORT:-3100}:3100"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      # Guarantees item_search exists before assertSchemaReady runs.
+      signals-bootstrap:
+        condition: service_completed_successfully
+
+  # Ingestion worker: consumes the Redis stream, embeds `vectorize` fields and
+  # keeps the item_search read-model current. Same image, different entrypoint.
+  signals-search-worker:
+    profiles: ["search"]
+    image: ${SIGNALS_SEARCH_IMAGE:-ghcr.io/blue-dots-economy/signals-search:develop}
+    # amd64-only image (see the note on tei-embeddings). Overridable so a native
+    # build can be used instead of emulation on arm64:
+    #   SIGNALS_SEARCH_IMAGE=signals-search:local
+    #   SEARCH_PLATFORM=linux/arm64
+    # signals-search's Dockerfile builds cleanly on arm64, so that path is real.
+    platform: ${SEARCH_PLATFORM:-linux/amd64}
+    container_name: signals-search-worker
+    restart: unless-stopped
+    command: ["node", "dist/worker/main.js"]
+    environment:
+      <<: *search-env
+      WORKER_HEALTH_PORT: "3101"
+    volumes:
+      - ../examples/schemas/${SIGNALS_NETWORK:-blue_dot}/network.json:/networks/network.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      signals-bootstrap:
+        condition: service_completed_successfully
+
 volumes:
   signals-postgres-data:
   signals-metabase-data:
   signals-redis-data:
+  signals-keycloak-data:

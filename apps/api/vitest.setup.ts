@@ -3,9 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 // Load the repo-root .env so `pnpm --filter api test:integration` picks up
-// POSTGRES_URL / REDIS_URL / etc. without needing the root turbo-with-env
-// wrapper. Unit-test runs benefit too (they're a superset of the same env
-// surface). Vars already in process.env take precedence — CI overrides win.
+// POSTGRES_URL / REDIS_URL / etc. without the root turbo wrapper. Vars already
+// in process.env take precedence, so CI overrides win.
 const here = dirname(fileURLToPath(import.meta.url));
 loadDotenv({ path: resolve(here, '../../.env'), override: false });
 
@@ -27,3 +26,8 @@ process.env.POSTGRES_DB ??= 'test';
 process.env.REDIS_PASSWORD ??= 'test-password';
 process.env.SERVED_DOMAINS ??= 'yellow_dot/student';
 process.env.INSTANCE_SHARED_SECRET ??= 'test-instance-shared-secret-32-bytes-min';
+
+// `assertKeycloakConfigured` runs at `src/config.ts` import, so without these
+// every test reaching the config chain fails to import.
+process.env.KEYCLOAK_BASE_URL ??= 'http://localhost:8080/auth';
+process.env.KEYCLOAK_ACCEPTED_CLIENT_IDS ??= 'signals-ui';

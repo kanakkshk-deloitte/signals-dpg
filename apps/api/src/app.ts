@@ -6,13 +6,14 @@ import {
   serializerCompiler,
   validatorCompiler,
 } from 'fastify-type-provider-zod';
-import AuthRoutes from '@/routes/auth';
 import {
   apiConfig,
   apiReferenceEnabled,
   getCurrentApiBaseUrl,
   instance,
+  uiHostBindings,
 } from '@/config';
+import cookie from '@fastify/cookie';
 import cors from '@fastify/cors';
 import fastifyQs from 'fastify-qs';
 import fastifySwagger from '@fastify/swagger';
@@ -20,8 +21,10 @@ import {
   allowed_origins,
   getAllowedInstanceOriginsFromNetworkConfig,
   mergeAllowedOrigins,
+  unknownBindingDomains,
 } from '@dpg/config';
 import v1_routes from '@/routes/v1/v1_routes';
+import { EXPORT_EXPOSED_HEADERS } from '@/services/action_export/headers';
 import { requestIdOptions, registerRequestIdEcho } from '@/request_id';
 import health_routes from '@/routes/health/health_route';
 import { getNetworkConfigs } from '@/network_configs';
@@ -29,6 +32,10 @@ import {
   clearNetworkSchemaCache,
   refreshConsumedSchemas,
 } from '@/network_schema_cache';
+import { getEmailMessages } from '@/notifications/email/messages';
+import { getSmsTemplates } from '@/notifications/sms/templates';
+import { registerRawBodyCapture } from '@/plugins/raw_body';
+import { registerCompression } from '@/plugins/compression';
 
 const pkg = createRequire(import.meta.url)('../package.json') as {
   version: string;
@@ -36,12 +43,10 @@ const pkg = createRequire(import.meta.url)('../package.json') as {
 
 const baseJsonSchemaTransform = createJsonSchemaTransform({});
 
-// Operations served WITHOUT user auth (no preHandler on the route and no
-// group-level auth hook) — the spec-level default security is cleared for
-// these. Derived from the actual route wiring; keep in sync when a route's
-// preHandler changes (see apps/api/CLAUDE.md "Route auth wiring"). Failure
-// direction is safe: a forgotten entry documents auth on a public route — it
-// never hides auth on a protected one; runtime auth is untouched either way.
+// Operations served without user auth; the spec's default security is
+// cleared for these. Documentation only, so keep it in sync with the route
+// preHandlers (see apps/api/CLAUDE.md "Route auth wiring"). A missing entry
+// only over-documents auth on a public route; runtime auth is unaffected.
 const PUBLIC_OPERATION_URLS = new Set([
   '/',
   '/health/live',
@@ -51,12 +56,38 @@ const PUBLIC_OPERATION_URLS = new Set([
   '/api/v1/consent/status-by-identifier',
   '/api/v1/network/schemas',
   '/api/v1/network/item/fetch',
-  '/api/v1/network/action/perform',
+  // The BFF login flow: how a browser obtains a session.
+  '/api/v1/auth/session',
+  '/api/v1/auth/session/login',
+  '/api/v1/auth/session/callback',
+  '/api/v1/auth/session/logout',
 ]);
 
 // Operations guarded by peer_instance_guard (inter-instance HMAC) instead of
 // user auth.
-const PEER_OPERATION_URLS = new Set(['/api/v1/network/item/count_local', '/api/v1/network/item/fetch_local']);
+const PEER_OPERATION_URLS = new Set([
+  '/api/v1/network/item/count_local',
+  '/api/v1/network/item/fetch_local',
+  '/api/v1/network/item/markers_local',
+  // Asserts identity in its body, so it is peer-authenticated.
+  '/api/v1/network/action/perform',
+]);
+
+import { setBrowserAllowedOrigins } from '@/services/auth/oidc_flow_state';
+import { loadCountryBoundary } from '@/services/geocoding/country_boundary';
+
+// Public responses that must still not be cached. `status-by-identifier`
+// answers "is this identifier registered?", so a shared proxy would re-serve
+// that enumeration answer; `auth/config` describes the instance's auth wiring.
+// Every other public route keeps its own caching semantics.
+const NO_STORE_PUBLIC_URLS = new Set([
+  '/api/v1/auth/config',
+  '/api/v1/consent/status-by-identifier',
+  // Carries the per-session CSRF token but resolves no `request.user` (it
+  // reads the cookie itself), so the authenticated branch of the no-store hook
+  // misses it; a shared proxy could otherwise hand one user's token to another.
+  '/api/v1/auth/session',
+]);
 
 /**
  * Wraps the zod json-schema transform to make the auth model machine-readable
@@ -96,30 +127,43 @@ const documentAuthTransform: typeof baseJsonSchemaTransform = (data) => {
 };
 
 /**
- * Builds the fully-wired Fastify app WITHOUT listening. Used by the server
- * entry (which listens), the OpenAPI dump script, and the openapi smoke test.
+ * Builds the fully wired Fastify app without listening. Used by the server
+ * entry, the OpenAPI dump script, and the OpenAPI smoke test.
  */
 export async function buildApp(): Promise<FastifyInstance> {
   const app = fastify({
     logger: true,
     trustProxy: true,
-    // Correlation id: honour + length-cap an inbound `x-request-id`, mint one
-    // when absent, log it as `reqId` (see @/request_id).
+    // Honours and length-caps an inbound `x-request-id`, mints one when
+    // absent, and logs it as `reqId` (see @/request_id).
     ...requestIdOptions,
   });
 
-  // Echo the resolved correlation id back on every response.
   registerRequestIdEcho(app);
 
-  // The schema cache lives on disk under tmpdir() and outlives a restart. In
-  // local mode the network is driven by NETWORK_CONFIG_LOCAL_FILE, so a stale
-  // cache from a previous network keeps being served after a switch. Wipe and
-  // rebuild on boot so local dev always reflects the configured network.
-  // Remote mode keeps the cache (schemas there are expensive to refetch).
-  // Rebuilding queries the `items` table (cacheReferencedItemSchemas), so it
-  // needs a reachable Postgres; SCHEMA_CACHE_WARMUP_ENABLED=false (used by
-  // the OpenAPI dump script) skips it — safe because route registration
-  // below is fully static and never reads the schema cache itself.
+  // UI_HOST_BINDINGS is parsed at module load, before a logger exists, so its
+  // warnings surface here. Malformed entries were already dropped; this is the
+  // only signal an operator gets that a portal link is misconfigured.
+  for (const warning of uiHostBindings.warnings) {
+    app.log.warn(warning);
+  }
+  const unknown = unknownBindingDomains(
+    uiHostBindings.byDomain,
+    apiConfig.served_domains.map((b) => b.domain)
+  );
+  if (unknown.length > 0) {
+    app.log.warn(
+      { domains: unknown },
+      'UI_HOST_BINDINGS names domains this instance does not serve — their emails will fall back to FRONTEND_BASE_URL'
+    );
+  }
+
+  // The schema cache lives on disk under tmpdir() and survives restarts, so in
+  // local mode a cache from a previously configured network would keep being
+  // served. Wipe and rebuild on boot; remote mode keeps the cache because its
+  // schemas are expensive to refetch. Rebuilding queries the `items` table, so
+  // it needs Postgres; SCHEMA_CACHE_WARMUP_ENABLED=false (the OpenAPI dump)
+  // skips it, which is safe because route registration never reads the cache.
   if (
     apiConfig.network_config_source === 'local' &&
     apiConfig.schema_cache_warmup_enabled
@@ -127,6 +171,21 @@ export async function buildApp(): Promise<FastifyInstance> {
     await clearNetworkSchemaCache();
     await refreshConsumedSchemas();
   }
+
+  // Load email copy at boot: a defect in the required bundled defaults throws
+  // here rather than on the first send, and fallback warnings for an
+  // EMAIL_MESSAGES_PATH override land in deploy logs. Filesystem only, so it
+  // runs unconditionally.
+  await getEmailMessages();
+
+  // Loaded at boot so a bad registry shows in deploy logs. Never throws: SMS
+  // is best-effort and dispatchSms skips an unconfigured template.
+  await getSmsTemplates();
+
+  // Country boundary for the supplied-coordinate check, loaded at boot so a
+  // bad ConfigMap is a deploy-log warning. Never throws: an unloadable
+  // boundary only disables that check.
+  await loadCountryBoundary();
 
   const networkConfigs = await getNetworkConfigs();
 
@@ -142,11 +201,39 @@ export async function buildApp(): Promise<FastifyInstance> {
     networkAllowedOrigins
   );
 
-  // Add schema validator and serializer
+  // The BFF login validates `appOrigin` and the request Host against the CORS
+  // list, so the origins a browser may call from and be redirected to match.
+  setBrowserAllowedOrigins(corsAllowedOrigins);
+
   app.setValidatorCompiler(validatorCompiler);
   app.setSerializerCompiler(serializerCompiler);
 
-  // CORS
+  // Capture raw JSON bytes for peer_instance_guard (see plugins/raw_body.ts).
+  registerRawBodyCapture(app);
+  await registerCompression(app);
+
+  // Responses for a resolved user carry PII or session state, so they get
+  // no-store, as do NO_STORE_PUBLIC_URLS. Other public responses keep their own
+  // caching. A route that already set Cache-Control wins.
+  app.addHook('onSend', async (request, reply, payload) => {
+    const needsNoStore =
+      request.user || NO_STORE_PUBLIC_URLS.has(request.url.split('?')[0]);
+    if (needsNoStore && !reply.getHeader('cache-control')) {
+      reply.header('Cache-Control', 'no-store');
+    }
+    return payload;
+  });
+
+  /**
+   * Cookie parsing for the BFF browser session. Registered at the root scope
+   * before any route: registered later or in an encapsulated scope, the session
+   * routes and cookie auth channel silently see no cookies.
+   *
+   * No `secret`: `sid` is an opaque random id looked up in Redis, so signing
+   * it would prove nothing the lookup does not.
+   */
+  await app.register(cookie);
+
   await app.register(cors, {
     origin: (origin, cb) => {
       if (!origin || corsAllowedOrigins.includes(origin)) {
@@ -157,14 +244,15 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    // Lets the cross-origin UI read the export filename and counts.
+    exposedHeaders: [...EXPORT_EXPOSED_HEADERS],
   });
 
   // Query string parser - supports bracket notation (e.g. itemState[userId]=value)
   await app.register(fastifyQs, {});
 
-  // Documentation. Gated: the always-available reference is the
-  // bluedots-docs site, so this is a secure-by-default local/dev convenience
-  // (see apiReferenceEnabled in @/config).
+  // Off by default; the published reference is the bluedots-docs site (see
+  // apiReferenceEnabled in @/config).
   if (apiReferenceEnabled) {
     await app.register(fastifySwagger, {
       openapi: {
@@ -174,18 +262,18 @@ export async function buildApp(): Promise<FastifyInstance> {
             'Network-aware Signals DPG API — items, actions, events, consent, network fetch, admin.\n\n' +
             'Unless marked otherwise, operations require authentication via either the `apiKeyAuth` ' +
             'or `sessionAuth` scheme (the spec default). Public operations carry no Authorizations ' +
-            'section; the two inter-instance `*_local` operations use the service-to-service ' +
+            'section; the four inter-instance peer operations (the three `*_local` reads and `action/perform`) use the service-to-service ' +
             '`peerAuth` scheme instead. Admin and aggregator operations additionally require the ' +
             '`x-acting-org-id` header (optional on action operations). See ' +
             '`docs/operations/integrating-dpgs.md` for the full auth model.',
           version: pkg.version,
         },
-        // Default for every operation; exceptions are applied per-route in
-        // documentAuthTransform below.
-        security: [{ apiKeyAuth: [] }, { sessionAuth: [] }],
-        // Tag descriptions make starlight-openapi emit one overview page per
-        // group in the published reference (tags without a description get
-        // sidebar-group-only treatment).
+        // Default for every operation; documentAuthTransform applies the
+        // exceptions. Two alternatives: an api key, or the session cookie plus
+        // the CSRF token (paired so generated clients discover the header; it
+        // is enforced only on unsafe methods).
+        security: [{ apiKeyAuth: [] }, { sessionAuth: [], csrfToken: [] }],
+        // Tag descriptions make starlight-openapi emit an overview page per group.
         tags: [
           { name: 'health', description: 'Liveness and readiness probes for orchestrators (unauthenticated).' },
           { name: 'item', description: 'Create, fetch, update and delete items, and manage their lifecycle status.' },
@@ -220,7 +308,7 @@ export async function buildApp(): Promise<FastifyInstance> {
               name: 'x-api-key',
               description:
                 'Service API key used by integrating DPGs (aggregator-dpg, voice-dpg) and other ' +
-                'machine clients (apps/api/plugins/auth/validate_api_key.ts). Takes priority over ' +
+                'machine clients (apps/api/plugins/auth/auth_middleware.ts). Takes priority over ' +
                 'session auth: if present and invalid the request is rejected outright, with no ' +
                 'fallback to a session. Routes under /api/v1/admin and /api/v1/aggregator ' +
                 'additionally require an `x-acting-org-id` header identifying the organization the ' +
@@ -229,11 +317,29 @@ export async function buildApp(): Promise<FastifyInstance> {
             sessionAuth: {
               type: 'apiKey',
               in: 'cookie',
-              name: 'better-auth.session_token',
+              name: 'sid',
               description:
-                'Browser session cookie issued by better-auth after sign-in, used by the web UI ' +
-                '(apps/api/plugins/auth/validate_session.ts). Checked as a fallback only when ' +
-                'x-api-key is absent.',
+                'Opaque browser-session cookie issued by the BFF after sign-in, used by the web UI ' +
+                '(apps/api/plugins/auth/resolve_browser_session.ts). httpOnly, so script cannot ' +
+                'read it; the access and refresh tokens live server-side in Redis and never reach ' +
+                'the browser. Checked when x-api-key is absent, before the bearer path. This is ' +
+                'the only session channel a browser has — #517 removed the better-auth cookie ' +
+                'that used to sit alongside it. **Every unsafe method ' +
+                '(anything but GET/HEAD/OPTIONS) additionally requires the `x-csrf-token` header ' +
+                'echoing the value from `GET /api/v1/auth/session`; without it the request is ' +
+                'refused with 403 CSRF_TOKEN_INVALID.**',
+            },
+            csrfToken: {
+              type: 'apiKey',
+              in: 'header',
+              name: 'x-csrf-token',
+              description:
+                'Per-session CSRF token for the cookie channel, read from `GET /api/v1/auth/session` ' +
+                'and echoed on every state-changing request. A cookie is attached by the browser ' +
+                'automatically, so this double-submit token is what a cross-site page cannot supply ' +
+                '— it can cause the cookie to be sent but cannot read the response that carries ' +
+                'this value. Not required on GET/HEAD/OPTIONS, and not used by the x-api-key or ' +
+                'bearer channels.',
             },
             peerAuth: {
               type: 'apiKey',
@@ -268,7 +374,7 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
   });
   app.register(health_routes);
-  app.register(AuthRoutes);
+
   app.register(v1_routes, { prefix: '/api/v1' });
 
   return app;

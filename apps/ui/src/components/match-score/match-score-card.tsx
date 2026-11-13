@@ -5,6 +5,7 @@ import { DomainCard } from '@/components/cards/domain-card';
 import { MatchScoreModal } from './match-score-modal';
 import { useMatchScore } from '@/hooks/use-match-score';
 import type { Item } from '@/lib/item-api';
+import type { BrowseSort } from '@/lib/browse-discover';
 
 export interface MatchScoreCardProps {
   schema: RJSFSchema;
@@ -20,6 +21,12 @@ export interface MatchScoreCardProps {
   localItem: Item | null;
   networkItem: Item;
   selectionMode?: boolean;
+  /** Disable the action CTA: an open action already exists for this pair. */
+  actionsDisabled?: boolean;
+  actionsDisabledReason?: string;
+  /** Decides which quantity the card's pill shows. */
+  sortApplied?: BrowseSort;
+  relevanceBasis?: 'profile' | 'search' | null;
 }
 
 export function MatchScoreCard({
@@ -36,7 +43,11 @@ export function MatchScoreCard({
   localItem,
   networkItem,
   selectionMode = false,
-}: MatchScoreCardProps) {
+  actionsDisabled = false,
+  actionsDisabledReason,
+  sortApplied,
+  relevanceBasis,
+}: Readonly<MatchScoreCardProps>) {
   const [isModalOpen, setIsModalOpen] = React.useState(false);
   
   const {
@@ -51,11 +62,8 @@ export function MatchScoreCard({
   });
 
   const handleCalculate = React.useCallback(() => {
-    // Open the details modal on the same click that starts the calculation, so
-    // the list matches the map's one-click flow: the modal shows its loading
-    // state, then the full score + factors. Closing it collapses back to the
-    // score badge (rendered by MatchScoreButton once a score exists), which
-    // reopens the modal via handleViewDetails.
+    // Opens the modal on the same click that starts the calculation, like the
+    // map's one-click flow; it shows loading, then the score.
     calculate();
     setIsModalOpen(true);
   }, [calculate]);
@@ -74,13 +82,12 @@ export function MatchScoreCard({
 
   const handleProceed = React.useCallback(() => {
     setIsModalOpen(false);
-    // Trigger the first action if available
+    if (actionsDisabled) return;
     if (actions.length > 0 && onAction) {
       onAction(actions[0].action_type, actions[0]);
     }
-  }, [actions, onAction]);
+  }, [actions, onAction, actionsDisabled]);
 
-  // Get title for items
   const titleKey = findTitleField(schema);
   const localItemName = localItem 
     ? (localItem.item_state[titleKey ?? 'name'] as string) ?? 'Your Profile'
@@ -102,8 +109,13 @@ export function MatchScoreCard({
         onClick={onClick}
         localItem={localItem}
         networkItem={networkItem}
+        shareItem={networkItem}
         selectionMode={selectionMode}
+        actionsDisabled={actionsDisabled}
+        actionsDisabledReason={actionsDisabledReason}
         matchScore={score}
+        sortApplied={sortApplied}
+        relevanceBasis={relevanceBasis}
         matchScoreLoading={matchScoreLoading}
         matchScoreError={matchScoreError}
         onCalculateMatch={handleCalculate}

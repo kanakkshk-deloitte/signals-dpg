@@ -1,8 +1,14 @@
 import { useQuery } from '@tanstack/react-query';
 import type { ConsentConfigDocument } from '@dpg/schemas';
 import { getConsentStatus } from '@/lib/consent-api';
+import {
+  currentGateVersions,
+  outstandingGateCategories,
+  type ConsentVariant,
+} from '@/lib/consent-gate';
 import { useConsentConfig } from './use-consent-config';
 import { useNetworkTheme } from '@/theme/theme-provider';
+import { useAuth } from '@/contexts/auth-context';
 
 type ConsentCategory = 'terms' | 'privacy';
 
@@ -15,12 +21,18 @@ interface UseConsentGateResult {
   needed: ConsentCategory[];
   config: ConsentConfigDocument | null;
   currentVersions: CurrentVersions | null;
+  /**
+   * Which document set applies. The status endpoint derives it from the user's
+   * recorded age; the client has no access to the age and must not decide it.
+   */
+  variant: ConsentVariant;
   isLoading: boolean;
   refetch: () => void;
 }
 
 export function useConsentGate(): UseConsentGateResult {
   const { themeId } = useNetworkTheme();
+  const { isAuthenticated } = useAuth();
   const { config, isLoading: configLoading } = useConsentConfig();
 
   const {
@@ -30,7 +42,7 @@ export function useConsentGate(): UseConsentGateResult {
   } = useQuery({
     queryKey: ['consent-status', themeId],
     queryFn: () => getConsentStatus(themeId),
-    enabled: !!themeId,
+    enabled: !!themeId && isAuthenticated,
     staleTime: 0,
   });
 
@@ -41,22 +53,19 @@ export function useConsentGate(): UseConsentGateResult {
       needed: [],
       config,
       currentVersions: null,
+      variant: 'adult',
       isLoading,
       refetch,
     };
   }
 
-  const currentVersions: CurrentVersions = {
-    terms: config.documents.terms.current_version,
-    privacy: config.documents.privacy.current_version,
-  };
-
-  const needed = (['terms', 'privacy'] as const).filter(
-    (c) => !status.statuses[c].includes(currentVersions[c]),
-  );
+  const variant: ConsentVariant = status.variant ?? 'adult';
+  const currentVersions: CurrentVersions = currentGateVersions(config, variant);
+  const needed: ConsentCategory[] = outstandingGateCategories(config, variant, status.statuses);
 
   return {
     needed,
+    variant,
     config,
     currentVersions,
     isLoading,

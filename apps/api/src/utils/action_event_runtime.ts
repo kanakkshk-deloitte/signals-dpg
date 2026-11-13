@@ -9,6 +9,7 @@ import z, {
 import { action_events, items } from '@dpg/database';
 import type { NodePgDatabase } from 'drizzle-orm/node-postgres';
 import { apiConfig, getCurrentApiBaseUrl } from '@/config';
+import { getNetworkConfigById } from '@/network_configs';
 import { decryptItemPrivate } from './item_decrypt';
 
 type ActionItemRef = z.infer<typeof PerformNetworkActionBodySchema>['source_item'];
@@ -70,8 +71,16 @@ function decodeSnapshot<
     item_state: row.item_state as Record<string, unknown>,
     item_private_state: row.item_private_state,
   });
-  const { item_state: _drop, item_private_state: _drop2, ...rest } = row;
-  return { ...rest, private_state: mergedState };
+  const {
+    item_state: publicItemState,
+    item_private_state: _drop2,
+    ...rest
+  } = row;
+  return {
+    ...rest,
+    item_state: publicItemState as Record<string, unknown>,
+    private_state: mergedState,
+  };
 }
 
 export async function fetchLocalItemSnapshot(
@@ -89,6 +98,7 @@ export async function fetchLocalItemSnapshot(
     .select({
       item_id: items.item_id,
       item_instance_url: items.item_instance_url,
+      item_schema_url: items.item_schema_url,
       item_state: items.item_state,
       item_private_state: items.item_private_state,
       created_by: items.created_by,
@@ -113,6 +123,7 @@ export async function fetchLocalItemSnapshot(
     .select({
       item_id: items.item_id,
       item_instance_url: items.item_instance_url,
+      item_schema_url: items.item_schema_url,
       item_state: items.item_state,
       item_private_state: items.item_private_state,
       created_by: items.created_by,
@@ -242,7 +253,9 @@ export function validateActionEventPayload(
     return;
   }
 
-  validateAgainstJsonSchema(eventSchema, eventPayload, 'event payload', {
+  // Consent is validated at the request boundary (ConsentAckSchema), not by the network schema.
+  const { consent: _drop, ...networkPayload } = eventPayload;
+  validateAgainstJsonSchema(eventSchema, networkPayload, 'event payload', {
     allowAdditionalProperties: apiConfig.allow_extra_schema_data,
     ignoredKeys: actionEventSystemPayloadKeys,
   });
@@ -296,6 +309,38 @@ function isPlainObject(input: unknown): input is Record<string, unknown> {
   return typeof input === 'object' && input !== null && !Array.isArray(input);
 }
 
+/**
+ * SSRF guard for the outbound event mirror, which POSTs a full action event
+ * (with PII) to `source_item.item_instance_url`. That URL comes from the
+ * /network/action/perform body, is persisted, and is replayed on status
+ * updates, so it must not be able to target an internal address or an
+ * arbitrary endpoint.
+ *
+ * Allowed: an instance in the network's registered `instances` with the
+ * source item's `domain_id` and the same origin (scheme+host+port). Checked
+ * against `networkConfig.instances`, not the served-domains CORS list, because
+ * the target is a remote peer.
+ */
+async function isRegisteredSourceInstance(
+  event: StoredActionEvent
+): Promise<boolean> {
+  // Already parsed by normalizeInstanceUrl in the caller, so this cannot throw.
+  const sourceOrigin = new URL(event.source_item.item_instance_url).origin;
+
+  const networkConfig = await getNetworkConfigById(
+    event.source_item.item_network
+  );
+
+  return (networkConfig.instances ?? []).some((instance) => {
+    if (instance.domain_id !== event.source_item.item_domain) return false;
+    try {
+      return new URL(instance.instance_url).origin === sourceOrigin;
+    } catch {
+      return false;
+    }
+  });
+}
+
 export async function mirrorActionEventToSourceInstance(
   event: StoredActionEvent,
   log: FastifyBaseLogger
@@ -308,6 +353,30 @@ export async function mirrorActionEventToSourceInstance(
   }
 
   try {
+    if (!(await isRegisteredSourceInstance(event))) {
+      log.error(
+        {
+          action_id: event.action_id,
+          source_instance_url: event.source_item.item_instance_url,
+          source_item_network: event.source_item.item_network,
+        },
+        'Refusing to mirror action event: source instance URL is not a registered instance for its network (possible SSRF)'
+      );
+      return;
+    }
+  } catch (err) {
+    log.error(
+      {
+        err,
+        action_id: event.action_id,
+        source_instance_url: event.source_item.item_instance_url,
+      },
+      'Failed to validate source instance URL before mirroring; refusing to mirror'
+    );
+    return;
+  }
+
+  try {
     const response = await fetch(
       new URL('/api/v1/event/store', event.source_item.item_instance_url),
       {
@@ -316,6 +385,11 @@ export async function mirrorActionEventToSourceInstance(
           'content-type': 'application/json',
         },
         body: JSON.stringify(event),
+        // The allowlist was checked against this URL only; following a
+        // redirect would send the PII payload to an unchecked origin.
+        redirect: 'error',
+        // Fire-and-forget: an unresponsive peer must not hold sockets open.
+        signal: AbortSignal.timeout(apiConfig.peer_fetch_timeout_ms),
       }
     );
 

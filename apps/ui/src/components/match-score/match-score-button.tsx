@@ -10,11 +10,20 @@ import {
 import type { Item } from '@/lib/item-api';
 import type { MatchScoreResult } from '@/lib/match-score-api';
 import { MatchScoreBadge } from './match-score-badge';
+import type { CardMetric } from '@/lib/metric-display';
 
 export interface MatchScoreButtonProps {
   localItem: Item | null;
   networkItem: Item;
   score: MatchScoreResult | null;
+  /**
+   * The card's ranking basis from the sort the server applied; null when
+   * nothing determined the position (the calculate CTA shows instead). Omit
+   * outside a sorted list, where the profile relevance score is the default.
+   */
+  metric?: CardMetric;
+  /** Which quantity `relevance` means; only used for the tooltip. */
+  basis?: 'profile' | 'search' | null;
   isLoading: boolean;
   error: Error | null;
   onCalculate: () => void;
@@ -25,6 +34,8 @@ export interface MatchScoreButtonProps {
 export function MatchScoreButton({
   localItem,
   score,
+  metric,
+  basis,
   isLoading,
   error,
   onCalculate,
@@ -32,18 +43,26 @@ export function MatchScoreButton({
   disabled = false,
 }: MatchScoreButtonProps) {
   const { t } = useTranslation();
-  // If we have a score, show the badge
-  if (score && !error) {
+  // `undefined`: no sort context, so use the profile relevance score. `null`:
+  // the sort produced no metric, which is respected.
+  let effectiveMetric: CardMetric = metric ?? null;
+  if (metric === undefined && score?.score != null) {
+    effectiveMetric = { kind: 'relevance', percent: score.score };
+  }
+
+  if (effectiveMetric && !error) {
+    // Only a relevance pill opens the score modal, which explains a cosine
+    // score. Without a handler the badge renders as plain text.
+    const opensDetails = effectiveMetric.kind === 'relevance';
     return (
       <MatchScoreBadge
-        score={score}
-        onClick={onViewDetails}
-        showLabel={false}
+        metric={effectiveMetric}
+        basis={basis ?? 'profile'}
+        onClick={opensDetails ? onViewDetails : undefined}
       />
     );
   }
 
-  // If there was an error, show error state
   if (error) {
     return (
       <TooltipProvider>
@@ -69,7 +88,6 @@ export function MatchScoreButton({
     );
   }
 
-  // Loading state
   if (isLoading) {
     return (
       <Button
@@ -84,7 +102,6 @@ export function MatchScoreButton({
     );
   }
 
-  // Default state - calculate button
   const isDisabled = disabled || !localItem;
   
   return (
@@ -94,6 +111,7 @@ export function MatchScoreButton({
           <Button
             variant="outline"
             size="sm"
+            data-tour="card-match-score"
             onClick={onCalculate}
             disabled={isDisabled}
             className="gap-1.5 min-w-0 max-w-full"

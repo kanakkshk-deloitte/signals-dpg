@@ -4,7 +4,7 @@ import { user } from '@api/db/postgres/schema/auth';
 
 export type ActingOrg = {
   org_id: string;
-  org_type: 'aggregator' | 'voice' | 'network_service';
+  org_type: 'aggregator' | 'network_service';
   service_user_id: string;
 };
 
@@ -37,27 +37,23 @@ export type ResolveActingActorInput = {
   request_user_id: string;
   acting_as_user_id: string | undefined;
   /**
-   * Returns `{ onboardedByOrgId }` when the user row exists (with
-   * `onboardedByOrgId` possibly null for self-registered or pre-Plan-2
-   * users); returns `null` when no user row exists at all.
-   *
-   * The two states must be distinguished — aggregator-tier and
-   * network-service-tier handle them differently.
+   * `{ onboardedByOrgId }` (possibly null, e.g. self-registered) when the user
+   * row exists; `null` when it does not. The two tiers handle them differently.
    */
   lookup_user: (user_id: string) => Promise<{ onboardedByOrgId: string | null } | null>;
 };
 
 /**
- * Single source of truth for the action on-behalf-of authorization
- * matrix documented in
- * docs/superpowers/specs/2026-05-23-action-on-behalf-of-network-service-tier-design.md.
+ * Single source of truth for the action on-behalf-of authorization matrix
+ * (docs/superpowers/specs/2026-05-23-action-on-behalf-of-network-service-tier-design.md).
  *
- * Two tiers are allowed today:
+ * Two tiers:
  *   - `aggregator`: scoped to users with `onboarded_by_org_id ===
  *     acting_org.org_id`.
  *   - `network_service`: unrestricted; any user in the network.
  *
- * Voice-typed acting_orgs are rejected (placeholder for future).
+ * Every other org type is rejected. The voice channel holds a
+ * `network_service` org and is told apart by the token's `azp`.
  */
 export const resolve_acting_actor = async (
   input: ResolveActingActorInput,
@@ -76,8 +72,9 @@ export const resolve_acting_actor = async (
     };
   }
 
-  // 2. Tier gate: aggregator OR network_service. Anything else (voice,
-  //    unknown) is rejected.
+  // 2. Tier gate. `organization.type` is plain nullable text, so a retired or
+  //    unknown type can reach here at runtime despite the union; keep this
+  //    explicit check.
   if (
     acting_org.org_type !== 'aggregator' &&
     acting_org.org_type !== 'network_service'
@@ -115,12 +112,7 @@ export const resolve_acting_actor = async (
   };
 };
 
-/**
- * Shared DB lookup used by `/action/perform` when resolving the
- * on-behalf-of target user. Returns `null` for missing users, or
- * `{ onboardedByOrgId }` for users that exist (the field may itself
- * be `null` for self-registered users).
- */
+/** The default `lookup_user` for resolving the on-behalf-of target user. */
 export const lookup_user_for_acting = async (
   user_id: string,
 ): Promise<{ onboardedByOrgId: string | null } | null> => {
@@ -133,17 +125,14 @@ export const lookup_user_for_acting = async (
   return { onboardedByOrgId: rows[0].onboardedByOrgId };
 };
 
-/**
- * Human-readable messages for each `ResolveErr.error` code. Route
- * handlers use this when constructing their `reply.send({ error, message })`.
- */
+/** Human-readable messages for each `ResolveErr.error` code. */
 export const action_error_messages: Record<ResolveErr['error'], string> = {
   CANNOT_OVERRIDE_SELF:
     'acting_as_user_id requires an x-acting-org-id header naming an aggregator-type or network_service-type acting org.',
   MISSING_ACTING_AS_USER_ID:
     'aggregator-type or network_service-type acting_org requires acting_as_user_id in the request body.',
   ACTING_ORG_TYPE_NOT_ALLOWED:
-    'only aggregator-type or network_service-type acting orgs may act on behalf of users today.',
+    'only aggregator-type or network_service-type acting orgs may act on behalf of users.',
   NOT_AUTHORIZED_FOR_TARGET:
     'acting_as_user_id is not a user onboarded by this aggregator.',
   USER_NOT_FOUND:

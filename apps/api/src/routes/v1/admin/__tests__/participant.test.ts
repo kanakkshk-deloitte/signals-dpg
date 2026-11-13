@@ -16,6 +16,19 @@ import {
  * the right side effects on the mocked DB / item helpers.
  */
 
+// Declared before the factory so the mock closes over it. `keycloak_enabled` is
+// a constant `true` since #517 retired better-auth; the mock is kept because the
+// route module reads authConfig at import time.
+// `vi.hoisted` because `vi.mock` factories are hoisted above ordinary consts,
+// and this one is dereferenced when the factory runs rather than lazily.
+const mockAuthConfig = vi.hoisted(() => ({
+  secret: 'test-secret',
+  middleware_enabled: false,
+  url: 'http://source.local/api/auth',
+  create_test_otp: false,
+  keycloak_enabled: true,
+}));
+
 // --- mock @/config so loadEnv() never runs ---
 vi.mock('@/config', () => ({
   apiConfig: {
@@ -31,12 +44,7 @@ vi.mock('@/config', () => ({
     allow_extra_schema_data: true,
     schema_registry_url: '',
   },
-  authConfig: {
-    secret: 'test-secret',
-    middleware_enabled: false,
-    url: 'http://source.local/api/auth',
-    create_test_otp: false,
-  },
+  authConfig: mockAuthConfig,
   getCurrentApiBaseUrl: () => 'http://source.local',
   instance: { INSTANCE_NAME: 'test', INSTANCE_ENV: 'development' },
   api: { API_DOMAIN: 'http://source.local', API_PORT: 3000 },
@@ -48,25 +56,14 @@ vi.mock('@/config', () => ({
   schemaRegistry: {},
 }));
 
-// --- neutralize the auth chain ---
-vi.mock('@/routes/auth/create_auth', () => {
-  return {
-    authInstance: {
-      api: {
-        signUpEmail: vi.fn(async () => {
-          if (dbState.signUpMode === 'unique_violation') {
-            const err: Error & { code?: string } = new Error(
-              'duplicate key value violates unique constraint',
-            );
-            err.code = '23505';
-            throw err;
-          }
-          return { user: { id: dbState.signUpUserId } };
-        }),
-      },
-    },
-  };
-});
+// The realm-identity step. Mocked so no admin client is constructed, and so a
+// failure can be simulated to prove the compensating delete still runs.
+vi.mock('@/services/auth/participant_identity', () => ({
+  createParticipantKeycloakIdentity: vi.fn(async (input: { email: string | null }) => {
+    dbState.identityCalls.push({ email: input.email });
+    return dbState.identityResult;
+  }),
+}));
 
 vi.mock('@api/plugins/auth/auth_middleware', () => ({
   auth_middleware_if_enabled: vi.fn(async () => {}),
@@ -83,14 +80,39 @@ vi.mock('@dpg/database', async (importOriginal) => {
 });
 
 // --- mock publishItemEvent so Redis is never touched in unit tests ---
-vi.mock('@/utils/publish_item_event', () => ({
-  publishItemEvent: vi.fn(async () => {}),
-}));
+vi.mock('@/utils/publish_item_event', () => {
+  const publishItemEvent = vi.fn(async () => {});
+  return {
+    publishItemEvent,
+    // Keeps the real fan-out + de-dupe, delegating to the mocked single publish,
+    // so every assertion on `publishItemEvent` still sees exactly the events the
+    // route emitted — a no-op stub here would hide them all.
+    publishItemEvents: vi.fn(
+      async (
+        keys: Array<Record<string, string>>,
+        op: string,
+        logger?: unknown,
+      ) => {
+        const seen = new Set<string>();
+        for (const k of keys) {
+          const id = `${k.item_network}/${k.item_domain}/${k.item_type}/${k.item_id}`;
+          if (seen.has(id)) continue;
+          seen.add(id);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          await (publishItemEvent as any)({ ...k, op }, logger);
+        }
+      },
+    ),
+  };
+});
 
 // --- mock the consent service: it is unit-tested separately; here we only
 //     assert the route calls it with the right args and stays green.
 vi.mock('@/services/participant_consent', () => ({
   recordParticipantConsent: vi.fn(async () => ({ recorded: 0, promoted: false })),
+  // Returns the keys of the drafts an age write promoted (#557) — the route has to
+  // publish an item event for each so signals-search re-indexes them.
+  promoteEligibleDraftsForUser: vi.fn(async () => [] as unknown[]),
 }));
 
 // --- mock @dpg/schemas: keep real exports + neutralize the merge helper for tests ---
@@ -135,6 +157,21 @@ const dbState: {
    * Set per-test for the idempotent re-onboard scenario.
    */
   existingOwnedItemId: string | null;
+  /** `user` rows written directly by insertLocalUser (the Keycloak branch). */
+  userInserts: Array<Record<string, unknown>>;
+  /** Args seen by createParticipantKeycloakIdentity. */
+  identityCalls: Array<{ email: string | null }>;
+  identityResult: { ok: boolean; code?: string; message?: string };
+  /** When set, the direct user insert throws this. */
+  userInsertError: unknown;
+  /** user rows deleted (the orphan-cleanup path). */
+  userDeletes: number;
+  /**
+   * Orgs claiming the binding in the SS-3 default-aggregator lookup (#640).
+   * Empty = no default configured for this instance, which is the launch state
+   * and what every pre-existing test in this file expects.
+   */
+  defaultAggregatorRows: Array<{ id: string }>;
 } = {
   existingUserRows: [],
   itemsByUser: new Map(),
@@ -144,6 +181,12 @@ const dbState: {
   signUpMode: 'ok',
   signUpUserId: 'usr_new_default',
   existingOwnedItemId: null,
+  userInserts: [],
+  identityCalls: [],
+  identityResult: { ok: true },
+  defaultAggregatorRows: [],
+  userInsertError: null,
+  userDeletes: 0,
 };
 
 // Discriminate db.select() projections by their key set, so the same
@@ -151,10 +194,15 @@ const dbState: {
 // and the idempotent existing-owned-item lookup.
 type SelectMode = 'user' | 'items_list' | 'item_owner' | 'existing_item_lookup' | 'unknown';
 
-const classifyProjection = (proj: Record<string, unknown>): SelectMode => {
+const classifyProjection = (proj: Record<string, unknown> | undefined): SelectMode => {
+  // `insertLocalUser` re-reads with a bare `select()` (no projection) after a
+  // unique violation, so undefined is a real case, not a mistake.
+  if (!proj) return 'unknown';
   const keys = Object.keys(proj);
   if (keys.includes('onboardedByOrgId')) return 'user';
-  if (keys.length === 1 && keys[0] === 'created_by') return 'item_owner';
+  // The ownership pre-flight now also reads the item's key columns (#557), so it is
+  // no longer a single-column projection.
+  if (keys.includes('created_by') && !keys.includes('item_state')) return 'item_owner';
   if (keys.length === 1 && keys[0] === 'item_id') return 'existing_item_lookup';
   if (keys.includes('item_state') && keys.includes('item_private_state')) {
     return 'items_list';
@@ -174,7 +222,7 @@ let lastQueriedItemId: string | null = null;
 // test's user_id is fed via a side channel — the existingUserRows[0].id —
 // since each test only ever has one user in scope.
 vi.mock('@api/db/postgres/drizzle_config', () => {
-  const makeSelectChain = (proj: Record<string, unknown>) => {
+  const makeSelectChain = (proj?: Record<string, unknown>) => {
     const mode = classifyProjection(proj);
     return {
       from: vi.fn(() => ({
@@ -189,7 +237,19 @@ vi.mock('@api/db/postgres/drizzle_config', () => {
                 ? dbState.itemOwnerLookup.get(item_id)
                 : undefined;
               if (!owner) return Promise.resolve([]);
-              return Promise.resolve([{ created_by: owner }]);
+              // Key columns come from the item row when the test seeded one, so a
+              // published event carries that item's real identity.
+              const seeded = (dbState.itemsByUser.get(owner) ?? []).find(
+                (r) => r.item_id === item_id,
+              );
+              return Promise.resolve([
+                {
+                  created_by: owner,
+                  item_network: seeded?.item_network ?? 'blue_dot',
+                  item_domain: seeded?.item_domain ?? 'seeker',
+                  item_type: seeded?.item_type ?? 'profile_1.0',
+                },
+              ]);
             }
             return Promise.resolve([]);
           }),
@@ -228,7 +288,7 @@ vi.mock('@api/db/postgres/drizzle_config', () => {
     };
   };
 
-  const select = vi.fn((proj: Record<string, unknown>) =>
+  const select = vi.fn((proj?: Record<string, unknown>) =>
     makeSelectChain(proj),
   );
 
@@ -245,7 +305,23 @@ vi.mock('@api/db/postgres/drizzle_config', () => {
   }));
 
   const deleteFn = vi.fn(() => ({
-    where: vi.fn(() => Promise.resolve()),
+    where: vi.fn(() => {
+      dbState.userDeletes += 1;
+      return Promise.resolve();
+    }),
+  }));
+
+  const insertFn = vi.fn(() => ({
+    values: vi.fn((values: Record<string, unknown>) => {
+      if (dbState.userInsertError) return Promise.reject(dbState.userInsertError);
+      dbState.userInserts.push(values);
+      // Read-back consistency: the route mints the user id itself now (it becomes
+      // the Keycloak `sub`), so a test can no longer pin it in advance the way it
+      // could when better-auth's signUpEmail returned one. Point the select fake
+      // at whatever was just written, so the fake db behaves like a real one.
+      if (typeof values.id === 'string') lastQueriedUserId = values.id;
+      return Promise.resolve();
+    }),
   }));
 
   const transaction = vi.fn(
@@ -253,7 +329,7 @@ vi.mock('@api/db/postgres/drizzle_config', () => {
       const tx = {
         select,
         update,
-        insert: vi.fn(),
+        insert: insertFn,
       };
       return cb(tx);
     },
@@ -263,8 +339,12 @@ vi.mock('@api/db/postgres/drizzle_config', () => {
     db: {
       select,
       update,
+      insert: insertFn,
       transaction,
       delete: deleteFn,
+      // Raw-SQL path. Used by the SS-3 default-aggregator lookup (#640);
+      // `defaultAggregatorRows` decides whether a default is configured.
+      execute: vi.fn(() => Promise.resolve({ rows: dbState.defaultAggregatorRows })),
     },
   };
 });
@@ -369,9 +449,11 @@ const VALID_PHONE = '+919876543210';
 const baseBody = (over: Record<string, unknown> = {}) => ({
   email: VALID_EMAIL,
   name: 'Demo',
-  terms_accepted: true,
-  privacy_accepted: true,
   channel: 'bulk',
+  // SS-3 (#640): a non-aggregator caller must send `domain` — it selects which
+  // default aggregator owns the participant, and the schema's `?? 'seeker'`
+  // fallback would silently hand a provider signup to the seeker aggregator.
+  domain: 'seeker',
   item_state: { whoIAm: { education: 'XII' } },
   ...over,
 });
@@ -379,7 +461,7 @@ const baseBody = (over: Record<string, unknown> = {}) => ({
 const buildApp = async (
   acting?: {
     org_id?: string;
-    org_type?: 'aggregator' | 'voice' | 'network_service';
+    org_type?: 'aggregator' | 'network_service';
   } | null,
 ): Promise<FastifyInstance> => {
   const app = Fastify().withTypeProvider<ZodTypeProvider>();
@@ -401,8 +483,8 @@ const buildApp = async (
 const VALID_UUID_A = '11111111-1111-4111-8111-111111111111';
 const VALID_UUID_B = '22222222-2222-4222-8222-222222222222';
 
-describe('POST /admin/participant', () => {
-  beforeEach(() => {
+/** Shared by both top-level describes; they must reset identically. */
+const resetDbState = () => {
     dbState.existingUserRows = [];
     dbState.itemsByUser = new Map();
     dbState.itemOwnerLookup = new Map();
@@ -411,6 +493,12 @@ describe('POST /admin/participant', () => {
     dbState.signUpMode = 'ok';
     dbState.signUpUserId = 'usr_new_default';
     dbState.existingOwnedItemId = null;
+    dbState.userInserts = [];
+    dbState.identityCalls = [];
+    dbState.identityResult = { ok: true };
+    dbState.userInsertError = null;
+    dbState.userDeletes = 0;
+    dbState.defaultAggregatorRows = [];
     lastQueriedUserId = null;
     lastQueriedItemId = null;
     vi.mocked(publishItemEvent).mockClear();
@@ -421,7 +509,10 @@ describe('POST /admin/participant', () => {
       recorded: 0,
       promoted: false,
     });
-  });
+};
+
+describe('POST /admin/participant', () => {
+  beforeEach(resetDbState);
 
   it('403 INVALID_ACTING_ORG when acting_org is missing', async () => {
     const app = await buildApp(null);
@@ -434,8 +525,10 @@ describe('POST /admin/participant', () => {
     expect(res.json().error).toBe('INVALID_ACTING_ORG');
   });
 
-  it('403 ACTING_ORG_TYPE_NOT_ALLOWED for voice', async () => {
-    const app = await buildApp({ org_type: 'voice' });
+  it('403 ACTING_ORG_TYPE_NOT_ALLOWED for an org type outside the allowed set', async () => {
+    const app = await buildApp({
+      org_type: 'employer' as unknown as 'aggregator',
+    });
     const res = await app.inject({
       method: 'POST',
       url: '/participant',
@@ -443,6 +536,34 @@ describe('POST /admin/participant', () => {
     });
     expect(res.statusCode).toBe(403);
     expect(res.json().error).toBe('ACTING_ORG_TYPE_NOT_ALLOWED');
+  });
+
+  it('403 ACTING_ORG_TYPE_NOT_ALLOWED for the retired `voice` type (#518)', async () => {
+    // `organization.type` is plain nullable text, so a surviving `voice` row is
+    // representable even though the union no longer admits it. It must be
+    // refused, not treated as the network-wide tier it used to be.
+    const app = await buildApp({
+      org_id: 'org_voice_1',
+      org_type: 'voice' as unknown as 'network_service',
+    });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody(),
+    });
+    expect(res.statusCode).toBe(403);
+    expect(res.json().error).toBe('ACTING_ORG_TYPE_NOT_ALLOWED');
+  });
+
+  it('admits a network_service acting org for participant upsert', async () => {
+    const app = await buildApp({ org_id: 'org_signals_1', org_type: 'network_service' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody(),
+    });
+    expect(res.statusCode).not.toBe(403);
+    expect(res.json().error).not.toBe('ACTING_ORG_TYPE_NOT_ALLOWED');
   });
 
   it('aggregator + new user + item_state → 200 user_existed:false, owned_elsewhere:false, items:[1], inserts:1', async () => {
@@ -461,7 +582,7 @@ describe('POST /admin/participant', () => {
     const body = res.json();
     expect(body.user_existed).toBe(false);
     expect(body.owned_elsewhere).toBe(false);
-    expect(body.user_id).toBe('usr_new_agg');
+    expect(body.user_id).toBe(dbState.userInserts[0].id);
     expect(body.onboarded_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     expect(body.items).toHaveLength(1);
     expect(dbState.inserts).toHaveLength(1);
@@ -486,16 +607,72 @@ describe('POST /admin/participant', () => {
     expect(body.items).toHaveLength(0);
     expect(dbState.inserts).toHaveLength(0);
     // Assert that the onboarding-field update fired and set the expected fields.
-    expect(dbState.updates).toHaveLength(1);
-    expect(dbState.updates[0].set).toMatchObject({
+    expect(dbState.userInserts).toHaveLength(1);
+    expect(dbState.userInserts[0]).toMatchObject({
       onboardedByOrgId: 'org_agg_1',
       onboardedVia: 'bulk',
+      // This API never wrote `user.domains`, which left every participant it
+      // onboarded permanently exempt from the single-domain lock (empty reads
+      // as "not decided yet") and made GET /api/v1/user/domains return [] for
+      // them in the UI. Recorded here, on the account-only path too, since the
+      // caller states the domain.
+      domains: ['seeker'],
     });
-    expect(dbState.updates[0].set).not.toHaveProperty('termsAccepted');
-    expect(dbState.updates[0].set).not.toHaveProperty('privacyAccepted');
+    expect(dbState.userInserts[0]).not.toHaveProperty('termsAccepted');
+    expect(dbState.userInserts[0]).not.toHaveProperty('privacyAccepted');
   });
 
-  it('accepts a request with terms_accepted/privacy_accepted omitted (now optional) → 200', async () => {
+  it('omits domains entirely when an aggregator caller sends no domain', async () => {
+    // An aggregator IS the owner, so `domain` is optional for it. Writing `[]`
+    // would read as "locked to nothing" rather than "not yet decided" — the
+    // participant's first item create records it instead.
+    dbState.signUpUserId = 'usr_new_nodomain';
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({
+        phone_number: VALID_PHONE,
+        email: undefined,
+        item_state: undefined,
+        domain: undefined,
+      }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(dbState.userInserts[0]).not.toHaveProperty('domains');
+  });
+
+  it('a NEW participant whose profile fails the schema gets INVALID_ITEM_STATE with its fields map', async () => {
+    dbState.signUpUserId = 'usr_new_invalid';
+    lastQueriedUserId = 'usr_new_invalid';
+    const { create_profile_item } = await import('@/lib/profile_item');
+    vi.mocked(create_profile_item).mockRejectedValueOnce(
+      Object.assign(new Error('Invalid item_state: mobile_number: Enter a 10-digit mobile number'), {
+        statusCode: 400,
+        errorCode: 'INVALID_ITEM_STATE',
+        details: { fields: { mobile_number: 'Enter a 10-digit mobile number' } },
+      }),
+    );
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: {
+        email: 'invalid-new@example.com',
+        name: 'New',
+        channel: 'bulk',
+        item_state: { mobile_number: '12' },
+      },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json()).toEqual({
+      error: 'INVALID_ITEM_STATE',
+      message: 'Invalid item_state: mobile_number: Enter a 10-digit mobile number',
+      fields: { mobile_number: 'Enter a 10-digit mobile number' },
+    });
+  });
+
+  it('accepts a request with no consent flags at all → 200', async () => {
     dbState.signUpUserId = 'usr_new_optional';
     lastQueriedUserId = 'usr_new_optional';
     const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
@@ -506,6 +683,28 @@ describe('POST /admin/participant', () => {
         email: 'optional@example.com',
         name: 'Opt',
         channel: 'bulk',
+        item_state: { whoIAm: { education: 'XII' } },
+      },
+    });
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('a legacy caller still sending terms_accepted/privacy_accepted gets 200, not 400 (#692)', async () => {
+    // The fields were removed from the schema, but the body object is not
+    // `.strict()`, so Zod strips them. Removal had to stay non-breaking for
+    // any integrator still sending the pre-#309 shape.
+    dbState.signUpUserId = 'usr_legacy_flags';
+    lastQueriedUserId = 'usr_legacy_flags';
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: {
+        email: 'legacy@example.com',
+        name: 'Legacy',
+        channel: 'bulk',
+        terms_accepted: true,
+        privacy_accepted: true,
         item_state: { whoIAm: { education: 'XII' } },
       },
     });
@@ -763,7 +962,7 @@ describe('POST /admin/participant', () => {
     const body = res.json();
     expect(body.user_existed).toBe(false);
     expect(body.owned_elsewhere).toBe(false);
-    expect(body.user_id).toBe('usr_new_ns');
+    expect(body.user_id).toBe(dbState.userInserts[0].id);
     expect(body.items).toHaveLength(1);
     expect(dbState.inserts).toHaveLength(1);
   });
@@ -787,13 +986,127 @@ describe('POST /admin/participant', () => {
     expect(body.items).toHaveLength(0);
     expect(dbState.inserts).toHaveLength(0);
     // Assert that the onboarding-field update fired and set the expected fields.
-    expect(dbState.updates).toHaveLength(1);
-    expect(dbState.updates[0].set).toMatchObject({
-      onboardedByOrgId: 'org_ns_1',
+    //
+    // SS-3 (#640): `onboardedByOrgId` is deliberately NULL here, where it used
+    // to be the acting org. A `network_service` caller is not an aggregator —
+    // tagging its participants to the network's own org satisfied "every
+    // entrant has an owner" on paper while leaving a verification queue nobody
+    // would open. No default is nominated in this test (the launch state), so
+    // the participant is left unowned.
+    expect(dbState.userInserts).toHaveLength(1);
+    expect(dbState.userInserts[0]).toMatchObject({
+      onboardedByOrgId: null,
+      onboardedByDefault: false,
       onboardedVia: 'bulk',
     });
-    expect(dbState.updates[0].set).not.toHaveProperty('termsAccepted');
-    expect(dbState.updates[0].set).not.toHaveProperty('privacyAccepted');
+    expect(dbState.userInserts[0]).not.toHaveProperty('termsAccepted');
+    expect(dbState.userInserts[0]).not.toHaveProperty('privacyAccepted');
+  });
+
+  it('a non-aggregator caller tags to the default aggregator when one is configured (SS-3)', async () => {
+    // Cold inbound voice: the caller is the network's own service org, so the
+    // participant is tagged to the nominated default aggregator rather than to
+    // the network org (whose verification queue nobody would open).
+    dbState.signUpUserId = 'usr_voice_default';
+    dbState.defaultAggregatorRows = [{ id: 'org_default_agg' }];
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      // A profile is created, so the domain is known and the per-(network,
+      // domain) default can be resolved.
+      payload: baseBody({
+        phone_number: VALID_PHONE,
+        email: undefined,
+        domain: 'seeker',
+        channel: 'voice',
+      }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(dbState.userInserts.length + dbState.updates.length).toBeGreaterThan(0);
+    const written = (dbState.updates[0]?.set ?? dbState.userInserts[0]) as Record<string, unknown>;
+    expect(written).toMatchObject({
+      onboardedByOrgId: 'org_default_agg',
+      onboardedByDefault: true,
+      onboardedVia: 'voice',
+    });
+  });
+
+  it('tags in account_only mode too — domain rides the body, not the item (SS-3)', async () => {
+    // `domain` is a top-level body field, independent of `item_state`, so an
+    // account-only onboard (no profile yet) still resolves its binding's
+    // default and is tagged at account creation rather than deferred.
+    dbState.signUpUserId = 'usr_voice_account_only';
+    dbState.defaultAggregatorRows = [{ id: 'org_default_agg' }];
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ phone_number: VALID_PHONE, email: undefined, item_state: undefined }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(dbState.userInserts[0]).toMatchObject({
+      onboardedByOrgId: 'org_default_agg',
+      onboardedByDefault: true,
+    });
+    expect(res.json()).toMatchObject({
+      onboarded_by_org_id: 'org_default_agg',
+      onboarded_by_default: true,
+    });
+  });
+
+
+  it('400s when a non-aggregator caller omits domain (SS-3)', async () => {
+    // Defaults are per (network, domain). The schema documents `domain` as
+    // defaulting to 'seeker', so without this a provider onboard that omitted
+    // it would be handed to the SEEKER aggregator — wrong org gets decrypt
+    // rights, with a 200 and no trace.
+    dbState.signUpUserId = 'usr_no_domain';
+    dbState.defaultAggregatorRows = [{ id: 'org_default_agg' }];
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ phone_number: VALID_PHONE, email: undefined, domain: undefined }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(res.json().error).toBe('DOMAIN_REQUIRED');
+    expect(dbState.updates).toHaveLength(0);
+  });
+
+  it('an aggregator caller may still omit domain — it owns its own onboards (SS-3)', async () => {
+    // The 400 is scoped to the branch that resolves a default; an aggregator
+    // never does, so its existing contract is unchanged.
+    dbState.signUpUserId = 'usr_agg_no_domain';
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ phone_number: VALID_PHONE, email: undefined, domain: undefined }),
+    });
+    expect(res.statusCode).toBe(200);
+    const written = (dbState.updates[0]?.set ?? dbState.userInserts[0]) as Record<string, unknown>;
+    expect(written).toMatchObject({ onboardedByOrgId: 'org_agg_1', onboardedByDefault: false });
+  });
+
+  it('aggregator acting org still owns the participants it onboards (SS-3 unchanged path)', async () => {
+    dbState.signUpUserId = 'usr_new_agg_acct';
+    const app = await buildApp({
+      org_id: 'org_agg_1',
+      org_type: 'aggregator',
+    });
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ phone_number: VALID_PHONE, email: undefined, item_state: undefined }),
+    });
+    expect(res.statusCode).toBe(200);
+    expect(dbState.userInserts).toHaveLength(1);
+    expect(dbState.userInserts[0]).toMatchObject({
+      onboardedByOrgId: 'org_agg_1',
+      onboardedByDefault: false,
+      onboardedVia: 'bulk',
+    });
   });
 
   it('network_service + existing user + valid item_id → 200 owned_elsewhere:false, item updated', async () => {
@@ -1212,6 +1525,73 @@ describe('POST /admin/participant', () => {
     expect(event.item_type).toBe('profile_1.0');
   });
 
+  // #557: both of these branches publish the item the request named. An age write
+  // can ALSO promote drafts the request never named (age is user-level), and those
+  // need re-indexing too — previously they were silently left `draft` in the index.
+  it('update_item branch: publishes the updated item AND the drafts the age write promoted', async () => {
+    const user_id = 'usr_update_collateral';
+    dbState.existingUserRows = [
+      { id: user_id, email: VALID_EMAIL, phoneNumber: null, onboardedByOrgId: 'org_ns_1' },
+    ];
+    dbState.itemsByUser.set(user_id, [
+      {
+        item_id: VALID_UUID_A,
+        item_network: 'blue_dot',
+        item_domain: 'seeker',
+        item_type: 'profile_1.0',
+        item_state: { v: 1 },
+        item_private_state: '',
+        created_at: new Date('2026-01-01T00:00:00Z'),
+        updated_at: new Date('2026-01-01T00:00:00Z'),
+      },
+    ]);
+    dbState.itemOwnerLookup.set(VALID_UUID_A, user_id);
+    lastQueriedUserId = user_id;
+    lastQueriedItemId = VALID_UUID_A;
+    const { promoteEligibleDraftsForUser } = await import('@/services/participant_consent');
+    vi.mocked(promoteEligibleDraftsForUser).mockResolvedValueOnce([
+      { item_network: 'blue_dot', item_domain: 'provider', item_type: 'profile_1.0', item_id: 'itm_other_draft' },
+    ]);
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ item_id: VALID_UUID_A, item_state: { v: 2 }, age: 25 }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(publishItemEvent).mock.calls.map(([e]) => e.item_id)).toEqual([
+      VALID_UUID_A,
+      'itm_other_draft',
+    ]);
+  });
+
+  it('insert_item branch: publishes the inserted item AND the drafts the age write promoted', async () => {
+    const user_id = 'usr_insert_collateral';
+    dbState.existingUserRows = [
+      { id: user_id, email: VALID_EMAIL, phoneNumber: null, onboardedByOrgId: 'org_ns_1' },
+    ];
+    dbState.itemsByUser.set(user_id, []);
+    lastQueriedUserId = user_id;
+    const { promoteEligibleDraftsForUser } = await import('@/services/participant_consent');
+    vi.mocked(promoteEligibleDraftsForUser).mockResolvedValueOnce([
+      { item_network: 'blue_dot', item_domain: 'provider', item_type: 'profile_1.0', item_id: 'itm_other_draft' },
+    ]);
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ network: 'blue_dot', domain: 'seeker', item_type: 'profile_1.0', age: 25 }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    const ids = vi.mocked(publishItemEvent).mock.calls.map(([e]) => e.item_id);
+    expect(ids).toHaveLength(2);
+    expect(ids[1]).toBe('itm_other_draft');
+  });
+
   it('create_new_user branch: publishItemEvent called with op:upsert after tx commits', async () => {
     dbState.signUpUserId = 'usr_new_enqueue';
     lastQueriedUserId = 'usr_new_enqueue';
@@ -1233,6 +1613,100 @@ describe('POST /admin/participant', () => {
     expect(event.item_id.length).toBeGreaterThan(0);
   });
 
+  // #557: `item_id` alone resolves to update_item "with or without item_state" —
+  // a consent-only activation. recordParticipantConsent then promotes that item
+  // draft → live inside the transaction, and its `promoted` flag is the ONLY signal
+  // for it: no item_state means no updateItemInternal row, and the item is no longer
+  // `draft` so promoteEligibleDraftsForUser cannot return it either. Without
+  // consuming that flag the promotion publishes nothing and the profile stays
+  // `draft` in item_search — the exact bug this PR fixes, via another door.
+  it('update_item branch: a consent-only activation (no item_state) publishes the promoted item', async () => {
+    const user_id = 'usr_consent_only_activation';
+    dbState.existingUserRows = [
+      { id: user_id, email: VALID_EMAIL, phoneNumber: null, onboardedByOrgId: 'org_ns_1' },
+    ];
+    dbState.itemsByUser.set(user_id, [
+      {
+        item_id: VALID_UUID_A,
+        item_network: 'blue_dot',
+        item_domain: 'seeker',
+        item_type: 'profile_1.0',
+        item_state: { v: 1 },
+        item_private_state: '',
+        created_at: new Date('2026-01-01T00:00:00Z'),
+        updated_at: new Date('2026-01-01T00:00:00Z'),
+      },
+    ]);
+    dbState.itemOwnerLookup.set(VALID_UUID_A, user_id);
+    lastQueriedUserId = user_id;
+    lastQueriedItemId = VALID_UUID_A;
+    vi.mocked(recordParticipantConsent).mockResolvedValueOnce({ recorded: 1, promoted: true });
+    const { updateItemInternal } = await import('@/services/item_service');
+    vi.mocked(updateItemInternal).mockClear();
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({
+        item_id: VALID_UUID_A,
+        item_state: undefined,
+        compliance: [{ key: 'profile_creation', value: true }],
+      }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    // No item write happened — the promotion is the only reason to publish.
+    expect(vi.mocked(updateItemInternal)).not.toHaveBeenCalled();
+    expect(vi.mocked(publishItemEvent)).toHaveBeenCalledTimes(1);
+    const [event] = vi.mocked(publishItemEvent).mock.calls[0];
+    expect(event.op).toBe('upsert');
+    expect(event.item_id).toBe(VALID_UUID_A);
+    expect(event.item_network).toBe('blue_dot');
+    expect(event.item_domain).toBe('seeker');
+    expect(event.item_type).toBe('profile_1.0');
+  });
+
+  // #557: an age write can promote drafts this request never mentions (age is
+  // user-level, so it can unblock several profiles at once). Those promotions
+  // changed what search must return, and the account_only branch published nothing
+  // at all — so the profiles stayed `draft` in item_search: invisible in every
+  // ranked feed and every map viewport while `items` said live.
+  it('account_only branch: publishes an upsert for each draft the age write promoted', async () => {
+    const user_id = 'usr_age_promotes_drafts';
+    dbState.existingUserRows = [
+      { id: user_id, email: VALID_EMAIL, phoneNumber: null, onboardedByOrgId: 'org_agg_1' },
+    ];
+    dbState.itemsByUser.set(user_id, []);
+    lastQueriedUserId = user_id;
+    const { promoteEligibleDraftsForUser } = await import('@/services/participant_consent');
+    vi.mocked(promoteEligibleDraftsForUser).mockResolvedValueOnce([
+      { item_network: 'blue_dot', item_domain: 'seeker', item_type: 'profile_1.0', item_id: 'itm_a' },
+      { item_network: 'blue_dot', item_domain: 'provider', item_type: 'profile_1.0', item_id: 'itm_b' },
+    ]);
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({
+        item_state: undefined,
+        age: 25,
+        compliance: [
+          { key: 'user_terms', value: true },
+          { key: 'user_privacy', value: true },
+        ],
+      }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(publishItemEvent)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(publishItemEvent).mock.calls.map(([e]) => [e.item_id, e.op])).toEqual([
+      ['itm_a', 'upsert'],
+      ['itm_b', 'upsert'],
+    ]);
+  });
+
   it('error branches: publishItemEvent NOT called when insert_item fails', async () => {
     const user_id = 'usr_insert_fail_no_enqueue';
     dbState.existingUserRows = [
@@ -1247,7 +1721,11 @@ describe('POST /admin/participant', () => {
     lastQueriedUserId = user_id;
     const { create_profile_item } = await import('@/lib/profile_item');
     vi.mocked(create_profile_item).mockRejectedValueOnce(
-      Object.assign(new Error('schema error'), { statusCode: 400, errorCode: 'INVALID_ITEM_STATE' }),
+      Object.assign(new Error('Invalid item_state: mobile_number: Enter a 10-digit mobile number'), {
+        statusCode: 400,
+        errorCode: 'INVALID_ITEM_STATE',
+        details: { fields: { mobile_number: 'Enter a 10-digit mobile number' } },
+      }),
     );
     const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
     const res = await app.inject({
@@ -1256,6 +1734,12 @@ describe('POST /admin/participant', () => {
       payload: baseBody(),
     });
     expect(res.statusCode).toBe(400);
+    // The per-field map reaches the integrator, so a bulk row can name its column.
+    expect(res.json()).toEqual({
+      error: 'INVALID_ITEM_STATE',
+      message: 'Invalid item_state: mobile_number: Enter a 10-digit mobile number',
+      fields: { mobile_number: 'Enter a 10-digit mobile number' },
+    });
     expect(vi.mocked(publishItemEvent)).not.toHaveBeenCalled();
   });
 
@@ -1376,5 +1860,355 @@ describe('POST /admin/participant', () => {
     expect(vi.mocked(recordParticipantConsent)).not.toHaveBeenCalled();
     expect(dbState.updates).toHaveLength(0);
     expect(dbState.inserts).toHaveLength(0);
+  });
+});
+
+/**
+ * The direct-write branch (Phase 2 of the Keycloak migration).
+ *
+ * Under `AUTH_PROVIDER=keycloak` the `user` row is written by `insertLocalUser`
+ * inside the onboarding transaction, instead of by better-auth's `signUpEmail`
+ * followed by a separate update. What these pin down is that the branch produces
+ * the same row without better-auth's artifacts, and that the failure handling
+ * survives the restructure.
+ */
+describe('POST /admin/participant — caller-supplied item_locations', () => {
+  beforeEach(resetDbState);
+
+  const COORDS = [{ lat: 12.9251, lng: 77.5938, label: 'Jayanagar' }];
+
+  const existingOwnUser = (user_id: string) => {
+    dbState.existingUserRows = [
+      {
+        id: user_id,
+        email: VALID_EMAIL,
+        phoneNumber: null,
+        onboardedByOrgId: 'org_agg_1',
+      },
+    ];
+    lastQueriedUserId = user_id;
+  };
+
+  const withExistingItem = (user_id: string) => {
+    dbState.itemsByUser.set(user_id, [
+      {
+        item_id: VALID_UUID_A,
+        item_network: 'blue_dot',
+        item_domain: 'seeker',
+        item_type: 'profile_1.0',
+        item_state: { v: 1 },
+        item_private_state: '',
+        created_at: new Date('2026-01-01T00:00:00Z'),
+        updated_at: new Date('2026-01-01T00:00:00Z'),
+      },
+    ]);
+    dbState.itemOwnerLookup.set(VALID_UUID_A, user_id);
+    lastQueriedItemId = VALID_UUID_A;
+  };
+
+  it('create_new_user: forwards the coordinates to create_profile_item', async () => {
+    const { create_profile_item } = await import('@/lib/profile_item');
+    vi.mocked(create_profile_item).mockClear();
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ item_locations: COORDS }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(create_profile_item)).toHaveBeenCalledWith(
+      expect.objectContaining({ item_locations: COORDS }),
+    );
+  });
+
+  it('insert_item (existing user, new profile): forwards the coordinates to create_profile_item', async () => {
+    existingOwnUser('usr_coords_insert');
+    const { create_profile_item } = await import('@/lib/profile_item');
+    vi.mocked(create_profile_item).mockClear();
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ item_locations: COORDS }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(create_profile_item)).toHaveBeenCalledWith(
+      expect.objectContaining({ item_locations: COORDS }),
+    );
+  });
+
+  it('update_item: forwards the coordinates alongside item_state', async () => {
+    const user_id = 'usr_coords_update';
+    existingOwnUser(user_id);
+    withExistingItem(user_id);
+    const { updateItemInternal } = await import('@/services/item_service');
+    vi.mocked(updateItemInternal).mockClear();
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({
+        item_id: VALID_UUID_A,
+        item_state: { v: 2 },
+        item_locations: COORDS,
+      }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(updateItemInternal)).toHaveBeenCalledWith(
+      expect.anything(),
+      VALID_UUID_A,
+      user_id,
+      true,
+      { item_state: { v: 2 }, item_locations: COORDS },
+    );
+  });
+
+  it('update_item: coordinates WITHOUT item_state still write the item', async () => {
+    // A caller re-sending only a re-picked exact point must not have to echo
+    // the whole profile back for the coordinate to land.
+    const user_id = 'usr_coords_only_update';
+    existingOwnUser(user_id);
+    withExistingItem(user_id);
+    const { updateItemInternal } = await import('@/services/item_service');
+    vi.mocked(updateItemInternal).mockClear();
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({
+        item_id: VALID_UUID_A,
+        item_state: {},
+        item_locations: COORDS,
+      }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(updateItemInternal)).toHaveBeenCalledWith(
+      expect.anything(),
+      VALID_UUID_A,
+      user_id,
+      true,
+      { item_locations: COORDS },
+    );
+  });
+
+  it('update_item: an EMPTY coordinate array with no item_state leaves the item untouched', async () => {
+    // Empty means "I resolved nothing", which must read as absent — otherwise
+    // a consent-only activation would start writing item rows.
+    const user_id = 'usr_coords_empty_update';
+    existingOwnUser(user_id);
+    withExistingItem(user_id);
+    const { updateItemInternal } = await import('@/services/item_service');
+    vi.mocked(updateItemInternal).mockClear();
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({
+        item_id: VALID_UUID_A,
+        item_state: {},
+        item_locations: [],
+      }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(updateItemInternal)).not.toHaveBeenCalled();
+  });
+
+  it('omitting item_locations leaves create_profile_item to geocode, exactly as before', async () => {
+    const { create_profile_item } = await import('@/lib/profile_item');
+    vi.mocked(create_profile_item).mockClear();
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody(),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(vi.mocked(create_profile_item).mock.calls[0][0].item_locations).toBeUndefined();
+  });
+
+  it('400s on an out-of-range coordinate rather than storing it', async () => {
+    const app = await buildApp({ org_id: 'org_ns_1', org_type: 'network_service' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ item_locations: [{ lat: 91, lng: 77.5938 }] }),
+    });
+
+    expect(res.statusCode).toBe(400);
+  });
+});
+
+describe('POST /admin/participant — direct write under AUTH_PROVIDER=keycloak', () => {
+  beforeEach(() => {
+    resetDbState();
+  });
+
+  const newUserBody = (over: Record<string, unknown> = {}) =>
+    baseBody({ item_state: undefined, ...over });
+
+  it('writes the row itself in a single insert', async () => {
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(dbState.userInserts).toHaveLength(1);
+  });
+
+  it('carries the onboarding columns in the insert, with no separate update', async () => {
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    const [row] = dbState.userInserts;
+    expect(row).toMatchObject({
+      onboardedByOrgId: 'org_agg_1',
+      onboardedVia: 'bulk',
+      phoneNumber: VALID_PHONE,
+    });
+    // Insert + update collapsed into one write.
+    expect(dbState.updates).toHaveLength(0);
+  });
+
+  it('leaves the consent booleans unwritten — consent lives in the ledger', async () => {
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(dbState.userInserts[0]).not.toHaveProperty('termsAccepted');
+    expect(dbState.userInserts[0]).not.toHaveProperty('privacyAccepted');
+  });
+
+  it('gives a phone-only participant a NULL email, not a placeholder', async () => {
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(dbState.userInserts[0].email).toBeNull();
+  });
+
+  it('does not hand the Keycloak identity a placeholder address either', async () => {
+    // This is what made 24 of 25 realm users key on <uuid>@no-email.local.
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(dbState.identityCalls).toHaveLength(1);
+    expect(dbState.identityCalls[0].email).toBeNull();
+  });
+
+  it('passes a real email straight through to both the row and the identity', async () => {
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ email: VALID_EMAIL, phone_number: undefined }),
+    });
+
+    expect(dbState.userInserts[0].email).toBe(VALID_EMAIL);
+    expect(dbState.identityCalls[0].email).toBe(VALID_EMAIL);
+  });
+
+  it('uses a bare UUID as the id, since it becomes the Keycloak subject', async () => {
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(dbState.userInserts[0].id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+    );
+  });
+
+  it('rolls back instead of orphan-deleting when the insert fails', async () => {
+    // The row never committed, so issuing a delete would at best be a no-op and
+    // at worst remove a different row that reused the id.
+    dbState.userInsertError = Object.assign(new Error('duplicate key value'), {
+      code: '23505',
+    });
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe('USER_ALREADY_EXISTS');
+    expect(dbState.userDeletes).toBe(0);
+  });
+
+  it('still deletes the row when the Keycloak identity cannot be created', async () => {
+    // That step is a remote call and cannot be in the transaction, so the
+    // compensating delete is still required — a participant with no realm
+    // identity could never sign in.
+    dbState.identityResult = {
+      ok: false,
+      code: 'IDENTITY_CONFLICT',
+      message: 'Another account already owns this email or phone number',
+    };
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: newUserBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error).toBe('IDENTITY_CONFLICT');
+    expect(dbState.userDeletes).toBe(1);
+  });
+
+  it('creates the profile item in the same transaction as the user row', async () => {
+    const app = await buildApp({ org_id: 'org_agg_1', org_type: 'aggregator' });
+
+    const res = await app.inject({
+      method: 'POST',
+      url: '/participant',
+      payload: baseBody({ phone_number: VALID_PHONE, email: undefined }),
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(dbState.userInserts).toHaveLength(1);
+    expect(dbState.inserts).toHaveLength(1);
   });
 });

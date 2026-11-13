@@ -6,7 +6,9 @@ import {
   integer,
   index,
   jsonb,
+  check,
 } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 export const user = pgTable('user', {
   id: text('id').primaryKey(),
@@ -28,7 +30,7 @@ export const user = pgTable('user', {
   banExpires: timestamp('ban_expires'),
   phoneNumber: text('phone_number').unique(),
   phoneNumberVerified: boolean('phone_number_verified'),
-  // Age (years) captured at registration for U18 gating (#331). Snapshot, not
+  // Age (years) captured at registration for U18 gating. Snapshot, not
   // a birthdate — a minor is age <= 18 (the boundary year is treated as u18,
   // no month). Optional. `location` is an optional free-text account location.
   age: integer('age'),
@@ -40,17 +42,25 @@ export const user = pgTable('user', {
   domains: text('domains').array(),
   termsAccepted: boolean('terms_accepted').default(false),
   privacyAccepted: boolean('privacy_accepted').default(false),
-  // Plan 2: participant attribution. Set by POST /api/v1/admin/onboard_participant
-  // (which acts on behalf of an aggregator or voice org via acting_org). Null
-  // for users created by other paths (better-auth signUp from a UI etc.).
+  // The owning aggregator. Set by POST /api/v1/admin/participant (the acting
+  // aggregator, or the default aggregator for a network_service caller) and by
+  // default-aggregator tagging (`tagUserWithDefaultAggregator`). Null when no
+  // aggregator owns the user. Grants PII-decrypt rights.
   onboardedByOrgId: text('onboarded_by_org_id').references(() => organization.id),
+  // True when `onboarded_by_org_id` came from the default aggregator rather
+  // than a real onboarding act. Server-only, never derived from
+  // `onboarded_via` (which comes from the caller's `channel` field), because
+  // the re-assignment job scopes on it to hand out PII-decrypt rights.
+  onboardedByDefault: boolean('onboarded_by_default').notNull().default(false),
   onboardedVia: text('onboarded_via'),
   onboardedSourceId: text('onboarded_source_id'),
   onboardedAt: timestamp('onboarded_at'),
   // Extensible support/ops markers on the user. Keyed jsonb so new flags can
-  // be added without a migration. Current key: `is_test` (boolean) — marks a
+  // be added without a migration. Current keys: `is_test` (boolean) — marks a
   // user (and, by the created_by/owner join, their profiles, posts, and
-  // applications) as test data for analysis + later bulk cleanup.
+  // applications) as test data for analysis + later bulk cleanup;
+  // `app_first_login_at` (ISO string) — first browser login to the app, see
+  // services/auth/app_first_login.ts.
   tags: jsonb('tags').notNull().default({}),
 }, (table) => [
   index('user_onboarded_by_org_via_idx').on(
@@ -61,37 +71,6 @@ export const user = pgTable('user', {
   index('user_tags_gin_idx').using('gin', table.tags),
 ]);
 
-export const account = pgTable('account', {
-  id: text('id').primaryKey(),
-  accountId: text('account_id').notNull(),
-  providerId: text('provider_id').notNull(),
-  userId: text('user_id')
-    .notNull()
-    .references(() => user.id, { onDelete: 'cascade' }),
-  accessToken: text('access_token'),
-  refreshToken: text('refresh_token'),
-  idToken: text('id_token'),
-  accessTokenExpiresAt: timestamp('access_token_expires_at'),
-  refreshTokenExpiresAt: timestamp('refresh_token_expires_at'),
-  scope: text('scope'),
-  password: text('password'),
-  createdAt: timestamp('created_at').notNull(),
-  updatedAt: timestamp('updated_at').notNull(),
-});
-
-export const verification = pgTable('verification', {
-  id: text('id').primaryKey(),
-  identifier: text('identifier').notNull(),
-  value: text('value').notNull(),
-  expiresAt: timestamp('expires_at').notNull(),
-  createdAt: timestamp('created_at').$defaultFn(
-    () => /* @__PURE__ */ new Date()
-  ),
-  updatedAt: timestamp('updated_at').$defaultFn(
-    () => /* @__PURE__ */ new Date()
-  ),
-});
-
 export const organization = pgTable('organization', {
   id: text('id').primaryKey(),
   name: text('name').notNull(),
@@ -100,7 +79,44 @@ export const organization = pgTable('organization', {
   createdAt: timestamp('created_at').notNull(),
   metadata: text('metadata'),
   type: text('type'),
-});
+  // Served-domain bindings ("<network>/<domain>", e.g.
+  // 'blue_dot/seeker') for which this org is the DEFAULT aggregator — the one
+  // that inherits users arriving with no aggregator of their own.
+  //
+  // An array because one aggregator may be the default for several domains
+  // (seeker AND provider is the expected launch shape). Postgres cannot
+  // unique-index an array element, so "one org per binding" is enforced by the
+  // `organization_default_binding_exclusive` trigger (migration 0014), which
+  // rejects a nomination for a binding another org already holds.
+  //
+  // Not indexed: `organization` holds tens to hundreds of rows, where a
+  // sequential scan beats GIN and GIN would tax every upsert.
+  defaultForBindings: text('default_for_bindings').array(),
+}, (table) => [
+  // The flag grants PII-decrypt rights over the users it captures, so it must
+  // never land on a `network_service` org. Approval state lives in
+  // aggregator-dpg, so this constraint is the only half enforceable here.
+  check(
+    'organization_default_requires_aggregator',
+    sql`${table.defaultForBindings} IS NULL OR ${table.type} = 'aggregator'`,
+  ),
+  // `type` is plain text, so this constraint moves an invalid value's failure
+  // to the INSERT instead of a later `403 ACTING_ORG_TYPE_NOT_ALLOWED`. NULL
+  // stays permitted for pre-existing rows (the acting-org preHandler refuses
+  // it). Adding a value is a migration on purpose: an org type is an
+  // authorization tier, and `_resolve_acting_actor.ts` must learn its reach in
+  // the same change.
+  check(
+    'organization_type_allowed',
+    sql`${table.type} IS NULL OR ${table.type} IN ('aggregator', 'network_service')`,
+  ),
+  // Several orgs may hold defaults, one per binding. That is safe because the
+  // single-domain lock (`claimDomain`, `services/items/single_domain_lock.ts`)
+  // keeps each account, whose `onboarded_by_org_id` grants PII-decrypt rights,
+  // to one domain. Per-binding exclusivity is enforced by the
+  // `organization_default_binding_exclusive` trigger (migration 0014), since
+  // Postgres cannot unique-index an array element.
+]);
 
 export const member = pgTable('member', {
   id: text('id').primaryKey(),
@@ -115,55 +131,17 @@ export const member = pgTable('member', {
   createdAt: timestamp('created_at').notNull(),
 });
 
-export const invitation = pgTable('invitation', {
-  id: text('id').primaryKey(),
-  organizationId: text('organization_id')
-    .notNull()
-    .references(() => organization.id, { onDelete: 'cascade' }),
-  email: text('email').notNull(),
-  role: text('role'),
-  teamId: text('team_id'),
-  status: text('status').default('pending').notNull(),
-  expiresAt: timestamp('expires_at').notNull(),
-  inviterId: text('inviter_id')
-    .notNull()
-    .references(() => user.id, { onDelete: 'cascade' }),
-});
-
-export const team = pgTable('team', {
-  id: text('id').primaryKey(),
-  name: text('name').notNull(),
-  organizationId: text('organization_id')
-    .notNull()
-    .references(() => organization.id, { onDelete: 'cascade' }),
-  createdAt: timestamp('created_at').notNull(),
-  updatedAt: timestamp('updated_at'),
-});
-
-export const teamMember = pgTable('team_member', {
-  id: text('id').primaryKey(),
-  teamId: text('team_id').notNull(),
-  userId: text('user_id')
-    .notNull()
-    .references(() => user.id, { onDelete: 'cascade' }),
-  createdAt: timestamp('created_at'),
-});
-
 export const apikey = pgTable('apikey', {
   id: text('id').primaryKey(),
   configId: text('config_id').notNull().default('default'),
   name: text('name'),
-  // First N raw-key chars (better-auth defaults to 6) — for UI display only.
-  // The raw key itself is NEVER stored.
+  // First raw-key chars, for display only. The raw key is never stored.
   start: text('start'),
   referenceId: text('reference_id').notNull(),
   prefix: text('prefix'),
-  // Stores SHA-256(raw_key) base64url-encoded WITHOUT padding (43 chars).
-  // Matches @better-auth/api-key's `defaultKeyHasher`. Mint via
-  // `authInstance.api.createApiKey(...)` or, for standalone scripts,
-  // hash with `createHash('sha256').update(raw).digest('base64url')`
-  // before inserting — never store the raw key. See
-  // apps/api/scripts/seed_service_users.ts for the reference pattern.
+  // SHA-256(raw_key) base64url-encoded without padding (43 chars), as
+  // `hashApiKey` in plugins/auth/verify_api_key.ts computes it. Never store the
+  // raw key; see apps/api/scripts/seed_service_users.ts for minting.
   key: text('key').notNull(),
   userId: text('user_id').references(() => user.id, { onDelete: 'cascade' }),
   refillInterval: integer('refill_interval'),

@@ -5,6 +5,8 @@ interface ImportMetaEnv {
   readonly VITE_INDIA_BOUNDARY_PMTILES_URL?: string;
   readonly VITE_GOOGLE_MAPS_API_KEY: string;
   readonly VITE_PHOTON_URL?: string;
+  /** ISO 3166-1 alpha-2 country the address search is restricted to (#785), e.g. `IN`. */
+  readonly VITE_GEO_COUNTRY?: string;
   readonly VITE_MAPBOX_ACCESS_TOKEN: string;
   readonly VITE_API_URL: string;
   readonly VITE_API_URLS: string;
@@ -33,15 +35,18 @@ interface ImportMetaEnv {
   readonly VITE_MAP_DEFAULT_CENTER?: string;
   /** Per-deployment default map zoom (falls back to 12). */
   readonly VITE_MAP_DEFAULT_ZOOM?: string;
-  /** Marker cap while zoomed below the cluster-disable zoom (#203 Task 6). Falls back to 1000. */
-  readonly VITE_MAP_MARKER_CAP_CLUSTERED?: string;
-  /** Marker cap at/above the cluster-disable zoom, once pins render individually (#203 Task 6). Falls back to 500. */
-  readonly VITE_MAP_MARKER_CAP_INDIVIDUAL?: string;
-  /** Zoom level at/above which the map disables clustering (#203 Task 6). Falls back to 14. */
-  readonly VITE_MAP_CLUSTER_DISABLE_ZOOM?: string;
+  /** Most map markers fetched per domain for one view, at every zoom. Falls back to 10000. */
+  readonly VITE_MAP_MARKER_CAP?: string;
   /** Duration (ms) of the smooth cluster-click zoom animation. Falls back to 2000; 0 = instant. */
   readonly VITE_MAP_CLUSTER_ZOOM_ANIM_MS?: string;
+  /** zIndex of the Google map's marker popup; must exceed every pin and cluster. Falls back to 1000000. */
+  readonly VITE_MAP_POPUP_Z_INDEX?: string;
+  /** Screen pixels within which map points merge into one bubble. Falls back to 80. */
+  readonly VITE_MAP_CLUSTER_RADIUS_PX?: string;
   readonly VITE_ACTION_POLL_INTERVAL_MS?: string;
+  // Max profiles fetched per network request; set per deployment via the
+  // chart's ui.runtimeConfig. Read through getRuntimeEnv (network-api.ts).
+  readonly VITE_PROFILE_FETCH_LIMIT?: string;
   readonly VITE_VC_WALLET_URL: string;
   readonly VITE_VC_WALLET_API_KEY: string;
   readonly VITE_AGENT_URL: string;
@@ -51,15 +56,30 @@ interface ImportMetaEnv {
   readonly VITE_TOURIST_APP_TITLE?: string;
   /** Dev/preview server port. Falls back to 5173. */
   readonly VITE_UI_PORT?: string;
+  /**
+   * Which login experience to serve: 'betterauth' (default, the OTP screens)
+   * or 'keycloak' (OIDC Authorization Code + PKCE). See lib/keycloak-config.ts.
+   */
+  readonly VITE_AUTH_PROVIDER?: 'betterauth' | 'keycloak';
+  /** Browser-facing Keycloak base URL, e.g. http://localhost:8080. */
+  readonly VITE_KEYCLOAK_URL?: string;
+  /** Shared realm. Falls back to 'bluedots'. */
+  readonly VITE_KEYCLOAK_REALM?: string;
+  /** Public OIDC client id. Falls back to 'signals-ui'. */
+  readonly VITE_KEYCLOAK_CLIENT_ID?: string;
+  /** Requested scopes. Falls back to 'openid profile email'. */
+  readonly VITE_KEYCLOAK_SCOPE?: string;
 }
 
 declare const __DEFAULT_NETWORK_THEME__: string;
 declare const __DEFAULT_BRAND__: string;
 declare const __BRAND_REGISTRY__: Record<string, {
   faviconType?: 'png' | 'svg';
-  logoShape?: 'square' | 'wordmark';
+  logoShape?: 'square' | 'wordmark' | 'lockup';
   copy?: Record<string, string>;
-  brands?: Record<string, { faviconType?: 'png' | 'svg'; logoShape?: 'square' | 'wordmark'; copy?: Record<string, string> }>;
+  footerLogo?: string;
+  footerLogoLight?: string;
+  brands?: Record<string, { faviconType?: 'png' | 'svg'; logoShape?: 'square' | 'wordmark' | 'lockup'; copy?: Record<string, string>; footerLogo?: string; footerLogoLight?: string }>;
 }>;
 
 interface ImportMeta {

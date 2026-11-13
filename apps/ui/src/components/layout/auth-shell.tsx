@@ -1,6 +1,9 @@
 import { BrandHero } from './brand-hero';
 import { PortalHeader } from './portal-header';
 import { AuthFooter } from './auth-footer';
+import { LanguageSwitcher } from './language-switcher';
+import { ThemeModeToggle } from './theme-mode-toggle';
+import { TooltipProvider } from '@/components/ui/tooltip';
 
 interface AuthShellProps {
   children: React.ReactNode;
@@ -8,6 +11,8 @@ interface AuthShellProps {
 
 export function AuthShell({ children }: AuthShellProps) {
   return (
+    // ThemeModeToggle renders a Radix Tooltip, which throws without a provider.
+    <TooltipProvider>
     <div className="min-h-svh lg:h-svh lg:overflow-hidden grid grid-cols-1 lg:grid-cols-[1.1fr_1fr]">
       {/* Left: branded hero panel (desktop only) — stays fixed while right scrolls */}
       <BrandHero />
@@ -27,17 +32,24 @@ export function AuthShell({ children }: AuthShellProps) {
             <circle cx="10" cy="10" r="3" fill="var(--brand-cta)" opacity="0.7" />
             <circle cx="23" cy="22" r="2.5" fill="var(--brand-cta)" opacity="0.6" />
           </svg>
-          <div>
-            <p className="text-sm font-semibold text-white leading-tight" />
+          <div className="flex-1" />
+          {/* Same controls on the mobile band. */}
+          <div className="flex items-center gap-1">
+            <LanguageSwitcher compact />
+            <ThemeModeToggle />
           </div>
         </div>
 
-        {/* Portal header (desktop) — aligned with the form column so the logo
-            doesn't float off-axis from the inputs below. Larger size variant
-            so the brand is the visual anchor of the right panel. */}
+        {/* Portal header (desktop), aligned with the form column. */}
         <div className="hidden lg:block px-6 sm:px-10 lg:px-14 pt-10">
-          <div className="mx-auto max-w-md w-full">
+          <div className="mx-auto max-w-md w-full flex items-start justify-between gap-4">
             <PortalHeader size="lg" />
+            {/* The auth pages have no top bar, so language and theme live
+                here. Keycloak-hosted screens are a separate app. */}
+            <div className="flex items-center gap-1 shrink-0">
+              <LanguageSwitcher compact />
+              <ThemeModeToggle />
+            </div>
           </div>
         </div>
 
@@ -50,5 +62,6 @@ export function AuthShell({ children }: AuthShellProps) {
         <AuthFooter />
       </div>
     </div>
+    </TooltipProvider>
   );
 }

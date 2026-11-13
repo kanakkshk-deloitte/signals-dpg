@@ -21,23 +21,22 @@ export interface MatchScoreSignal {
   summary: string;
 }
 
+/**
+ * Result of `/api/v1/match-score/calculate` (signals-search `/v1/relevance`).
+ *
+ * `unavailable_reason` reports the two expected non-scores: `not_indexed`
+ * (404, one side not indexed yet; indexing is async) and `not_comparable`
+ * (409, embedded with different model versions).
+ */
 export interface MatchScoreResult {
   provider: string;
+  /** 0-100. */
   score?: number;
-  band?: string;
-  confidence?: number;
   version?: string;
-  prompt_version?: string;
-  model_provider?: string;
-  model?: string;
-  reasoning?: string;
-  signals?: MatchScoreSignal[];
+  unavailable_reason?: 'not_indexed' | 'not_comparable';
   raw_response?: unknown;
-  // #394: set only on the value `useMatchScore` seeds from the discover
-  // response's `Item.score` (see `item-api.ts`), before any click hits
-  // `/api/v1/match-score/calculate` — distinguishes "upfront, no confidence/
-  // signals/reasoning yet" from a real `/v1/relevance` result, which never
-  // sets this field.
+  // Set only on a score `useMatchScore` seeds from the discover response's
+  // `Item.score`, to tell it apart from a real `/v1/relevance` result.
   source?: 'discover';
 }
 

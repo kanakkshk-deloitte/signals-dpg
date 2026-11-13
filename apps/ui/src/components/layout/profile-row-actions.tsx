@@ -13,6 +13,7 @@ import {
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 import { setItemLifecycle, type Item } from '@/lib/item-api';
+import { ShareProfileButton } from '@/components/share/share-profile-button';
 
 export interface ProfileRowActionsProps {
   profile: Item;
@@ -25,10 +26,8 @@ export interface ProfileRowActionsProps {
 }
 
 /**
- * Icon-only per-profile lifecycle actions shown on each "My Profiles" row
- * (#346 pause / #347 retire): Edit · Pause/Resume · Retire. Pause + retire are
- * confirmed first (retire is terminal + irreversible); resume is applied
- * directly. Lives here — the row — not inside the edit form.
+ * Icon-only lifecycle actions on each "My Profiles" row: Edit, Pause/Resume,
+ * Retire. Pause, resume and retire each confirm first; retire is terminal.
  */
 export function ProfileRowActions({ profile, pauseEnabled, onEdit, onChanged }: ProfileRowActionsProps) {
   const { t } = useTranslation();
@@ -38,8 +37,7 @@ export function ProfileRowActions({ profile, pauseEnabled, onEdit, onChanged }: 
   const [retireConfirm, setRetireConfirm] = React.useState(false);
 
   const status = profile.lifecycle_status;
-  // Pause offered only on a live profile when the network allows it; resume on a
-  // paused one (always allowed, so a paused profile can be recovered).
+  // Resume is always allowed, so a paused profile can be recovered.
   const showPause = status === 'live' && pauseEnabled;
   const showResume = status === 'paused';
 
@@ -71,11 +69,13 @@ export function ProfileRowActions({ profile, pauseEnabled, onEdit, onChanged }: 
     'flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-sidebar-accent hover:text-foreground disabled:opacity-40';
 
   return (
-    <div className="flex items-center gap-0.5">
+    <div data-tour="profile-actions" className="flex items-center gap-0.5">
+      <ShareProfileButton item={profile} />
       <Tooltip>
         <TooltipTrigger asChild>
           <button
             type="button"
+            data-tour="profile-edit"
             aria-label={t('profile.btn_edit', 'Edit profile')}
             className={iconBtn}
             onClick={(e) => { e.stopPropagation(); onEdit(); }}
@@ -91,6 +91,7 @@ export function ProfileRowActions({ profile, pauseEnabled, onEdit, onChanged }: 
           <TooltipTrigger asChild>
             <button
               type="button"
+              data-tour="profile-pause"
               aria-label={t('profile.btn_pause', 'Pause profile')}
               className={iconBtn}
               disabled={busy}
@@ -108,6 +109,7 @@ export function ProfileRowActions({ profile, pauseEnabled, onEdit, onChanged }: 
           <TooltipTrigger asChild>
             <button
               type="button"
+              data-tour="profile-resume"
               aria-label={t('profile.btn_unpause', 'Resume profile')}
               className={iconBtn}
               disabled={busy}
@@ -124,6 +126,7 @@ export function ProfileRowActions({ profile, pauseEnabled, onEdit, onChanged }: 
         <TooltipTrigger asChild>
           <button
             type="button"
+            data-tour="profile-retire"
             aria-label={t('profile.btn_retire', 'Retire profile')}
             className={`${iconBtn} hover:text-destructive`}
             disabled={busy}
@@ -191,7 +194,7 @@ export function ProfileRowActions({ profile, pauseEnabled, onEdit, onChanged }: 
         </DialogContent>
       </Dialog>
 
-      {/* Confirm before retiring — terminal, irreversible, wipes PII (#347). */}
+      {/* Confirm before retiring: terminal, irreversible, wipes PII. */}
       <Dialog open={retireConfirm} onOpenChange={setRetireConfirm}>
         <DialogContent className="max-h-[90dvh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
           <DialogHeader>

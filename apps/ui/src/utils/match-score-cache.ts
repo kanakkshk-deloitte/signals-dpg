@@ -1,7 +1,13 @@
 import type { MatchScoreResult } from '@/lib/match-score-api';
 
-const CACHE_KEY_PREFIX = 'dpg:matchScore:v1';
-const DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+/**
+ * The version prefix marks the score scale (v2 = 0-100). Bump it whenever the
+ * stored scale changes: a stored payload does not record its scale, so an old
+ * entry read with the new formatter would print a wrong percentage silently.
+ */
+const CACHE_KEY_PREFIX = 'dpg:matchScore:v2';
+const LEGACY_CACHE_KEY_PREFIXES = ['dpg:matchScore:v1'];
+const DEFAULT_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface CachedMatchScore {
   score: MatchScoreResult;
@@ -27,7 +33,6 @@ export function getCachedMatchScore(
     const parsed: CachedMatchScore = JSON.parse(cached);
     const age = Date.now() - parsed.timestamp;
     
-    // Check if cache is expired
     if (age > DEFAULT_CACHE_TTL_MS) {
       localStorage.removeItem(cacheKey);
       return null;
@@ -54,7 +59,7 @@ export function setCachedMatchScore(
     };
     localStorage.setItem(cacheKey, JSON.stringify(cached));
   } catch {
-    // Silently fail if localStorage is full or unavailable
+    // localStorage full or unavailable.
   }
 }
 
@@ -64,11 +69,9 @@ export function clearMatchScoreCache(
 ): void {
   try {
     if (localItemId && networkItemId) {
-      // Clear specific entry
       const cacheKey = generateCacheKey(localItemId, networkItemId);
       localStorage.removeItem(cacheKey);
     } else if (localItemId) {
-      // Clear all entries for a local item
       const prefix = `${CACHE_KEY_PREFIX}:${localItemId}:`;
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
@@ -77,7 +80,6 @@ export function clearMatchScoreCache(
         }
       }
     } else {
-      // Clear all match score cache
       const keysToRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const key = localStorage.key(i);
@@ -88,52 +90,35 @@ export function clearMatchScoreCache(
       keysToRemove.forEach((key) => localStorage.removeItem(key));
     }
   } catch {
-    // Silently fail
+    // localStorage unavailable.
   }
 }
 
-export function getMatchScoreBand(score: number): {
-  label: string;
-  color: string;
-  bgColor: string;
-  textColor: string;
-} {
-  // Normalize 0-10 score to 0-1 range for percentage calculations
-  const normalizedScore = score / 10;
-
-  if (normalizedScore >= 0.85) {
-    return {
-      label: 'Excellent Match',
-      color: 'emerald',
-      bgColor: 'bg-emerald-500',
-      textColor: 'text-white',
-    };
+/**
+ * Removes cached scores under legacy key prefixes. The 24-hour TTL is enforced
+ * only on read, and nothing reads old prefixes, so without this they would stay
+ * in localStorage and use quota. Called once at startup; idempotent.
+ */
+export function sweepLegacyMatchScoreCache(): void {
+  try {
+    const doomed: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i);
+      if (key && LEGACY_CACHE_KEY_PREFIXES.some((prefix) => key.startsWith(prefix))) {
+        doomed.push(key);
+      }
+    }
+    doomed.forEach((key) => localStorage.removeItem(key));
+  } catch {
+    // Storage unavailable (private mode, quota) — nothing to clean up.
   }
-  if (normalizedScore >= 0.70) {
-    return {
-      label: 'Good Match',
-      color: 'blue',
-      bgColor: 'bg-blue-500',
-      textColor: 'text-white',
-    };
-  }
-  if (normalizedScore >= 0.50) {
-    return {
-      label: 'Moderate Match',
-      color: 'amber',
-      bgColor: 'bg-amber-500',
-      textColor: 'text-white',
-    };
-  }
-  return {
-    label: 'Low Match',
-    color: 'rose',
-    bgColor: 'bg-rose-500',
-    textColor: 'text-white',
-  };
 }
 
+/**
+ * Scores are 0-100 on the wire and in the cache. There are no quality bands:
+ * BGE-M3 profile-to-profile similarities cluster in a narrow range, so fixed
+ * thresholds would read as near-constant.
+ */
 export function formatScorePercentage(score: number): string {
-  // Backend returns scores on 0-10 scale, convert to percentage
-  return `${Math.round((score / 10) * 100)}%`;
+  return `${Math.round(score)}%`;
 }

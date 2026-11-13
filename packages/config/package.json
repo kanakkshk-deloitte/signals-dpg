@@ -9,7 +9,8 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:coverage": "vitest run --coverage"
   },
   "keywords": [],
   "author": "",
@@ -19,6 +20,6 @@
     "schemas": "workspace:*"
   },
   "devDependencies": {
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.12"
   }
 }

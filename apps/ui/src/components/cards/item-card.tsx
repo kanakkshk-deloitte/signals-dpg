@@ -10,6 +10,7 @@ import {
   formatCardValue,
   type CardRow,
 } from './resolve-card-fields';
+import { UriValue } from './uri-value';
 
 export interface ItemCardProps {
   /** Item schema (drives field labels). May be absent for map markers. */
@@ -25,8 +26,9 @@ export interface ItemCardProps {
   precisionLabel?: string;
   /** Action buttons (Connect / See Match Score) rendered in the footer. */
   actions?: React.ReactNode;
-  /** When set, the avatar shows this image instead of the initials (e.g. a
-   *  RubiX listing's favicon). */
+  /** Optional node rendered top-right of the coloured header (e.g. a Share button). */
+  headerAction?: React.ReactNode;
+  /** When set, the avatar shows this image instead of the initials. */
   avatarImageUrl?: string;
   /** `popup` is the map marker card; `list` is the browse grid card. */
   variant?: 'popup' | 'list';
@@ -37,16 +39,16 @@ export interface ItemCardProps {
 const HEADER_GRADIENT =
   'linear-gradient(135deg, var(--primary), color-mix(in srgb, var(--primary), white 32%))';
 
-// Long text values (e.g. Description) are truncated to a preview length and
-// expanded with an inline "Show more" toggle, so a long write-up doesn't make
-// the card tall by default.
+// Long text values are truncated with an inline "Show more" toggle.
 const LONG_VALUE_PREVIEW_CHARS = 140;
 
 function FieldRow({ row, compact = false }: { row: CardRow; compact?: boolean }) {
   const { t } = useTranslation();
   const [expanded, setExpanded] = React.useState(false);
   const formatted = formatCardValue(row.value, row.type);
-  const isLong = formatted.length > LONG_VALUE_PREVIEW_CHARS;
+  // A link row skips the "Show more" toggle: UriValue elides its own display
+  // text and keeps the full value in the href + tooltip.
+  const isLong = !row.isUri && formatted.length > LONG_VALUE_PREVIEW_CHARS;
   const display =
     isLong && !expanded
       ? `${formatted.slice(0, LONG_VALUE_PREVIEW_CHARS).trimEnd()}… `
@@ -74,7 +76,7 @@ function FieldRow({ row, compact = false }: { row: CardRow; compact?: boolean })
           row.isEmpty ? 'text-muted-foreground/60' : 'text-foreground'
         )}
       >
-        {display}
+        {row.isUri ? <UriValue value={row.value} /> : display}
         {isLong && (
           <button
             type="button"
@@ -82,7 +84,8 @@ function FieldRow({ row, compact = false }: { row: CardRow; compact?: boolean })
               e.stopPropagation();
               setExpanded((v) => !v);
             }}
-            className="font-medium text-primary hover:underline"
+            // z-10: stay above the whole-card activation button (see CardShell).
+            className="relative z-10 font-medium text-primary hover:underline"
           >
             {expanded ? t('card.show_less', 'Show less') : t('card.show_more', 'Show more')}
           </button>
@@ -92,12 +95,53 @@ function FieldRow({ row, compact = false }: { row: CardRow; compact?: boolean })
   );
 }
 
+type CardShellProps = Omit<React.ComponentPropsWithoutRef<'div'>, 'onClick'> & {
+  /** Accessible name for the whole-card activation control. */
+  heading: string;
+  /** When given, the card gains a whole-card activation control. */
+  onClick?: () => void;
+};
+
 /**
- * Single card component shared by the map popup and the browse list. Default
- * fields (from the domain's network.json `card` block) render collapsed; a
- * "view more" accordion reveals the remaining schema fields. Connect / See
- * Match Score buttons are passed in via `actions` so each call site keeps its
- * own auth/profile gating.
+ * The card's outer element. With an `onClick`, a real `<button>` is stretched
+ * over the card as a sibling of the content, labelled with the card title.
+ * Wrapping the card in a button (or `role="button"`) would nest the footer's
+ * controls inside it (axe `nested-interactive`, WCAG 4.1.2). The card's own
+ * controls sit above the stretched button via `relative z-10`.
+ */
+function CardShell({
+  heading,
+  onClick,
+  className,
+  children,
+  ...rest
+}: Readonly<CardShellProps>) {
+  if (!onClick) {
+    return (
+      <div className={className} {...rest}>
+        {children}
+      </div>
+    );
+  }
+
+  return (
+    <div className={className} {...rest}>
+      <button
+        type="button"
+        onClick={onClick}
+        aria-label={heading}
+        // Inset focus ring, since the card root clips overflow.
+        className="absolute inset-0 cursor-pointer rounded-2xl focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      />
+      {children}
+    </div>
+  );
+}
+
+/**
+ * Card for the map popup and the browse list. The domain's `card.default_fields`
+ * render collapsed; "view more" reveals the rest. Buttons come in via
+ * `actions`, so each call site keeps its own auth gating.
  */
 export function ItemCard({
   schema,
@@ -107,11 +151,12 @@ export function ItemCard({
   domainLabel,
   precisionLabel,
   actions,
+  headerAction,
   avatarImageUrl,
   variant = 'list',
   className,
   onClick,
-}: ItemCardProps) {
+}: Readonly<ItemCardProps>) {
   const { t } = useTranslation();
   const [open, setOpen] = React.useState(false);
 
@@ -119,10 +164,8 @@ export function ItemCard({
   const heading = title ?? resolved.title;
   const hasExtra = resolved.extraRows.length > 0;
 
-  // Fields: default rows always, extra rows when expanded. On the DESKTOP popup
-  // this region alone scrolls (the footer stays pinned). On mobile it does not
-  // scroll on its own — the whole body wrapper scrolls instead (see below) so
-  // the action buttons are always reachable.
+  // On the desktop popup this region scrolls with the footer pinned; on
+  // mobile the whole body scrolls so the buttons stay reachable.
   const fieldsBlock = (
     <div
       className={cn(
@@ -141,14 +184,13 @@ export function ItemCard({
     </div>
   );
 
-  // Footer: the "view more" toggle + action buttons. On a list card it is
-  // pinned to the bottom (mt-auto) for equal-height rows. On the popup it is
-  // pinned only on desktop (sm:mt-auto); on mobile it flows at the end of the
-  // scrolling body so it can never be clipped when the fields expand.
+  // Footer: pinned to the bottom on list cards (equal-height rows) and on the
+  // desktop popup; on mobile it flows at the end of the scrolling body.
   const footerBlock = (hasExtra || actions) ? (
     <div
       className={cn(
-        'shrink-0 pt-1',
+        // z-10: above the whole-card button (see CardShell).
+        'relative z-10 shrink-0 pt-1',
         variant === 'list' ? 'mt-auto' : 'sm:mt-auto'
       )}
     >
@@ -178,11 +220,10 @@ export function ItemCard({
         </div>
       )}
 
-      {/* Action buttons — supplied by the caller. justify-between spreads
-          natural-width list buttons to the edges; the popup's buttons use
-          flex-1 so they fill instead. */}
+      {/* Caller-supplied buttons: spread on list cards, filled on popups. */}
       {actions && (
         <div
+          data-tour="card-actions"
           className={cn(
             'flex flex-wrap items-center justify-between gap-2 px-4 pb-4 pt-2',
             variant === 'popup' &&
@@ -196,22 +237,17 @@ export function ItemCard({
   ) : null;
 
   return (
-    <div
+    <CardShell
+      heading={heading}
       data-item-card={variant === 'list' ? '' : undefined}
       data-expanded={variant === 'list' ? open : undefined}
       className={cn(
-        'flex flex-col overflow-hidden rounded-2xl bg-background text-foreground shadow-sm',
-        // Map popup: bound BOTH dimensions so the card always fits the screen.
-        //  - width: a fixed 28rem (wide enough for the three action buttons on
-        //    one row, and so fewer field values wrap → a shorter card), capped
-        //    at 90vw so it never exceeds a phone viewport. Being a definite
-        //    width, long field values wrap to the next line rather than widening
-        //    the card.
-        //  - width: a small 17rem on mobile (≤ 86vw) so the card leaves room to
-        //    pan the map; a roomier 28rem on desktop.
-        //  - height: on mobile a compact 56dvh so an opened card never fills the
-        //    screen; the whole body scrolls within it. On desktop ≤ 28rem (and
-        //    ≤ 60dvh on short screens) with the footer pinned.
+        // `relative` contains CardShell's stretched button; `isolate` keeps the
+        // z-10 layering local to the card.
+        'relative isolate flex flex-col overflow-hidden rounded-2xl bg-background text-foreground shadow-sm',
+        // Map popup: bounded in both dimensions so it always fits. A definite
+        // width (17rem on mobile, leaving room to pan; 28rem from sm, which
+        // fits three buttons in a row) wraps long values instead of widening.
         variant === 'popup' &&
           'w-[min(17rem,86vw)] max-h-[56dvh] sm:w-[min(28rem,90vw)] sm:max-h-[min(60dvh,28rem)]',
         variant === 'list' &&
@@ -220,7 +256,7 @@ export function ItemCard({
       )}
       onClick={onClick}
     >
-      {/* Branded header — colour is the per-network theme var */}
+      {/* Header in the network theme colour */}
       <div
         className="flex shrink-0 items-center gap-2.5 px-3 py-2 sm:gap-3 sm:px-4 sm:py-3"
         style={{ background: HEADER_GRADIENT }}
@@ -252,13 +288,12 @@ export function ItemCard({
             </p>
           )}
         </div>
+        {/* z-10: above the whole-card button (see CardShell). */}
+        {headerAction && <div className="relative z-10 ml-auto shrink-0">{headerAction}</div>}
       </div>
 
-      {/* Body. Popup on mobile: fields + footer share ONE scroll area, so the
-          action buttons are always reachable (even after "view more" expands
-          the fields). Popup on desktop (sm+): the body itself doesn't scroll —
-          the fields region scrolls internally and the footer stays pinned
-          (unchanged). List: fields followed by the bottom-pinned footer. */}
+      {/* Mobile popup: fields and footer share one scroll area. Desktop popup:
+          only the fields scroll. */}
       {variant === 'popup' ? (
         <div className="flex min-h-0 flex-1 flex-col overflow-y-auto sm:overflow-hidden">
           {fieldsBlock}
@@ -270,6 +305,6 @@ export function ItemCard({
           {footerBlock}
         </>
       )}
-    </div>
+    </CardShell>
   );
 }

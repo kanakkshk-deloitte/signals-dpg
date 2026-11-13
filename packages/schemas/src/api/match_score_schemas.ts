@@ -16,6 +16,13 @@ export const MatchScoreResponseSchema = z.object({
   model_provider: z.string().min(1).optional(),
   model: z.string().min(1).optional(),
   reasoning: z.string().min(1).optional(),
+  /**
+   * Why `score` is absent on a 200: `not_indexed` (signals-search 404, an
+   * item has no embedding yet) or `not_comparable` (409, the items were
+   * embedded with different model versions). This schema is the reply
+   * serializer, so the field must be declared here or Zod strips it.
+   */
+  unavailable_reason: z.enum(['not_indexed', 'not_comparable']).optional(),
   signals: z
     .object({
       name: z.string().min(1),

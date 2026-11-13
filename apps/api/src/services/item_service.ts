@@ -1,4 +1,4 @@
-import { and, count, eq, sql } from 'drizzle-orm';
+import { and, count, eq, ne, sql } from 'drizzle-orm';
 import {
   getDomainItemSchema,
   getDomainItemTypes,
@@ -11,8 +11,19 @@ import {
   isPrimaryAddressBlank,
   splitItemStateByPrivacy,
   validateAgainstJsonSchema,
+  JsonSchemaValidationError,
 } from '@dpg/schemas';
-import { classify_item } from './items/classifier.js';
+import { classify_item, DEFAULT_GO_LIVE_GATES, type GoLiveGate } from './items/classifier.js';
+import type { DbOrTx } from '@/services/db_types';
+import {
+  claimDomain,
+  domainLockedMessage,
+  readLockedDomains,
+} from './items/single_domain_lock.js';
+import {
+  resolveOwnerGateContext,
+  type OwnerGateContext,
+} from './aggregator/default_aggregator.js';
 import { hasAcceptedProfileConsent } from './consent_acceptance.js';
 import { is_populated } from './metrics/profile_completion.js';
 import { decryptPiiBlob, encryptPiiBlob, getPiiKey } from '@dpg/auth';
@@ -24,6 +35,7 @@ import { guardianProfileConsentRow } from './guardian_consent_rows';
 import { getNetworkConfigById } from '@/network_configs';
 import { guardianConsentRequired, isMinor } from '@/services/minor';
 import { geocodeLocationsFromState } from '@/services/geocoding/resolve_locations_for_create';
+import { findLocationOutsideCountry } from '@/services/geocoding/country_boundary';
 import { jitterCoordinate } from '@/services/geocoding/jitter';
 import {
   buildNetworkItemSchemaUrl,
@@ -37,9 +49,9 @@ export function primaryLocation(locs: ItemLocation[] | null | undefined): ItemLo
 }
 
 /**
- * Order-sensitive equality of two location arrays (coords + label). Used by the
- * update path to detect a caller echoing back the already-stored (jittered)
- * coordinates, so we leave them as-is instead of jittering a jittered point.
+ * Order-sensitive equality of two location arrays (coords + label). The update
+ * path uses it to detect echoed-back stored (already jittered) coordinates, so
+ * they are not jittered twice.
  */
 export function sameLocations(a: ItemLocation[], b: ItemLocation[]): boolean {
   if (a.length !== b.length) return false;
@@ -50,12 +62,11 @@ export function sameLocations(a: ItemLocation[], b: ItemLocation[]): boolean {
 }
 
 /**
- * Jitters the coordinates of a PRIVATE (PII) primary location field so the exact
- * address is never persisted: each point is offset to a deterministic random
- * spot within the configured 100–250 m annulus (see geocoding/jitter.ts). This
- * is the authoritative server-side transform — even an API caller that submits
- * an exact coordinate for a private field has it jittered here before storage.
- * Non-private location fields are returned unchanged.
+ * Jitters the coordinates of a private (PII) primary location field so the
+ * exact address is never persisted: each point moves to a deterministic spot in
+ * the configured annulus (default 100–250 m, see geocoding/jitter.ts). This is
+ * the authoritative server-side transform, so exact coordinates from any API
+ * caller are jittered before storage. Non-private fields are returned unchanged.
  */
 export function jitterPrivateLocations(
   locations: ItemLocation[],
@@ -70,10 +81,8 @@ export function jitterPrivateLocations(
 }
 
 /**
- * Decides the coordinates to store for an item. NEVER geocodes — that happens in
- * the create/update paths. Here we apply the PII transform: a PRIVATE location
- * field's supplied coordinate is jittered (100–250 m) so an exact point can
- * never be persisted. Non-private fields are stored exactly as supplied.
+ * The coordinates to store for an item: private location fields are jittered,
+ * others are stored as supplied. Does not geocode; the create/update paths do.
  */
 function locationsForStorage(
   provided: ItemLocation[],
@@ -85,20 +94,71 @@ function locationsForStorage(
 export class ItemServiceError extends Error {
   statusCode: number;
   errorCode: string;
-  constructor(statusCode: number, errorCode: string, message: string) {
+  /**
+   * Extra machine-readable fields merged into the route's error body, e.g.
+   * `locked_domain` / `requested_domain` on DOMAIN_LOCKED or `fields` on
+   * INVALID_ITEM_STATE. These are part of the published error contract for
+   * external clients even where the in-repo UI does not read them.
+   */
+  details?: Record<string, unknown>;
+  constructor(
+    statusCode: number,
+    errorCode: string,
+    message: string,
+    details?: Record<string, unknown>,
+  ) {
     super(message);
     this.statusCode = statusCode;
     this.errorCode = errorCode;
+    this.details = details;
   }
 }
 
-type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
-export type DbOrTx = typeof db | Tx;
+export type { DbOrTx } from '@/services/db_types';
 
 /**
- * Whether `userId` is the creator of the item identified by the partition key.
- * Shared by the profile-consent routes (accept + U18) so the ownership query —
- * scoped on the partition-pruning columns — isn't hand-written per handler.
+ * A schema failure on `item_state` as the 400 every item write returns. Carries
+ * the validator's per-field map as `fields` (merged into the route's error
+ * body), so a caller can point at the offending input without parsing the
+ * message — a bulk CSV column, a form field.
+ */
+function invalidItemStateError(err: unknown): ItemServiceError {
+  return new ItemServiceError(
+    400,
+    'INVALID_ITEM_STATE',
+    err instanceof Error ? err.message : 'Invalid item_state',
+    err instanceof JsonSchemaValidationError ? { fields: err.fields } : undefined,
+  );
+}
+
+/**
+ * Rejects caller-supplied coordinates outside the configured country.
+ *
+ * Only for points the caller resolved (a bulk `geo_location` cell, an
+ * autocomplete pick, a partner's `item_locations`), which skip the geocoder's
+ * own country restriction. Geocoded points are not checked: geocoding is
+ * best-effort and a point on a simplified border line must not fail a
+ * registration. A no-op when `GEOCODING_COUNTRY` (or the boundary file) is unset.
+ *
+ * @throws {ItemServiceError} 400 LOCATION_OUTSIDE_COUNTRY, naming the point so a
+ *   bulk operator can find the row.
+ */
+export async function assertSuppliedLocationsInCountry(
+  points: readonly ItemLocation[] | undefined,
+): Promise<void> {
+  if (!points?.length) return;
+  const outside = await findLocationOutsideCountry(points);
+  if (!outside) return;
+  throw new ItemServiceError(
+    400,
+    'LOCATION_OUTSIDE_COUNTRY',
+    `Location ${outside.lat}, ${outside.lng} is outside the allowed region (${geocodingConfig.country}).`,
+  );
+}
+
+/**
+ * Whether `userId` is the creator of the item, queried on the full partition
+ * key so Postgres can prune partitions.
  */
 export async function isItemOwnedBy(
   userId: string,
@@ -127,17 +187,16 @@ export interface CreateItemServiceParams {
   item_locations?: ItemLocation[];
   created_by: string;
   /**
-   * Whether profile_creation consent is being accepted as part of this create
-   * (the public /item/create carries a consent block). When true, a required-
-   * complete item is classified `live` immediately; when false/omitted (admin/
-   * bulk onboarding), the item stays `draft` and is promoted later via
-   * POST /consent/profile-accept. Defaults to false.
+   * Whether profile_creation consent is accepted as part of this create. When
+   * true, a complete item can go `live` immediately; when false (admin/bulk
+   * onboarding, or a gated minor), it stays `draft` until
+   * POST /consent/profile-accept promotes it. Defaults to false.
    */
   consent_accepted?: boolean;
   /**
    * Skip the per-user profile cap (MAX_PROFILES_PER_USER / the domain's
-   * `max_profiles_per_user`). Set only by trusted internal callers such as
-   * seed scripts. Defaults to false — every real create path is capped.
+   * `max_profiles_per_user`). For trusted internal callers such as seed
+   * scripts only; every request-driven create path is capped.
    */
   skip_profile_limit?: boolean;
 }
@@ -226,11 +285,7 @@ async function resolveSchema(params: {
       ignoredKeys: required,
     });
   } catch (err) {
-    throw new ItemServiceError(
-      400,
-      'INVALID_ITEM_STATE',
-      err instanceof Error ? err.message : 'Invalid item_state'
-    );
+    throw invalidItemStateError(err);
   }
 
   const itemState = splitItemStateByPrivacy(itemSchema, params.submittedItemState);
@@ -259,10 +314,18 @@ async function resolveProfileLimit(
 
 /**
  * Enforce the per-user profile cap atomically, inside the caller's transaction.
- * Mirrors assertWardLimitWithLock: a transaction-scoped advisory lock keyed on
- * the (user, network, domain, item_type) scope serializes concurrent creates so
- * two racing inserts can't both pass a `count < limit` check. Throws 409
- * PROFILE_LIMIT_REACHED when the user is already at the cap.
+ * A transaction-scoped advisory lock on (user, network, domain, item_type)
+ * serializes concurrent creates so two racing inserts can't both pass the
+ * count check. Throws 409 PROFILE_LIMIT_REACHED at the cap.
+ *
+ * Retired rows do not hold a slot: retiring is the remedy the 409 message
+ * offers. This is safe only because `retired` is terminal (no
+ * retire-create-unretire path); revisit if retire becomes reversible. The
+ * filter is a denylist so any future lifecycle state still consumes a slot.
+ *
+ * The single-domain lock (`single_domain_lock.ts`) intentionally does count
+ * retired items: it protects the per-account tenancy key, which retire does not
+ * reset.
  */
 async function assertProfileLimit(
   exec: DbOrTx,
@@ -286,6 +349,7 @@ async function assertProfileLimit(
         eq(items.item_network, params.item_network),
         eq(items.item_domain, params.item_domain),
         eq(items.item_type, params.item_type),
+        ne(items.lifecycle_status, 'retired'),
       ),
     );
 
@@ -293,9 +357,42 @@ async function assertProfileLimit(
     throw new ItemServiceError(
       409,
       'PROFILE_LIMIT_REACHED',
-      `This user already has the maximum of ${limit} ${params.item_domain} profile(s) allowed. Delete an existing profile to create a new one.`,
+      `This user already has the maximum of ${limit} ${params.item_domain} profile(s) allowed. Retire an existing profile to create a new one.`,
     );
   }
+}
+
+/**
+ * Single-domain lock on the create path. Enforced here so every create path
+ * (including admin api-key callers and `POST /admin/participant`) inherits it.
+ * The rule and SQL live in `services/items/single_domain_lock.ts`, shared with
+ * `POST /api/v1/user/domains`.
+ *
+ * Only a mismatch is refused: a first create, a repeat in the same domain, and a
+ * backfilled legacy account in either of its domains all pass.
+ *
+ * @throws ItemServiceError 403 DOMAIN_LOCKED when the account is locked to
+ *   another domain. The body carries `locked_domain` / `requested_domain`.
+ */
+async function assertSingleDomain(
+  exec: DbOrTx,
+  params: Pick<CreateItemServiceParams, 'created_by' | 'item_domain'>,
+): Promise<void> {
+  if (await claimDomain(exec, params.created_by, params.item_domain)) return;
+
+  const allowed = await readLockedDomains(exec, params.created_by);
+
+  // Empty ⇒ the user row is missing (`claimDomain` declines for an account that
+  // owns items, so an existing account never lands here empty). Let the items
+  // FK raise that, rather than dressing a missing user up as a domain error.
+  if (allowed.length === 0 || allowed.includes(params.item_domain)) return;
+
+  throw new ItemServiceError(
+    403,
+    'DOMAIN_LOCKED',
+    domainLockedMessage(allowed[0] as string, params.item_domain, 'create items under'),
+    { locked_domain: allowed[0], requested_domain: params.item_domain },
+  );
 }
 
 export async function createItemInternal(
@@ -310,9 +407,12 @@ export async function createItemInternal(
     submittedItemState,
   });
 
-  // Per-user profile cap (#349). Enforced at this single choke point so every
-  // create path (item/create, admin/participant, aggregator bulk + reg-links)
-  // inherits it. Runs on the caller's transaction for an atomic check-then-insert.
+  // The domain lock runs before the cap: a wrong domain is the more fundamental
+  // refusal, and a fixed order keeps the two guards' locks acquired consistently.
+  await assertSingleDomain(exec, params);
+
+  // Enforced here so every create path (item/create, admin/participant,
+  // aggregator bulk + reg-links) inherits the cap atomically.
   if (!params.skip_profile_limit) {
     await assertProfileLimit(exec, params);
   }
@@ -324,19 +424,29 @@ export async function createItemInternal(
       ? ''
       : encryptPiiBlob(JSON.stringify(itemState.privateState), getPiiKey());
 
-  // Live requires required-complete AND profile_creation consent
-  // (aggregator-dpg#464). A create that carries consent (public /item/create
-  // with a consent block, passed as `consent_accepted`) IS that acceptance, so
-  // it can go live now (#275). Consent-less callers (admin/bulk onboarding)
-  // stay draft until POST /consent/profile-accept promotes. U18: for a gated
-  // MINOR the route passes `consent_accepted=false` (self-consent must not
-  // promote a minor), so they stay draft until GUARDIAN consent promotes via
-  // the finalize/accept path — see create_item.ts and promoteItemOnProfileConsent.
+  // A create carrying consent is the profile_creation acceptance, so it can go
+  // live now. Consent-less callers stay draft until POST /consent/profile-accept.
+  // For a gated minor create_item passes `consent_accepted=false` (self-consent
+  // must not promote a minor); guardian consent promotes later via
+  // promoteItemOnProfileConsent.
+  const goLiveGates = await resolveGoLiveGates(params.item_network, params.item_domain);
   const classification = classify_item({
     schema: itemSchema as { required?: string[] },
     merged_state: submittedItemState,
     current_status: 'draft',
+    // Read-only gate check. create_item calls `tagUserWithDefaultAggregator`
+    // earlier in this same transaction.
+    owner_context: await ownerGateContext(
+      exec,
+      goLiveGates,
+      params.created_by,
+      params.item_network,
+      params.item_domain,
+    ),
+    // No separate guardian check here: create_item already passes false for a
+    // gated minor.
     consent_accepted: params.consent_accepted ?? false,
+    gates: goLiveGates,
   });
 
   const itemLocations = locationsForStorage(params.item_locations ?? [], itemSchema);
@@ -368,6 +478,8 @@ export async function createItemInternal(
       itemDomain: items.item_domain,
       itemType: items.item_type,
       itemId: items.item_id,
+      // Callers need it to pick the create email copy (live vs complete-your-profile).
+      lifecycleStatus: items.lifecycle_status,
     });
 
   if (result.length === 0) {
@@ -398,22 +510,63 @@ export interface UpdateItemInternalResult {
   };
 }
 
+/** Whether a domain's configured gate set includes the `owner_required` gate. */
+function gatesRequireOwner(gates: readonly GoLiveGate[]): boolean {
+  return gates.includes('owner_required');
+}
+
 /**
- * Server-authoritative U18 go-live gate. Returns true when an item must NOT be
- * flipped `draft → live` because a guardian-gated domain lacks the required
- * guardian consent. THE single source of truth for the age gate on every
- * promotion path (create self-consent, /consent/profile-accept, and item
- * update) — do not re-derive it inline. Fail-closed on two fronts:
+ * The `owner_required` gate context for one profile write. Read-only: tagging
+ * happens at the account level (`tagUserForDomain` /
+ * `tagUserWithDefaultAggregator`) when the user's domain is decided.
  *
- *  - **null age on a gated domain → blocked.** A missing `user.age` is
- *    never treated as "adult": age capture is client-side only (u18_precheck is
- *    a hint, not a control), so a minor account with no age must not be able to
- *    self-consent to live.
- *  - **minor with no `source='guardian'` profile_creation row → blocked.** Only
- *    guardian consent promotes a minor; the ward's own self-consent row cannot.
+ * @returns undefined when the domain does not configure `owner_required` (the
+ *   default), so this normally costs nothing.
+ */
+async function ownerGateContext(
+  exec: DbOrTx,
+  gates: readonly GoLiveGate[],
+  ownerUserId: string,
+  network: string,
+  domain: string,
+): Promise<OwnerGateContext | undefined> {
+  if (!gatesRequireOwner(gates)) return undefined;
+  return resolveOwnerGateContext(exec, ownerUserId, network, domain);
+}
+
+/**
+ * The go-live gate set for a (network, domain), from the domain's
+ * `go_live_required` config, or `DEFAULT_GO_LIVE_GATES` when unset. Callers
+ * pass the result into `classify_item` and use it to decide whether the U18
+ * guardian check applies (it is part of the `consent_required` gate).
+ */
+export async function resolveGoLiveGates(
+  network: string,
+  domain: string,
+): Promise<readonly GoLiveGate[]> {
+  const networkConfig = await getNetworkConfigById(network);
+  const domainConfig = networkConfig.domains.find((d) => d.id === domain);
+  const gates = domainConfig?.go_live_required ?? DEFAULT_GO_LIVE_GATES;
+  // The U18 guardian check lives in `consent_required`, so a guardian-gated
+  // domain always gets that gate: the age gate must never be droppable by config.
+  if (domainConfig?.guardian_consent_required && !gates.includes('consent_required')) {
+    return [...gates, 'consent_required'];
+  }
+  return gates;
+}
+
+/**
+ * Server-authoritative U18 go-live gate: true when an item must not go
+ * `draft → live` because a guardian-gated domain lacks guardian consent. Used by
+ * /consent/profile-accept promotion and item update; the create path applies
+ * the same rule in create_item's `resolveSelfConsentPromotes`. Fails closed:
  *
- * A proven adult (age present and not a minor), and ANY user on a non-gated
- * domain, are never blocked.
+ *  - Null age on a gated domain blocks: age capture is client-side
+ *    (u18_precheck is a hint, not a control), so a missing age is never "adult".
+ *  - A minor with no `source='guardian'` profile_creation row blocks: the
+ *    ward's own self-consent row cannot promote.
+ *
+ * A proven adult, and any user on a non-gated domain, is never blocked.
  */
 export async function guardianGateBlocksGoLive(
   exec: DbOrTx,
@@ -428,7 +581,6 @@ export async function guardianGateBlocksGoLive(
     .where(eq(user.id, item.created_by))
     .limit(1);
 
-  // Cannot prove adulthood without an age → fail-closed on a gated domain.
   if (ward?.age == null) return true;
   if (!isMinor(ward.age)) return false;
 
@@ -445,22 +597,17 @@ export async function guardianGateBlocksGoLive(
       ),
     )
     .limit(1);
-  return !guardianRow; // minor without guardian consent → stay draft
+  return !guardianRow;
 }
 
 /**
- * Promote a single profile to `live` after its owner accepts `profile_creation`
- * consent (aggregator-dpg#464). A profile is created `draft` because per-item
- * consent can only be recorded after the item exists; when the owner accepts
- * profile consent (via POST /consent/profile-accept, on platform login or a
- * Voice AI call), a complete profile becomes discoverable.
+ * Promote a `draft` profile to `live` after its owner accepts
+ * `profile_creation` consent, re-running the write-path classifier so the
+ * completeness rules stay in one place. `paused` is sticky and `live` needs no
+ * change. Returns true if it flipped to live.
  *
- * Only a `draft` item is promoted — `paused` is sticky and `live` needs no
- * change. Re-runs the same classifier used on write (with consent now true),
- * so completeness rules stay in one place. Returns true if it flipped to live.
- *
- * Caller is expected to have already recorded the consent row (and verified the
- * caller owns the item); this only re-evaluates lifecycle.
+ * The caller must already have recorded the consent row and verified ownership;
+ * this only re-evaluates lifecycle.
  */
 export async function promoteItemOnProfileConsent(
   exec: DbOrTx,
@@ -495,24 +642,33 @@ export async function promoteItemOnProfileConsent(
     item.item_private_state === ''
       ? {}
       : (JSON.parse(
-        decryptPiiBlob(item.item_private_state, getPiiKey())
-      ) as Record<string, unknown>);
+          decryptPiiBlob(item.item_private_state, getPiiKey())
+        ) as Record<string, unknown>);
   const mergedFullState = mergeItemStateWithPrivate(
     item.item_state as Record<string, unknown>,
     priv
   );
 
+  const goLiveGates = await resolveGoLiveGates(item.item_network, item.item_domain);
+  // The caller recorded the consent row, so `consent_required` reduces to the
+  // U18 guardian check (fail-closed for a gated minor or null age).
+  const consentSatisfied = !(await guardianGateBlocksGoLive(exec, item));
   const { lifecycle_status } = classify_item({
     schema: itemSchema as { required?: string[] },
     merged_state: mergedFullState,
     current_status: 'draft',
-    consent_accepted: true,
+    consent_accepted: consentSatisfied,
+    gates: goLiveGates,
+    owner_context: await ownerGateContext(
+      exec,
+      goLiveGates,
+      item.created_by,
+      item.item_network,
+      item.item_domain,
+    ),
   });
 
   if (lifecycle_status !== 'live') return false;
-
-  // U18 age gate (spec §7 / D11/D13). Fail-closed for a gated minor / null-age.
-  if (await guardianGateBlocksGoLive(exec, item)) return false;
 
   await exec
     .update(items)
@@ -522,11 +678,9 @@ export async function promoteItemOnProfileConsent(
 }
 
 /**
- * Record (or upgrade) a minor's GUARDIAN `profile_creation` consent for an item
- * and promote it live in one step. Upsert (not plain insert): a prior
- * `source='profile'` row from create_item must be upgraded to `'guardian'`, not
- * 23505'd. Shared by the U18 profile-consent verify + finalize handlers, which
- * were byte-identical. Returns whether the item was promoted to live.
+ * Record a minor's guardian `profile_creation` consent for an item and promote
+ * it live in one step. Shared by the U18 profile-consent verify and finalize
+ * handlers. Returns whether the item was promoted to live.
  */
 export async function upsertGuardianProfileConsentAndPromote(
   tx: DbOrTx,
@@ -535,9 +689,8 @@ export async function upsertGuardianProfileConsentAndPromote(
   await tx
     .insert(consent_record)
     .values(guardianProfileConsentRow(args))
-    // Append a distinct source='guardian' row (the ward's own source='profile'
-    // row from create_item is preserved). Conflict only on a repeat guardian
-    // acceptance for the same item → idempotent update, self row untouched.
+    // Adds a source='guardian' row beside the ward's own source='profile' row.
+    // A repeat guardian acceptance for the same item updates in place.
     .onConflictDoUpdate({
       target: [consent_record.userId, consent_record.itemId, consent_record.source],
       targetWhere: sql`level = 'item' AND consent_category = 'profile_creation'`,
@@ -548,6 +701,163 @@ export async function upsertGuardianProfileConsentAndPromote(
       },
     });
   return promoteItemOnProfileConsent(tx, args.itemId);
+}
+
+/** The existing-item fields `updateItemInternal`'s state/location helpers read. */
+interface ExistingItemForUpdate {
+  item_id: string;
+  item_network: string;
+  item_domain: string;
+  item_type: string;
+  item_schema_url: string | null;
+  item_state: unknown;
+  item_private_state: string;
+  lifecycle_status: string;
+  created_by: string;
+  item_locations: unknown;
+}
+
+/**
+ * Computes the `item_state` / `item_private_state` / `lifecycle_status` writes
+ * for a state-changing update: decrypt + merge the prior state, validate,
+ * enforce the live latch, split private fields, and re-classify go-live
+ * (guardian-aware consent folded in).
+ *
+ * @returns The merged full state + whether the primary address changed (for
+ *          downstream location resolution) and the column writes to apply.
+ * @throws {ItemServiceError} 400 INVALID_ITEM_STATE / 409 REQUIRED_FIELD_LOCKED_WHILE_LIVE.
+ */
+async function computeItemStateUpdate(
+  exec: DbOrTx,
+  existingItem: ExistingItemForUpdate,
+  itemSchema: Awaited<ReturnType<typeof getOrFetchSchemaByUrl>>,
+  bodyState: Record<string, unknown>,
+): Promise<{
+  mergedFullState: Record<string, unknown>;
+  addressChanged: boolean;
+  writes: { item_state: unknown; item_private_state: string; lifecycle_status: string };
+}> {
+  const priorPrivate =
+    existingItem.item_private_state === ''
+      ? {}
+      : (JSON.parse(decryptPiiBlob(existingItem.item_private_state, getPiiKey())) as Record<
+          string,
+          unknown
+        >);
+  const priorFullState = mergeItemStateWithPrivate(
+    existingItem.item_state as Record<string, unknown>,
+    priorPrivate,
+  );
+  const mergedFullState = { ...priorFullState, ...bodyState };
+  const addressChanged = primaryAddressChanged(
+    itemSchema as Record<string, unknown>,
+    bodyState,
+    priorFullState,
+  );
+
+  const requiredKeys = Array.isArray((itemSchema as { required?: unknown }).required)
+    ? ((itemSchema as { required?: string[] }).required as string[])
+    : [];
+
+  try {
+    validateAgainstJsonSchema(itemSchema, mergedFullState, 'item_state', {
+      allowAdditionalProperties: apiConfig.allow_extra_schema_data,
+      ignoredKeys: requiredKeys,
+    });
+  } catch (err) {
+    throw invalidItemStateError(err);
+  }
+
+  // Live latch: a live profile must stay complete, so an edit that empties a
+  // required field is rejected (docs/superpowers/specs/2026-06-10-live-latch-design.md).
+  const unpopulatedRequired = requiredKeys.filter((k) => !is_populated(mergedFullState[k]));
+  if (unpopulatedRequired.length > 0 && existingItem.lifecycle_status === 'live') {
+    throw new ItemServiceError(
+      409,
+      'REQUIRED_FIELD_LOCKED_WHILE_LIVE',
+      `Required field(s) must stay populated on a live profile: ${unpopulatedRequired.join(', ')}; pause it first`,
+    );
+  }
+
+  const split = splitItemStateByPrivacy(itemSchema, mergedFullState);
+  const masked = maskPrivateState(itemSchema, split.privateState);
+  const item_state = mergeMasksIntoPublic(split.publicState, masked);
+  const item_private_state =
+    Object.keys(split.privateState).length === 0
+      ? ''
+      : encryptPiiBlob(JSON.stringify(split.privateState), getPiiKey());
+
+  // `consent_required` folds in the U18 guardian check so a minor's self-consent
+  // row can't flip the item live (the classifier just evaluates configured gates).
+  const goLiveGates = await resolveGoLiveGates(existingItem.item_network, existingItem.item_domain);
+  const consentSatisfied =
+    (await hasAcceptedProfileConsent(exec, existingItem.item_id)) &&
+    !(await guardianGateBlocksGoLive(exec, existingItem));
+  const classification = classify_item({
+    schema: itemSchema as { required?: string[] },
+    merged_state: mergedFullState,
+    current_status: existingItem.lifecycle_status as 'draft' | 'live' | 'paused',
+    consent_accepted: consentSatisfied,
+    gates: goLiveGates,
+    // Only needed for a draft: `owner_required` passes for an already-live item
+    // and `paused` is sticky, so the lookup is skipped for most edits.
+    owner_context:
+      existingItem.lifecycle_status === 'draft'
+        ? await ownerGateContext(
+            exec,
+            goLiveGates,
+            existingItem.created_by,
+            existingItem.item_network,
+            existingItem.item_domain,
+          )
+        : undefined,
+  });
+
+  return {
+    mergedFullState,
+    addressChanged,
+    writes: { item_state, item_private_state, lifecycle_status: classification.lifecycle_status },
+  };
+}
+
+/**
+ * Resolves the `item_locations` write for an update, in precedence order:
+ * explicit non-empty client coords win (re-jitter unless echoed back); else an
+ * edited primary address re-geocodes (blank → wipe, geocode hit → store,
+ * geocode miss → keep existing); else leave unchanged.
+ *
+ * @returns The locations to write, or `undefined` to leave them unchanged.
+ */
+async function resolveLocationUpdate(
+  existingItem: ExistingItemForUpdate,
+  itemSchema: Awaited<ReturnType<typeof getOrFetchSchemaByUrl>>,
+  bodyLocations: ItemLocation[] | undefined,
+  mergedFullState: Record<string, unknown>,
+  addressChanged: boolean,
+): Promise<ItemLocation[] | undefined> {
+  const providedCoords =
+    Array.isArray(bodyLocations) && bodyLocations.length > 0 ? bodyLocations : null;
+  if (providedCoords) {
+    const stored = (existingItem.item_locations ?? []) as ItemLocation[];
+    // Echoed-back stored coordinates are not re-checked, so an unrelated edit
+    // never fails on a point stored before the country restriction applied.
+    if (sameLocations(providedCoords, stored)) return stored;
+    await assertSuppliedLocationsInCountry(providedCoords);
+    return locationsForStorage(providedCoords, itemSchema as Record<string, unknown>);
+  }
+  if (addressChanged) {
+    if (isPrimaryAddressBlank(itemSchema as Record<string, unknown>, mergedFullState)) {
+      return [];
+    }
+    const geocoded = await geocodeLocationsFromState(
+      itemSchema as Record<string, unknown>,
+      mergedFullState,
+    );
+    if (geocoded.length > 0) {
+      return locationsForStorage(geocoded, itemSchema as Record<string, unknown>);
+    }
+  }
+  return undefined;
 }
 
 export async function updateItemInternal(
@@ -565,9 +875,8 @@ export async function updateItemInternal(
     updated_at: sql`now()`,
   };
 
-  // Fetch the existing item + its schema once when either the state or the
-  // locations are changing: the schema is needed to merge/validate state,
-  // classify lifecycle, and coarsen a private location field.
+  // The schema is needed to merge/validate state, classify lifecycle, and
+  // jitter a private location field.
   if (body.item_state !== undefined || body.item_locations !== undefined) {
     const [existingItem] = await exec
       .select({
@@ -594,10 +903,8 @@ export async function updateItemInternal(
       );
     }
 
-    // Retire is terminal (#347): the row's PII was wiped and item_private_state
-    // cleared. Block any state/location mutation on a retired item — the owner
-    // still owns the row, so without this a PATCH would re-merge the body,
-    // re-encrypt private fields and silently re-introduce the PII retire erased.
+    // Retire wiped this row's PII and is terminal. The owner still owns the row,
+    // so without this a PATCH would re-introduce the PII retire erased.
     if (existingItem.lifecycle_status === 'retired') {
       throw new ItemServiceError(
         409,
@@ -613,134 +920,32 @@ export async function updateItemInternal(
       itemType: existingItem.item_type,
     });
 
-    // Full prior + merged state, hoisted so location resolution (below, after
-    // the merge) can detect an address change. Populated only when item_state
-    // is part of this update.
-    let priorFullState: Record<string, unknown> = {};
+    // Populated only when item_state is part of this update.
     let mergedFullState: Record<string, unknown> = {};
     let addressChanged = false;
 
     if (body.item_state) {
-      // Decrypt existing private blob (empty string => no prior private fields)
-      // and reconstitute the full prior state (real values, not masks).
-      const priorPrivate =
-        existingItem.item_private_state === ''
-          ? {}
-          : (JSON.parse(
-            decryptPiiBlob(existingItem.item_private_state, getPiiKey())
-          ) as Record<string, unknown>);
-      priorFullState = mergeItemStateWithPrivate(
-        existingItem.item_state as Record<string, unknown>,
-        priorPrivate
-      );
-      // Layer the caller's partial update on top.
-      mergedFullState = { ...priorFullState, ...body.item_state };
-
-      addressChanged = primaryAddressChanged(
-        itemSchema as Record<string, unknown>,
-        body.item_state,
-        priorFullState,
-      );
-
-      const requiredKeys = Array.isArray((itemSchema as { required?: unknown }).required)
-        ? ((itemSchema as { required?: string[] }).required as string[])
-        : [];
-
-      try {
-        validateAgainstJsonSchema(itemSchema, mergedFullState, 'item_state', {
-          allowAdditionalProperties: apiConfig.allow_extra_schema_data,
-          ignoredKeys: requiredKeys,
-        });
-      } catch (err) {
-        throw new ItemServiceError(
-          400,
-          'INVALID_ITEM_STATE',
-          err instanceof Error ? err.message : 'Invalid item_state'
-        );
-      }
-
-      // Live latch: a profile that has reached `live` must stay complete. Reject
-      // any edit that would leave a required field unpopulated while the item is
-      // live. (Scope: live only — see 2026-06-10-live-latch-design.md §6.)
-      const unpopulatedRequired = requiredKeys.filter((k) => !is_populated(mergedFullState[k]));
-      if (unpopulatedRequired.length > 0 && existingItem.lifecycle_status === 'live') {
-        throw new ItemServiceError(
-          409,
-          'REQUIRED_FIELD_LOCKED_WHILE_LIVE',
-          `Required field(s) must stay populated on a live profile: ${unpopulatedRequired.join(', ')}; pause it first`,
-        );
-      }
-
-      const split = splitItemStateByPrivacy(itemSchema, mergedFullState);
-      const masked = maskPrivateState(itemSchema, split.privateState);
-      updateValues.item_state = mergeMasksIntoPublic(split.publicState, masked);
-      updateValues.item_private_state =
-        Object.keys(split.privateState).length === 0
-          ? ''
-          : encryptPiiBlob(JSON.stringify(split.privateState), getPiiKey());
-
-      const consent_accepted = await hasAcceptedProfileConsent(
+      const stateUpdate = await computeItemStateUpdate(
         exec,
-        existingItem.item_id,
+        existingItem,
+        itemSchema,
+        body.item_state,
       );
-
-      const classification = classify_item({
-        schema: itemSchema as { required?: string[] },
-        merged_state: mergedFullState,
-        current_status: existingItem.lifecycle_status as 'draft' | 'live' | 'paused',
-        consent_accepted,
-      });
-      // U18 age gate on the UPDATE path: `hasAcceptedProfileConsent` matches a
-      // profile_creation row of ANY source, so a minor's create-draft-then-edit
-      // would otherwise flip to `live` on their own self-consent row. Block the
-      // draft→live transition through the same server gate as promote/create;
-      // an already-live item is untouched (the live-latch handles those).
-      const wouldGoLive =
-        classification.lifecycle_status === 'live' && existingItem.lifecycle_status !== 'live';
-      if (wouldGoLive && (await guardianGateBlocksGoLive(exec, existingItem))) {
-        updateValues.lifecycle_status = existingItem.lifecycle_status;
-      } else {
-        updateValues.lifecycle_status = classification.lifecycle_status;
-      }
+      mergedFullState = stateUpdate.mergedFullState;
+      addressChanged = stateUpdate.addressChanged;
+      Object.assign(updateValues, stateUpdate.writes);
     }
 
-    // Location resolution precedence (runs after the state merge):
-    //  1. Explicit non-empty client coords win (e.g. user picked a map
-    //     suggestion). An empty `[]` is NOT explicit — it means "no coords".
-    //  2. Otherwise, if the primary address field was edited (present in the
-    //     partial update and changed vs prior):
-    //       a. cleared to blank/empty → wipe coords (`[]`).
-    //       b. non-blank → re-geocode from the merged state; only overwrite
-    //          when geocoding produced something, so a geocode FAILURE
-    //          preserves the existing coords rather than wiping them.
-    //  3. Otherwise leave item_locations unchanged.
-    const providedCoords =
-      Array.isArray(body.item_locations) && body.item_locations.length > 0
-        ? body.item_locations
-        : null;
-    if (providedCoords) {
-      const stored = (existingItem.item_locations ?? []) as ItemLocation[];
-      // Caller echoed back the already-stored (jittered) coords → leave as-is,
-      // so a read-modify-write update never re-jitters a jittered point.
-      updateValues.item_locations = sameLocations(providedCoords, stored)
-        ? stored
-        : locationsForStorage(providedCoords, itemSchema as Record<string, unknown>);
-    } else if (addressChanged) {
-      if (isPrimaryAddressBlank(itemSchema as Record<string, unknown>, mergedFullState)) {
-        // Address removed — wipe coords (distinct from a geocode failure).
-        updateValues.item_locations = [];
-      } else {
-        const geocoded = await geocodeLocationsFromState(
-          itemSchema as Record<string, unknown>,
-          mergedFullState
-        );
-        if (geocoded.length > 0) {
-          updateValues.item_locations = locationsForStorage(
-            geocoded,
-            itemSchema as Record<string, unknown>
-          );
-        }
-      }
+    // Runs after the state merge; `undefined` leaves item_locations unchanged.
+    const locationUpdate = await resolveLocationUpdate(
+      existingItem,
+      itemSchema,
+      body.item_locations,
+      mergedFullState,
+      addressChanged,
+    );
+    if (locationUpdate !== undefined) {
+      updateValues.item_locations = locationUpdate;
     }
   }
 

@@ -82,7 +82,13 @@
           }
         }
       },
+      "profile_completion_prompt": {
+        "heading": "Complete your profile to find the right tutors",
+        "body": "Tutors and counsellors can find and connect with you only once your profile is live. Fill in the details below to get matched."
+      },
       "id": "student",
+      "contact_fields": { "name": "Full Name", "phone": "Phone Number", "email": "Email Address" },
+      "go_live_required": ["schema_required", "consent_required"],
       "card": {
         "title_field": "Full Name",
         "avatar_from": "Full Name",
@@ -191,7 +197,13 @@
           }
         }
       },
+      "profile_completion_prompt": {
+        "heading": "Complete your profile to reach students",
+        "body": "Students can find and connect with you only once your profile is live. Add your details below to start getting learners."
+      },
       "id": "individual_tutor_weera_counsellor",
+      "contact_fields": { "name": "Full Name", "phone": "Phone Number", "email": "Email Address" },
+      "go_live_required": ["schema_required", "consent_required"],
       "card": {
         "title_field": "Full Name",
         "avatar_from": "Full Name",
@@ -245,6 +257,10 @@
           "from_domain": "student",
           "to_network": "onest_yellow_dot",
           "to_domain": "individual_tutor_weera_counsellor",
+          "column_fields": {
+            "from": ["Grade", "Academic Stream", "Service Looking For"],
+            "to": ["Service Offered", "Grade Bands Served", "Academic Streams Served"]
+          },
           "requirement_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "Student To Individual Tutor Connect Requirement",
@@ -317,6 +333,10 @@
           "from_domain": "individual_tutor_weera_counsellor",
           "to_network": "onest_yellow_dot",
           "to_domain": "student",
+          "column_fields": {
+            "from": ["Service Offered", "Grade Bands Served", "Academic Streams Served"],
+            "to": ["Grade", "Academic Stream", "Service Looking For"]
+          },
           "requirement_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "Individual Tutor To Student Connect Requirement",

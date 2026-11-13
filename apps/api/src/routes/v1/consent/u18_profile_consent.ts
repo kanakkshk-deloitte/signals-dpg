@@ -19,6 +19,42 @@ import {
   issueGuardianOtp, verifyGuardianOtp, assertVerifyAttemptAllowed, guardianOtpErrorReply,
 } from '@/services/guardian_otp';
 import { isItemOwnedBy, upsertGuardianProfileConsentAndPromote } from '@/services/item_service';
+import { invalidateItemFetchCache } from '@/utils/item_fetch_cache_invalidate';
+import { publishItemEvent } from '@/utils/publish_item_event';
+
+/**
+ * After-commit side effects of a guardian promotion (`draft` → `live`), shared
+ * by the verify and finalize handlers; `accept_profile_consent.ts` does the
+ * same.
+ *
+ * Runs after the transaction, never inside it: an event published pre-commit
+ * lets the search worker re-index the stale `draft`. Best-effort: the promotion
+ * is committed, so a Redis or cache failure must not turn it into a 500; the
+ * signals-search reconciliation sweep is the backstop.
+ */
+async function afterGuardianPromotion(
+  body: { network: string; item_domain: string; item_type: string; item_id: string },
+  log: FastifyRequest['log'],
+): Promise<void> {
+  // Both item read caches (1s local, domain-TTL inter-instance) hold a stale `draft`.
+  await invalidateItemFetchCache(body.network, body.item_domain).catch((err) =>
+    log.warn({ err }, 'cache invalidation after guardian profile-consent promotion failed'),
+  );
+  // signals-search reads are live-only, so an unpublished promotion keeps the
+  // profile out of search.
+  await publishItemEvent(
+    {
+      item_network: body.network,
+      item_domain: body.item_domain,
+      item_type: body.item_type,
+      item_id: body.item_id,
+      op: 'upsert',
+    },
+    log,
+  ).catch((err) =>
+    log.warn({ err }, 'item event publish after guardian profile-consent promotion failed'),
+  );
+}
 
 const profileScope = (userId: string, itemId: string) => `${userId}:profile:${itemId}`;
 // Pre-create OTP is scoped to the ward + network + domain (no item yet). The
@@ -193,6 +229,7 @@ const finalize_handler = async (
     await redis.set(tokenKey, '1', 'EX', PRECREATE_TOKEN_TTL_SEC); // allow retry
     return reply.code(500).send({ error: 'CONSENT_WRITE_FAILED', message: 'Failed to record guardian profile consent' });
   }
+  if (promoted) await afterGuardianPromotion(body, request.log);
   return reply.code(200).send({ promoted });
 };
 
@@ -267,5 +304,6 @@ const verify_handler = async (request: VerifyReq, reply: FastifyReply) => {
     request.log.error({ err }, 'Failed to write guardian profile consent');
     return reply.code(500).send({ error: 'CONSENT_WRITE_FAILED', message: 'Failed to record guardian profile consent' });
   }
+  if (promoted) await afterGuardianPromotion(body, request.log);
   return reply.code(200).send({ verified: true, promoted });
 };

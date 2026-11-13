@@ -27,21 +27,16 @@ interface UseMatchScoreReturn {
   clearCache: () => void;
 }
 
-// #394: `/discover` already returns a per-item relevance score (the SAME
-// cosine-similarity quantity `/v1/relevance` computes), raw ~0-1, on
-// `networkItem.score` (see `item-api.ts`). Seed the badge with it — scaled to
-// the 0-10 internal scale the rest of match-score assumes
-// (`formatScorePercentage`/`getMatchScoreBand`) — so the card shows a % upfront
-// instead of requiring a click. It has no `confidence`/`signals`/`reasoning`
-// (those only come from `/v1/relevance`); `source: 'discover'` marks it as
-// such so badge/modal know to hide the confidence line. Absent on native
-// (non-discover) items, in which case this returns null and the current
-// click-to-fetch flow (`calculate` → `/v1/relevance`) is unchanged.
+// `/discover` items carry a relevance score already rescaled to 0-100 by
+// `fetchDiscover`, so the badge shows it up front. It has no confidence,
+// signals or reasoning (those come from `/v1/relevance`); `source: 'discover'`
+// tells the badge to hide the confidence line. Native items have no score and
+// keep the click-to-fetch flow.
 function seedFromDiscoverScore(networkItem: Item): MatchScoreResult | null {
   if (networkItem.score == null) return null;
   return {
     provider: 'discover',
-    score: networkItem.score * 10,
+    score: networkItem.score,
     source: 'discover',
   };
 }
@@ -66,14 +61,8 @@ export function useMatchScore({
     [localItem?.item_id, networkItem.item_id]
   );
 
-  // The score is specific to the (local profile, destination) pair. When the
-  // pair changes — most commonly because the user switches their active profile
-  // — a previously displayed score was computed against the OLD local profile
-  // and is no longer valid, so clear it. The card falls back to the discover
-  // seed (if `networkItem.score` is present) or "See Match Score", and the
-  // user re-triggers a calculation for the new pair (which still hits the
-  // per-pair localStorage cache on repeat). Without this, the stale score
-  // badge lingers after a profile switch.
+  // A score belongs to one (local profile, destination) pair, so a profile
+  // switch clears it back to the discover seed.
   useEffect(() => {
     setScore(seedFromDiscoverScore(networkItem));
     setError(null);
@@ -91,7 +80,6 @@ export function useMatchScore({
     setError(null);
 
     try {
-      // Check cache first (unless skipCache is true)
       if (!skipCache) {
         const cachedResult = getCachedMatchScore(
           cacheKey.localItemId,
@@ -105,7 +93,6 @@ export function useMatchScore({
         }
       }
 
-      // Fetch from API
       const payload = {
         itemA: itemToSnapshot(localItem),
         itemB: itemToSnapshot(networkItem),
@@ -113,7 +100,6 @@ export function useMatchScore({
 
       const result = await calculateMatchScore(payload);
       
-      // Cache the result
       setCachedMatchScore(cacheKey.localItemId, cacheKey.networkItemId, result);
       
       setScore(result);
@@ -128,10 +114,8 @@ export function useMatchScore({
   }, [localItem, networkItem, cacheKey, skipCache]);
 
   const recalculate = useCallback(async () => {
-    // Clear cache for this specific pair
     clearMatchScoreCache(cacheKey.localItemId, cacheKey.networkItemId);
     setCached(false);
-    // Calculate fresh
     await calculate();
   }, [cacheKey.localItemId, cacheKey.networkItemId, calculate]);
 

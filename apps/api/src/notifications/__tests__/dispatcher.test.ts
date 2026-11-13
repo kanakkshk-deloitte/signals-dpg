@@ -22,24 +22,26 @@ function createEvent(overrides: Partial<NotificationEvent> = {}): NotificationEv
 
 function makeDeps(overrides: Partial<DispatcherDeps> = {}): {
   deps: DispatcherDeps;
-  calls: Parameters<DispatcherDeps['notify']>[0][];
+  calls: Parameters<DispatcherDeps['sendEmail']>[0][];
   skips: string[];
 } {
-  const calls: Parameters<DispatcherDeps['notify']>[0][] = [];
+  const calls: Parameters<DispatcherDeps['sendEmail']>[0][] = [];
   const skips: string[] = [];
   const deps: DispatcherDeps = {
-    notify: vi.fn(async (req) => {
-      calls.push(req);
+    sendEmail: vi.fn(async (args) => {
+      calls.push(args);
+      return { ok: true };
     }),
     resolveEmail: vi.fn(async (userId: string) => `${userId}@example.com`),
     // Default: counterparty is a seeker → no name resolved.
     resolveCounterpartyName: vi.fn(async () => null),
     brand: {
       brandName: 'Blue Dot',
-      fromEmail: 'no-reply@blue.example',
-      replyTo: 'support@blue.example',
-      ctaUrl: 'https://app.example.com/auth/login',
     },
+    resolveCtaUrl: (domain: string) =>
+      domain === 'seeker'
+        ? 'https://seeker.example.org/auth/login'
+        : 'https://provider.example.org/auth/login',
     log: vi.fn(),
     onSkip: vi.fn((reason: string) => {
       skips.push(reason);
@@ -57,21 +59,14 @@ describe('DirectDispatcher', () => {
     expect(calls).toHaveLength(2);
 
     // INBOUND_REQUEST → provider (target); provider-facing connect copy.
-    const inbound = calls.find((c) => c.dedupe_id.endsWith('INBOUND_REQUEST'));
+    const inbound = calls.find((c) => c.dedupeId?.endsWith('INBOUND_REQUEST'));
     expect(inbound).toMatchObject({
-      channel: 'email',
-      template_id: 'basic_email',
+      caseId: 'action.connect.provider.inbound_request',
       to: 'user-target@example.com',
-      priority: 'other',
-      dedupe_id: 'action-1:0:INBOUND_REQUEST',
-    });
-    expect(inbound?.variables).toMatchObject({
       fromName: 'Blue Dot',
-      fromEmail: 'no-reply@blue.example',
-      replyTo: 'support@blue.example',
-      subject: 'A seeker wants to avail your service',
+      dedupeId: 'action-1:0:INBOUND_REQUEST',
     });
-    expect(inbound?.variables.html).toContain('Blue Dot');
+    expect(inbound?.variables?.name).toBe('the service provider');
   });
 
   it('skips and counts a side whose owner has no user id (no throw)', async () => {
@@ -84,7 +79,7 @@ describe('DirectDispatcher', () => {
 
     // only the source-side OUTBOUND_REQUEST goes out
     expect(calls).toHaveLength(1);
-    expect(calls[0].dedupe_id).toBe('action-1:0:OUTBOUND_REQUEST');
+    expect(calls[0].dedupeId).toBe('action-1:0:OUTBOUND_REQUEST');
     expect(skips).toContain('no_user_id');
   });
 
@@ -102,9 +97,9 @@ describe('DirectDispatcher', () => {
     expect(skips).toContain('no_email');
   });
 
-  it('never throws when notify rejects (fire-and-forget)', async () => {
+  it('never throws when sendEmail rejects (fire-and-forget)', async () => {
     const { deps } = makeDeps({
-      notify: vi.fn(async () => {
+      sendEmail: vi.fn(async () => {
         throw new Error('NS down');
       }),
     });
@@ -124,11 +119,55 @@ describe('DirectDispatcher', () => {
       createEvent({ lifecycle: 'status', status: 'accepted', updateCount: 1 }),
     );
 
-    // INBOUND_STATUS → source (seeker); seeker-facing connect copy uses {name}.
-    const inboundStatus = calls.find((c) => c.dedupe_id.endsWith('INBOUND_STATUS'));
+    // INBOUND_STATUS → source (seeker); seeker-facing connect copy uses {{name}}.
+    const inboundStatus = calls.find((c) => c.dedupeId?.endsWith('INBOUND_STATUS'));
     expect(inboundStatus?.to).toBe('user-source@example.com');
-    expect(inboundStatus?.variables.subject).toBe(
-      'Acme Services has responded to your connection request',
+    expect(inboundStatus?.caseId).toBe('action.connect.seeker.inbound_status');
+    expect(inboundStatus?.variables?.name).toBe('Acme Services');
+  });
+
+  it('falls back to FALLBACK_SERVICE_NAME when the counterparty name is null/empty', async () => {
+    const { deps, calls } = makeDeps({
+      resolveCounterpartyName: vi.fn(async () => null),
+    });
+
+    await createDirectDispatcher(deps).dispatch(
+      createEvent({ lifecycle: 'status', status: 'accepted', updateCount: 1 }),
     );
+
+    const inboundStatus = calls.find((c) => c.dedupeId?.endsWith('INBOUND_STATUS'));
+    expect(inboundStatus?.variables?.name).toBe('the service provider');
+  });
+
+  it('sends each side to its OWN portal, not the counterparty portal', async () => {
+    const { deps, calls } = makeDeps();
+    // source = seeker, target = provider (see createEvent).
+    await createDirectDispatcher(deps).dispatch(createEvent());
+
+    const inbound = calls.find((c) => c.dedupeId?.endsWith('INBOUND_REQUEST'));
+    const outbound = calls.find((c) => c.dedupeId?.endsWith('OUTBOUND_REQUEST'));
+
+    // INBOUND_REQUEST goes to the TARGET (provider) → provider portal.
+    expect(inbound?.ctaUrl).toBe('https://provider.example.org/auth/login');
+    // OUTBOUND_REQUEST goes to the SOURCE (seeker) → seeker portal.
+    expect(outbound?.ctaUrl).toBe('https://seeker.example.org/auth/login');
+  });
+
+  it('skips a recipient whose domain resolves to no URL rather than sending a dead link', async () => {
+    // Reachable once the gate accepts a map-only config: UI_HOST_BINDINGS is
+    // set (so the gate passes) but FRONTEND_BASE_URL is not, and this
+    // recipient's domain is absent from the map. `dispatch_email` would render
+    // `ctaUrl: args.ctaUrl ?? ''` into `<a href="">` — an email whose only
+    // call to action is a broken button.
+    const { deps, calls, skips } = makeDeps({
+      resolveCtaUrl: (domain: string) =>
+        domain === 'seeker' ? 'https://seeker.example.org/auth/login' : undefined,
+    });
+
+    await createDirectDispatcher(deps).dispatch(createEvent());
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.ctaUrl).toBe('https://seeker.example.org/auth/login');
+    expect(skips).toContain('no_cta_url');
   });
 });

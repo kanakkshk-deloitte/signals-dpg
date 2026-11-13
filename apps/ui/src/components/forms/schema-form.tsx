@@ -1,14 +1,26 @@
 import * as React from 'react';
 import Form from '@rjsf/shadcn';
 import validator from '@rjsf/validator-ajv8';
-import type { RJSFSchema, UiSchema, RegistryWidgetsType, ObjectFieldTemplateProps } from '@rjsf/utils';
+import { useTranslation } from 'react-i18next';
+import type {
+  RJSFSchema,
+  UiSchema,
+  RegistryWidgetsType,
+  ObjectFieldTemplateProps,
+  RJSFValidationError,
+} from '@rjsf/utils';
+import { applyUriPatterns, collectUriFieldKeys, URI_FIELD_MARKER } from '@dpg/schemas/uri_fields';
 import { DatePickerWidget } from './custom-widgets/date-picker-widget';
 import { LocationAutocompleteWidget } from './custom-widgets/location-autocomplete-widget';
 import { MultiLocationAutocompleteWidget } from './custom-widgets/multi-location-autocomplete-widget';
 import { ReferenceAutocompleteWidget } from './custom-widgets/reference-autocomplete-widget';
+import { ClearableSelectWidget } from './custom-widgets/clearable-select-widget';
 import CustomFieldTemplate from './custom-field-template';
 import { resolveFormLayout, type FormLayout } from '@/theme/form-layouts';
 import { resolveVisibleSchema } from '@/lib/show-if';
+import { filterErrorSchemaToVisited } from './field-error-visibility';
+import { FIELD_ERROR_MESSAGE_MARKER, resolvePatternErrorMessage } from './field-error-message';
+import { cn } from '@/lib/utils';
 
 interface RjsfError {
   property?: string;
@@ -17,11 +29,8 @@ interface RjsfError {
 }
 
 /**
- * Map an RJSF validation error to the DOM id RJSF assigns the offending field.
- * RJSF defaults to idPrefix "root" + idSeparator "_", so a property like
- * ".trip_window_start" becomes "root_trip_window_start" and ".items.0.name"
- * becomes "root_items_0_name". (RJSF v6 already points `property` at the field
- * for `required` errors, so no special-casing is needed.)
+ * Maps an RJSF error to the field's DOM id: ".items.0.name" becomes
+ * "root_items_0_name" (RJSF's default idPrefix and idSeparator).
  */
 function fieldIdFromError(error: RjsfError): string {
   const segments = (error.property ?? '')
@@ -32,20 +41,16 @@ function fieldIdFromError(error: RjsfError): string {
 }
 
 /**
- * `focusOnFirstError` handler: on a blocked submit RJSF passes us the first
- * error; we smooth-scroll its field to the centre of the viewport and focus it,
- * so the user is taken to the problem instead of nothing happening. Resolution
- * mirrors RJSF's own (exact id, then a prefix match) because some shadcn widgets
- * put the field id on a wrapping button rather than a native input.
+ * `focusOnFirstError` handler: scrolls the first invalid field to the centre
+ * and focuses it.
  */
 function focusErrorField(container: HTMLElement | null, error: RjsfError): void {
   if (!container) return;
   const elementId = fieldIdFromError(error);
   const form = container.querySelector('form');
 
-  // Resolve like RJSF does: the form's elements collection matches by id OR
-  // name, with a prefix fallback for widgets (e.g. shadcn radios/selects) that
-  // put the id on a wrapping button rather than a native input.
+  // Resolve like RJSF does: by id or name, then a prefix match for shadcn
+  // widgets that put the id on a wrapping button.
   const named = form?.elements.namedItem(elementId) ?? null;
   let candidate: Element | null =
     named instanceof RadioNodeList ? (named.item(0) as Element | null) : named;
@@ -74,10 +79,8 @@ function focusErrorField(container: HTMLElement | null, error: RjsfError): void 
 interface SchemaFormProps {
   schema: RJSFSchema;
   /**
-   * Initial form values. MUST be referentially stable (e.g. React state or a
-   * memoized object) — the controlled form re-seeds its internal state whenever
-   * this prop's identity changes, so an inline object literal would discard the
-   * user's edits on every render.
+   * Initial values. Must be referentially stable: the form re-seeds whenever
+   * this identity changes, so an inline literal discards edits every render.
    */
   formData?: Record<string, unknown>;
   onSubmit: (data: Record<string, unknown>) => void;
@@ -89,26 +92,33 @@ interface SchemaFormProps {
   id?: string;
   hideSubmit?: boolean;
   /**
-   * Called with the AJV validity of the current form data whenever data changes
-   * and once on mount. Only computed when this prop is provided.
+   * Called with AJV validity on mount and whenever data changes; `detail`
+   * says why it is invalid. Only computed when provided.
    */
-  onValidityChange?: (isValid: boolean) => void;
+  onValidityChange?: (isValid: boolean, detail?: SchemaFormValidity) => void;
   domainId?: string;
   /**
-   * Network id, used with domainId to resolve the section layout. Domain ids
-   * (seeker/provider) collide across networks, so the layout is keyed on
-   * `${networkId}:${domainId}` — see resolveFormLayout.
+   * With `domainId`, resolves the section layout. Domain ids collide across
+   * networks, so layouts are keyed `${networkId}:${domainId}`.
    */
   networkId?: string;
   formContext?: Record<string, unknown>;
+  /**
+   * Heading level for section titles, so they follow the page's own heading
+   * without skipping a level.
+   */
+  sectionHeadingLevel?: 2 | 3;
 }
 
-// Root-only ObjectFieldTemplate that renders section headers + two-column grid.
-// For nested objects (non-root) it falls back to the default RJSF column layout.
-function SectionedObjectFieldTemplate(layout: FormLayout | undefined) {
+// ObjectFieldTemplate rendering layout sections, pairing adjacent `twoColumn`
+// fields side by side.
+function SectionedObjectFieldTemplate(
+  layout: FormLayout | undefined,
+  headingLevel: 2 | 3 = 3,
+) {
+  const SectionHeading = headingLevel === 2 ? 'h2' : 'h3';
   return function ObjectFieldTemplate(props: ObjectFieldTemplateProps) {
     if (!layout) {
-      // No layout config — render properties in a simple column
       return (
         <div className="space-y-4">
           {props.properties.map((element) => (
@@ -118,12 +128,10 @@ function SectionedObjectFieldTemplate(layout: FormLayout | undefined) {
       );
     }
 
-    // Build a lookup of name → element
     const elementMap = new Map(props.properties.map((el) => [el.name, el]));
     const rendered = new Set<string>();
 
-    // Track which section is being rendered so we can number them and show
-    // the divider only between sections (not above the first one).
+    // Numbers only sections that render.
     let visibleSectionIndex = 0;
 
     return (
@@ -135,7 +143,6 @@ function SectionedObjectFieldTemplate(layout: FormLayout | undefined) {
 
           if (sectionElements.length === 0) return null;
 
-          // Group into rows: pairs from twoColumn list go side-by-side, rest go full-width
           const rows: Array<typeof sectionElements> = [];
           let i = 0;
           while (i < sectionElements.length) {
@@ -158,13 +165,13 @@ function SectionedObjectFieldTemplate(layout: FormLayout | undefined) {
 
           return (
             <section key={section.title}>
-              {/* Section header: numbered badge + title + accent bar + divider line below */}
+              {/* Section header */}
               <div className="mb-5">
                 <div className="flex items-center gap-3">
                   <div className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary/10 text-xs font-bold text-primary">
                     {sectionNum}
                   </div>
-                  <h3 className="text-base font-semibold text-foreground tracking-tight">{section.title}</h3>
+                  <SectionHeading className="text-base font-semibold text-foreground tracking-tight">{section.title}</SectionHeading>
                 </div>
                 <div className="mt-3 h-px bg-gradient-to-r from-border via-border/60 to-transparent" />
               </div>
@@ -183,7 +190,7 @@ function SectionedObjectFieldTemplate(layout: FormLayout | undefined) {
           );
         })}
 
-        {/* Render any fields not covered by sections */}
+        {/* Fields not covered by any section */}
         {props.properties
           .filter((el) => !rendered.has(el.name))
           .map((el) => (
@@ -194,8 +201,7 @@ function SectionedObjectFieldTemplate(layout: FormLayout | undefined) {
   };
 }
 
-// Walks a local JSON pointer like "#/$defs/support_category" against the
-// root schema. Returns the referenced subschema or undefined if not found.
+// Resolves a local JSON pointer ("#/$defs/x") against the root schema.
 function resolveLocalRef(schema: RJSFSchema, ref: string): RJSFSchema | undefined {
   if (!ref.startsWith('#/')) return undefined;
   const parts = ref.slice(2).split('/');
@@ -217,9 +223,8 @@ function generateUiSchema(
 ): UiSchema {
   const uiSchema: Record<string, unknown> = {};
 
-  // Suppress the JSON-Schema-supplied root title/description. Surrounding
-  // page chrome (CardTitle / CardDescription) already announces the form;
-  // the inline duplicate adds noise. Section headers come from SectionedObjectFieldTemplate.
+  // The page chrome already titles the form, so suppress the schema's root
+  // title and description.
   uiSchema['ui:title'] = '';
   uiSchema['ui:description'] = '';
 
@@ -231,7 +236,11 @@ function generateUiSchema(
   };
 
   for (const [key, prop] of Object.entries(schema.properties ?? {})) {
-    const typed = prop as RJSFSchema & { private?: boolean; format?: string };
+    const typed = prop as RJSFSchema & {
+      private?: boolean;
+      format?: string;
+      [URI_FIELD_MARKER]?: unknown;
+    };
 
     if (mode === 'compact' && typed.private === true) {
       uiSchema[key] = { 'ui:widget': 'hidden' };
@@ -246,13 +255,18 @@ function generateUiSchema(
       uiSchema[key] = { 'ui:placeholder': 'email@example.com' };
     }
 
+    // A link field (`x-uri`) gets a sample URL as its prompt. Merged, since
+    // earlier blocks may have written this key.
+    if (typed[URI_FIELD_MARKER] === true) {
+      uiSchema[key] = { ...(uiSchema[key] as object), 'ui:placeholder': 'https://example.com' };
+    }
+
     if (typed.enum && typed.type === 'string') {
       uiSchema[key] = { 'ui:placeholder': 'Select...' };
     }
 
-    // Render array-of-enums as a single multi-select (FancyMultiSelect:
-    // Popover + cmdk Command + Badge chips) instead of RJSF's default stack
-    // of single-selects with up/down/delete buttons per index.
+    // Array-of-enums renders as one multi-select (FancyMultiSelect) instead of
+    // RJSF's stack of per-index single-selects.
     if (typed.type === 'array' && typed.items) {
       const items = typed.items as RJSFSchema & { $ref?: string };
       let itemEnum = items.enum;
@@ -268,9 +282,7 @@ function generateUiSchema(
       }
     }
 
-    // A field-level `placeholder` on the schema (network.json) wins over the
-    // generic defaults above ('Select...', email sample) so each field can
-    // carry its own prompt text.
+    // A field-level `placeholder` in the schema wins over the defaults above.
     const fieldPlaceholder = (typed as { placeholder?: unknown }).placeholder;
     if (typeof fieldPlaceholder === 'string' && fieldPlaceholder.length > 0) {
       uiSchema[key] = {
@@ -279,11 +291,10 @@ function generateUiSchema(
       };
     }
 
-    // External reference vocabulary (network.json `x-reference-source`): render
-    // an autocomplete backed by a reference dataset instead of an inline enum,
-    // so large lists (colleges/institutes/trades) stay out of the schema. The
-    // marker is either a bare `"source"` string or `{ source, subtitle }`, where
-    // `subtitle` is the ordered option fields shown under each result.
+    // `x-reference-source`: an autocomplete over a reference dataset, so large
+    // lists stay out of the schema. Either a `"source"` string or
+    // `{ source, subtitle }`, where `subtitle` lists the option fields shown
+    // under each result.
     const referenceMarker = (typed as { 'x-reference-source'?: unknown })['x-reference-source'];
     let referenceSource: string | undefined;
     let subtitleFields: string[] | undefined;
@@ -333,6 +344,9 @@ const widgets: RegistryWidgetsType = {
   'location-autocomplete': LocationAutocompleteWidget,
   'location-multi': MultiLocationAutocompleteWidget,
   'reference-autocomplete': ReferenceAutocompleteWidget,
+  // Overrides the theme's `SelectWidget` by name, so every enum field gets a
+  // clear button when optional.
+  SelectWidget: ClearableSelectWidget,
 };
 
 function stripMetaSchema(schema: RJSFSchema): RJSFSchema {
@@ -340,12 +354,10 @@ function stripMetaSchema(schema: RJSFSchema): RJSFSchema {
   return rest as RJSFSchema;
 }
 
-// Walks the schema tree, replacing local `{ $ref: "#/..." }` nodes with the
-// referenced subschema and ensuring array-of-enum fields have `uniqueItems:
-// true`. RJSF's `multiple=true` (which routes SelectWidget to FancyMultiSelect)
-// requires the items enum to be visible at the field level AND uniqueItems
-// set — without these, an `ui:widget: 'select'` array renders as a non-functional
-// single-select with no options.
+// Inlines local `$ref`s, strips the custom keywords below, and sets `uniqueItems:
+// true` on array-of-enum fields. RJSF's multi-select needs the items enum
+// inline and uniqueItems set; otherwise the field renders as an empty
+// single-select.
 function normalizeSchemaForRjsf(schema: RJSFSchema, rootSchema?: RJSFSchema): RJSFSchema {
   const root = rootSchema ?? schema;
   if (typeof schema !== 'object' || schema === null) return schema;
@@ -364,28 +376,20 @@ function normalizeSchemaForRjsf(schema: RJSFSchema, rootSchema?: RJSFSchema): RJ
 
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(schema as Record<string, unknown>)) {
-    // Strip the custom `location` MARKER (value "primary" | "secondary"), which is consumed
-    // by generateUiSchema, not real JSON Schema. Must NOT strip a property whose
-    // NAME is "location" (its value is the field's schema object, not a string).
+    // The `location` marker ("primary" | "secondary"), not a property named
+    // "location", whose value is a schema object.
     if (key === 'location' && (value === 'primary' || value === 'secondary')) continue;
-    // Strip the custom `x-show-if` keyword — consumed by resolveVisibleSchema before
-    // this point; ajv must never see it.
     if (key === 'x-show-if') continue;
-    // Strip the custom `x-form-layout` keyword — consumed by the section
-    // renderer (read off the raw schema); ajv/RJSF must never see it.
     if (key === 'x-form-layout') continue;
-    // Strip the custom field-level `placeholder` keyword (string value) — it's
-    // mapped to `ui:placeholder` by generateUiSchema, so ajv must not see it.
-    // The `typeof string` guard avoids stripping a property NAMED "placeholder".
+    // The string guard keeps a property named "placeholder".
     if (key === 'placeholder' && typeof value === 'string') continue;
-    // Strip the custom `x-reference-source` marker (string or `{source,subtitle}`
-    // object) — it's mapped to the reference-autocomplete widget by
-    // generateUiSchema, so ajv must not see it.
     if (key === 'x-reference-source') continue;
+    if (key === FIELD_ERROR_MESSAGE_MARKER) continue;
+    // `x-uri` has already become a `pattern` via applyUriPatterns.
+    if (key === URI_FIELD_MARKER) continue;
     result[key] = normalizeSchemaForRjsf(value as RJSFSchema, root);
   }
 
-  // After children are normalized, force uniqueItems on array-of-enum fields.
   const normalized = result as RJSFSchema & { type?: string; items?: RJSFSchema; uniqueItems?: boolean };
   if (
     normalized.type === 'array' &&
@@ -400,10 +404,6 @@ function normalizeSchemaForRjsf(schema: RJSFSchema, rootSchema?: RJSFSchema): RJ
   return normalized as RJSFSchema;
 }
 
-/**
- * Pure helper for AJV-backed validity checking. Extracted so it can be
- * unit-tested deterministically without mounting the full form.
- */
 export function isSchemaFormValid(
   v: typeof validator,
   schema: RJSFSchema,
@@ -411,6 +411,65 @@ export function isSchemaFormValid(
 ): boolean {
   return v.isValid(schema, data, schema);
 }
+
+/** Why a form is invalid, so callers can say which of the two it is. */
+export interface SchemaFormValidity {
+  valid: boolean;
+  /** Required fields the user has not filled in. */
+  missingRequired: number;
+  /** Fields that hold a value which breaks its own rule (pattern, format, …). */
+  invalidValues: number;
+}
+
+/** Resolve an RJSF error `property` (".a", ".a.0") against the form data. */
+function valueAtProperty(data: Record<string, unknown>, property: string | undefined): unknown {
+  if (!property) return undefined;
+  const segments = property.replace(/\[(\w+)\]/g, '.$1').split('.').filter(Boolean);
+  let cursor: unknown = data;
+  for (const segment of segments) {
+    if (cursor === null || typeof cursor !== 'object') return undefined;
+    cursor = (cursor as Record<string, unknown>)[segment];
+  }
+  return cursor;
+}
+
+function isBlank(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'string') return value.trim().length === 0;
+  if (Array.isArray(value)) return value.length === 0;
+  return false;
+}
+
+/**
+ * Ajv's `if` error only summarises a conditional branch ("must match "then"
+ * schema") on top of the field-level errors, so counting and display skip it.
+ */
+function isConditionalSummary(error: { name?: string }): boolean {
+  return error.name === 'if';
+}
+
+/**
+ * Splits AJV errors into missing required fields and invalid values, which
+ * need different copy. A blank value counts as missing even when AJV reports
+ * `minLength`.
+ */
+export function getSchemaFormValidity(
+  v: typeof validator,
+  schema: RJSFSchema,
+  data: Record<string, unknown>,
+): SchemaFormValidity {
+  const errors = v.validateFormData(data, schema).errors.filter((e) => !isConditionalSummary(e));
+  let missingRequired = 0;
+  let invalidValues = 0;
+  for (const error of errors) {
+    const blank = isBlank(valueAtProperty(data, error.property));
+    if (error.name === 'required' || blank) missingRequired += 1;
+    else invalidValues += 1;
+  }
+  return { valid: errors.length === 0, missingRequired, invalidValues };
+}
+
+
 
 export function SchemaForm({
   schema,
@@ -427,32 +486,33 @@ export function SchemaForm({
   domainId,
   networkId,
   formContext,
-}: SchemaFormProps) {
-  // Base schema (meta stripped) still carries `x-show-if` so the evaluator can read it.
+  sectionHeadingLevel = 3,
+}: Readonly<SchemaFormProps>) {
+  const { t } = useTranslation();
+
+  // Still carries `x-show-if` for the visibility evaluator.
   const baseSchema = React.useMemo(() => stripMetaSchema(schema), [schema]);
 
-  // Controlled form data. Seeded from the prop, with hidden values pre-cleared so
-  // an edit-mode load whose stored control no longer matches starts clean.
+  // Seeded with hidden values cleared, so an edit-mode load starts clean.
   const [data, setData] = React.useState<Record<string, unknown>>(
     () => resolveVisibleSchema(baseSchema, formData ?? {}).formData,
   );
 
-  // Re-seed when the incoming formData identity changes (edit mode loads async).
-  // Parents pass a stable formData identity except on (re)load, so this does not
-  // fire while the user is typing.
+  // Re-seed when the formData identity changes (async edit-mode load).
   React.useEffect(() => {
     setData(resolveVisibleSchema(baseSchema, formData ?? {}).formData);
   }, [baseSchema, formData]);
 
   const resolved = resolveVisibleSchema(baseSchema, data);
-  // Signature of the visible set. The normalized schema + uiSchema are memoized on
-  // this so their object identity is stable while the visible set is unchanged —
-  // otherwise RJSF remounts fields and text inputs lose focus on every keystroke.
+  // The schema and uiSchema are memoized on the visible set; a new identity
+  // per render makes RJSF remount fields and inputs lose focus on each key.
   const hiddenKey = resolved.hidden.join('|');
 
   const rjsfSchema = React.useMemo(
-    () => normalizeSchemaForRjsf(resolved.schema),
-    // resolved.schema depends only on (schema, visible set); key on hiddenKey.
+    // applyUriPatterns first, so the `x-uri` pattern exists before the marker
+    // is stripped.
+    () => normalizeSchemaForRjsf(applyUriPatterns(resolved.schema)),
+    // resolved.schema depends only on schema and the visible set.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [schema, hiddenKey],
   );
@@ -464,43 +524,118 @@ export function SchemaForm({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [schema, hiddenKey, mode, hideSubmit, submitButtonText]);
 
-  // Keep a ref to the latest onValidityChange so the validity effect below does
-  // not depend on the callback's identity. This prevents a render loop when a
-  // consumer passes an unstable function reference (e.g. an inline arrow).
+  const uriFieldKeys = React.useMemo(() => new Set(collectUriFieldKeys(baseSchema)), [baseSchema]);
+
+  /**
+   * Readable copy for a failed `pattern`, since AJV's message is the raw
+   * regex: the field's `x-error-message`, else the `x-uri` default, else a
+   * generic. Used by both error paths, as `extraErrors` bypasses
+   * `transformErrors`.
+   */
+  const patternMessageFor = React.useCallback(
+    (property: string): string => {
+      const properties = (baseSchema.properties ?? {}) as Record<string, Record<string, unknown>>;
+      return resolvePatternErrorMessage(properties[property], uriFieldKeys.has(property), {
+        uri: t('form.invalid_url', 'Enter a valid link, e.g. https://example.com'),
+        generic: (label) => t('form.invalid_format', 'Please enter a valid {{field}}.', { field: label }),
+      });
+    },
+    [baseSchema, uriFieldKeys, t],
+  );
+
+  const transformErrors = React.useCallback(
+    (errors: RJSFValidationError[]) =>
+      errors.filter((error) => !isConditionalSummary(error)).map((error) => {
+        if (error.name !== 'pattern') return error;
+        const field = (error.property ?? '').replace(/^\./, '').split('.')[0];
+        const message = patternMessageFor(field);
+        // `stack` is what RJSF's ErrorList renders, so rewrite it too.
+        return { ...error, message, stack: `${error.property} ${message}` };
+      }),
+    [patternMessageFor],
+  );
+
+  // A ref, so an inline-arrow callback does not re-fire the effect below in a
+  // render loop.
   const onValidityChangeRef = React.useRef(onValidityChange);
   React.useEffect(() => {
     onValidityChangeRef.current = onValidityChange;
   });
 
-  // Report AJV validity to the consumer once on mount and whenever data or schema
-  // changes. Depends only on [rjsfSchema, data] — not on the callback ref — so it
-  // never re-fires due to an unstable callback identity.
   React.useEffect(() => {
     const cb = onValidityChangeRef.current;
-    if (cb) cb(isSchemaFormValid(validator, rjsfSchema, data));
+    if (!cb) return;
+    const detail = getSchemaFormValidity(validator, rjsfSchema, data);
+    cb(detail.valid, detail);
   }, [rjsfSchema, data]);
 
-  // Section layout is schema-driven first: an `x-form-layout` block on the item
-  // schema (network.json) is the single source of truth, so field add/remove/
-  // reorder needs no code change. Falls back to the code-side `formLayouts` map
-  // (keyed network:domain) for networks not yet migrated to x-form-layout.
+  // Visited fields by RJSF id ("root_phone"); only these get errors.
+  const [touchedFieldIds, setTouchedFieldIds] = React.useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [submitAttempted, setSubmitAttempted] = React.useState(false);
+
+  const markTouched = React.useCallback((fieldId: string) => {
+    setTouchedFieldIds((prev) => {
+      if (prev.has(fieldId)) return prev;
+      const next = new Set(prev);
+      next.add(fieldId);
+      return next;
+    });
+  }, []);
+
+  // Reset on a schema swap so one form's touched set never leaks into another.
+  React.useEffect(() => {
+    setTouchedFieldIds(new Set());
+    setSubmitAttempted(false);
+  }, [schema]);
+
+  // Display errors via `extraErrors`, limited to visited fields. `liveValidate`
+  // is off because it errors every invalid field at once and the theme reddens
+  // borders from `rawErrors`. RJSF still validates on submit.
+  const extraErrors = React.useMemo(() => {
+    const { errors, errorSchema } = validator.validateFormData(data, rjsfSchema);
+    const patternFields = new Set(
+      errors
+        .filter((error) => error.name === 'pattern')
+        .map((error) => (error.property ?? '').replace(/^\./, '').split('.')[0])
+        .filter(Boolean),
+    );
+    const readable: Record<string, unknown> = { ...errorSchema };
+    // Drop the root-level `if` summary.
+    const ifMessages = new Set(errors.filter(isConditionalSummary).map((e) => e.message));
+    const rootErrors = (readable.__errors as string[] | undefined)?.filter((m) => !ifMessages.has(m));
+    if (rootErrors && rootErrors.length > 0) readable.__errors = rootErrors;
+    else delete readable.__errors;
+    for (const property of patternFields) {
+      readable[property] = { __errors: [patternMessageFor(property)] };
+    }
+    return filterErrorSchemaToVisited(readable as typeof errorSchema, touchedFieldIds, submitAttempted);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rjsfSchema, data, touchedFieldIds, submitAttempted, patternMessageFor]);
+
+  // The schema's `x-form-layout` wins; the code-side `formLayouts` map is the
+  // fallback for networks without one.
   const activeLayout: FormLayout | undefined =
     (schema as { 'x-form-layout'?: FormLayout })['x-form-layout'] ??
     resolveFormLayout(networkId, domainId);
 
-  // FieldTemplate applies to every form (red required marker). ObjectFieldTemplate
-  // (section layout) is added only when a layout is resolved.
   const templates = {
     FieldTemplate: CustomFieldTemplate,
     ...(activeLayout
-      ? { ObjectFieldTemplate: SectionedObjectFieldTemplate(activeLayout) }
+      ? { ObjectFieldTemplate: SectionedObjectFieldTemplate(activeLayout, sectionHeadingLevel) }
       : {}),
   };
 
   const containerRef = React.useRef<HTMLDivElement>(null);
 
   return (
-    <div className={className} ref={containerRef}>
+    <div
+      // Left-align select triggers: `@rjsf/shadcn`'s FancySelect trigger is a
+      // <button>, which keeps the UA `text-align: center`.
+      className={cn('[&_button[aria-haspopup=listbox]]:text-left', className)}
+      ref={containerRef}
+    >
       <Form
         id={id}
         schema={rjsfSchema}
@@ -515,14 +650,21 @@ export function SchemaForm({
           const nextData = resolveVisibleSchema(baseSchema, (next ?? {}) as Record<string, unknown>).formData;
           setData(nextData);
         }}
+        onBlur={(fieldId) => markTouched(fieldId)}
         onSubmit={({ formData: submitted }) => {
+          setSubmitAttempted(true);
           if (submitted) onSubmit(submitted as Record<string, unknown>);
         }}
-        onError={(errors) => onError?.(errors)}
+        onError={(errors) => {
+          setSubmitAttempted(true);
+          onError?.(errors);
+        }}
+        transformErrors={transformErrors}
         focusOnFirstError={(error) =>
           focusErrorField(containerRef.current, error as RjsfError)
         }
         showErrorList={false}
+        extraErrors={extraErrors}
         liveValidate={false}
         noHtml5Validate
         omitExtraData

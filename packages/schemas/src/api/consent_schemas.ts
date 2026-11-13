@@ -3,11 +3,32 @@ import z from 'zod';
 export const UserConsentCategorySchema = z.enum(['terms', 'privacy']);
 
 export const ConsentStatusQuerySchema = z.object({ network: z.string().min(1) });
+
+const ConsentStatusVersionsSchema = z.object({
+  terms: z.array(z.number().int()),
+  privacy: z.array(z.number().int()),
+});
+
+/**
+ * The UNAUTHENTICATED pre-login status, keyed on a phone/email.
+ *
+ * Kept separate from `ConsentStatusResponseSchema` because it must never carry
+ * `variant`: that would tell anyone holding a phone number that it belongs to
+ * a minor.
+ */
+export const ConsentStatusByIdentifierResponseSchema = z.object({
+  statuses: ConsentStatusVersionsSchema,
+});
+
 export const ConsentStatusResponseSchema = z.object({
-  statuses: z.object({
-    terms: z.array(z.number().int()),
-    privacy: z.array(z.number().int()),
-  }),
+  statuses: ConsentStatusVersionsSchema,
+  /**
+   * Which document set applies to this user, resolved server-side from the
+   * recorded age; never client-supplied, or a client could choose its own
+   * terms. `statuses` are compared against the current version of this set,
+   * so a `u18_documents` version bump re-prompts a minor. Absent means `adult`.
+   */
+  variant: z.enum(['adult', 'u18']).optional(),
 });
 
 export const ConsentStatusByIdentifierQuerySchema = z.object({
@@ -29,6 +50,9 @@ export const ConsentAcceptBodySchema = z.object({
 export const ConsentAcceptResponseSchema = z.object({ recorded: z.number().int() });
 
 export type ConsentStatusResponse = z.infer<typeof ConsentStatusResponseSchema>;
+export type ConsentStatusByIdentifierResponse = z.infer<
+  typeof ConsentStatusByIdentifierResponseSchema
+>;
 export type ConsentAcceptBody = z.infer<typeof ConsentAcceptBodySchema>;
 export type ConsentStatusByIdentifierQuery = z.infer<typeof ConsentStatusByIdentifierQuerySchema>;
 

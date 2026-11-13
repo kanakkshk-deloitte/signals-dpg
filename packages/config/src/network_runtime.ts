@@ -56,6 +56,9 @@ export type NetworkConfig = {
   instances?: NetworkInstanceConfig[];
   cross_network_origins?: NetworkCrossOriginConfig[];
   actions?: Record<string, NetworkActionConfig>;
+  // Max concurrent open actions between any two items, counted in both
+  // directions and across action types. Unset means 1.
+  max_actions_per_pair?: number;
 };
 
 export type NetworkCrossOriginConfig = {

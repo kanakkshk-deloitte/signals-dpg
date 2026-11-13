@@ -15,6 +15,7 @@ export * from './admin/participant_decrypt';
 export * from './aggregator/dashboard';
 export * from './item_state_privacy';
 export * from './item_state_masking';
+export * from './uri_fields';
 export {
   findMetricCategoryAsymmetries,
   getActionInteraction,
@@ -23,12 +24,23 @@ export {
   getDomainItemSchema,
   getInstanceCustomItemSchemaUrl,
   getInteractionPiiRevealStatuses,
+  getInteractionExportRequesterDomains,
+  getInteractionColumnFields,
+  interactionInputOf,
+  type ActionInteractionInput,
+  type ActionRowSides,
+  getExportableCounterparties,
+  getExportableStatuses,
+  type ExportableCounterparty,
+  PROFILE_GO_LIVE_GATES,
+  type GoLiveGate,
   type MetricCategoryAsymmetry,
   type MetricCategoryEdge,
   NetworkConfigSchema,
   parseNetworkConfigDocument,
   type NetworkConfigDocument,
   validateAgainstJsonSchema,
+  JsonSchemaValidationError,
 } from './network_workflow';
 export {
   parseLocationFields,
