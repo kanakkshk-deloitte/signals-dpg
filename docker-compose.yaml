@@ -112,6 +112,7 @@ services:
       INSTANCE_SHARED_SECRET: ${INSTANCE_SHARED_SECRET:?INSTANCE_SHARED_SECRET must be set in .env and be at least 32 chars}
       AUTH_MIDDLEWARE_ENABLED: ${AUTH_MIDDLEWARE_ENABLED:-true}
       CREATE_TEST_OTP: "true"
+      SELF_SIGNUP_MODE: ${SELF_SIGNUP_MODE:-gated}
       VITE_NETWORK_ID: ${VITE_NETWORK_ID:-blue_dot}
       SERVED_DOMAINS: ${SERVED_DOMAINS:-blue_dot/seeker,blue_dot/provider}
       NETWORK_CONFIG_SOURCE: local

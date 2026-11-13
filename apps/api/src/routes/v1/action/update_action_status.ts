@@ -43,7 +43,7 @@ const BulkUpdateActionStatusBodySchema = z.array(z.unknown());
  * cannot be written, so the status update rolls back with it (fail-closed — the
  * PII-revealing accept is not applied without a consent record).
  */
-class ConsentWriteError extends Error {}
+class ConsentWriteError extends Error { }
 
 export const update_action_status: FastifyPluginAsyncZod = async function (fastify) {
   fastify.route({
@@ -229,6 +229,11 @@ export const update_action_status_handler = async (
       // (update_count === 0). Withdrawal is de-escalation, so it is not gated
       // on either side's liveness.
       const isCancellation = cancelStatuses.includes(body.action_status);
+      const isPostCompleteFeedback =
+        !isCancellation &&
+        existingAction.action_status === 'completed' &&
+        body.action_status === 'completed' &&
+        existingAction.source_item_owner === callerId;
 
       if (isCancellation) {
         if (existingAction.source_item_owner !== callerId) {
@@ -241,6 +246,13 @@ export const update_action_status_handler = async (
           throw new BulkItemFailure(
             'RECEIVER_ALREADY_ACTED',
             'Cannot cancel; the receiver has already responded to this request.',
+          );
+        }
+      } else if (isPostCompleteFeedback) {
+        if (!body.remarks?.trim()) {
+          throw new BulkItemFailure(
+            'FEEDBACK_REQUIRED',
+            'Feedback text is required when submitting post-completion feedback.',
           );
         }
       } else {
@@ -295,7 +307,46 @@ export const update_action_status_handler = async (
       // not be gated even if a network lists a cancel status in
       // reveals_pii_on_status.
       const requiresReceiverConsent =
-        !isCancellation && interaction.reveals_pii_on_status.includes(body.action_status);
+        !isCancellation &&
+        !isPostCompleteFeedback &&
+        interaction.reveals_pii_on_status.includes(body.action_status);
+
+      const nextRemarks = (() => {
+        if (!isPostCompleteFeedback) {
+          return body.remarks ?? existingAction.remarks;
+        }
+
+        const seekerFeedback = body.remarks?.trim();
+        if (!seekerFeedback) return existingAction.remarks;
+
+        const SEEKER_PREFIX = 'Seeker feedback: ';
+        const PROVIDER_PREFIX = 'Provider feedback: ';
+        const existing =
+          typeof existingAction.remarks === 'string'
+            ? existingAction.remarks.trim()
+            : '';
+
+        if (!existing) {
+          return `${SEEKER_PREFIX}${seekerFeedback}`;
+        }
+
+        // Backfill a provider label for legacy single-remark rows.
+        const normalized =
+          existing.startsWith(PROVIDER_PREFIX) || existing.startsWith(SEEKER_PREFIX)
+            ? existing
+            : `${PROVIDER_PREFIX}${existing}`;
+
+        // Replace prior seeker line if present; otherwise append a new one.
+        const seekerLineBreak = `\n${SEEKER_PREFIX}`;
+        if (normalized.includes(seekerLineBreak)) {
+          const providerPart = normalized.split(seekerLineBreak)[0];
+          return `${providerPart}${seekerLineBreak}${seekerFeedback}`;
+        }
+        if (normalized.startsWith(SEEKER_PREFIX)) {
+          return `${SEEKER_PREFIX}${seekerFeedback}`;
+        }
+        return `${normalized}${seekerLineBreak}${seekerFeedback}`;
+      })();
 
       // U18 guardian gate (Phase 5b). Scoped to exactly the accept / PII-
       // reveal stage — the same `requiresReceiverConsent` condition the
@@ -432,7 +483,7 @@ export const update_action_status_handler = async (
             .set({
               action_status: body.action_status,
               update_count: nextUpdateCount,
-              remarks: body.remarks ?? existingAction.remarks,
+              remarks: nextRemarks,
               updated_at: new Date(),
             })
             .where(
@@ -566,12 +617,12 @@ export const update_action_status_handler = async (
       const sourceItemSnapshot =
         updatedAction.source_item_instance_url === getCurrentApiBaseUrl()
           ? await fetchLocalItemSnapshot(db, {
-              item_network: updatedAction.source_item_network,
-              item_domain: updatedAction.source_item_domain,
-              item_type: updatedAction.source_item_type,
-              item_id: updatedAction.source_item_id,
-              item_instance_url: updatedAction.source_item_instance_url,
-            })
+            item_network: updatedAction.source_item_network,
+            item_domain: updatedAction.source_item_domain,
+            item_type: updatedAction.source_item_type,
+            item_id: updatedAction.source_item_id,
+            item_instance_url: updatedAction.source_item_instance_url,
+          })
           : null;
 
       const storedEvent = {

@@ -1541,7 +1541,7 @@
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "title": "Job Application Requirement",
             "type": "object",
-            "additionalProperties": false,
+            "additionalProperties": true,
             "required": [],
             "properties": {}
           },

@@ -127,6 +127,8 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
   const canReject = ownershipRole === 'received' && isPending;
   const canComplete = ownershipRole === 'received' && action.action_status === 'accepted';
   const canCancel = ownershipRole === 'initiated' && isPending;
+  const canGiveFeedback =
+    ownershipRole === 'initiated' && action.action_status === 'completed';
 
   // Message + structured requirement fields split out of the snapshot.
   const reqEntries = Object.entries(action.requirements_snapshot);
@@ -297,6 +299,12 @@ export function ActionCard({ action, ownershipRole, onStatusUpdate, selectionMod
               <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'cancelled')}>
                 <X className="mr-1.5 h-3.5 w-3.5 text-destructive" />
                 {t('actions.btn_cancel')}
+              </Button>
+            )}
+            {canGiveFeedback && (
+              <Button size="sm" variant="outline" className="flex-1" onClick={() => onStatusUpdate?.(action, 'completed')}>
+                <MessageSquare className="mr-1.5 h-3.5 w-3.5" />
+                {t('actions.btn_feedback', 'Give feedback')}
               </Button>
             )}
           </div>

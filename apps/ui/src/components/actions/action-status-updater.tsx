@@ -141,7 +141,10 @@ export function ActionStatusUpdater({
 
   // Determine whether consent is required for this status transition.
   const revealStatuses = interaction?.reveals_pii_on_status ?? [];
-  const requiresConsent = revealStatuses.includes(targetStatus);
+  const isPostCompleteFeedback =
+    action.action_status === 'completed' && targetStatus === 'completed';
+  const requiresConsent =
+    !isPostCompleteFeedback && revealStatuses.includes(targetStatus);
   const acceptDoc = config?.actions?.[action.action_type]?.accept;
   const acceptVersion = acceptDoc?.versions.find((v) => v.version === acceptDoc.current_version);
   // Accept stage: the accepter shares details with whoever initiated the
@@ -164,12 +167,12 @@ export function ActionStatusUpdater({
       action_status: targetStatus,
       ...(requiresConsent
         ? {
-            consent: {
-              acknowledged: true as const,
-              version: acceptDoc?.current_version ?? 1,
-              brand: brand === 'standard' ? null : brand,
-            },
-          }
+          consent: {
+            acknowledged: true as const,
+            version: acceptDoc?.current_version ?? 1,
+            brand: brand === 'standard' ? null : brand,
+          },
+        }
         : remarks.trim()
           ? { remarks: remarks.trim() }
           : {}),
@@ -208,12 +211,12 @@ export function ActionStatusUpdater({
         />
       ) : (
         <div className="space-y-2">
-          <Label htmlFor="action-remarks">{t('actions.remarks_label')}</Label>
+          <Label htmlFor="action-remarks">{t('actions.feedback_label', 'Feedback text (optional)')}</Label>
           <Textarea
             id="action-remarks"
             value={remarks}
             onChange={(e) => setRemarks(e.target.value)}
-            placeholder={t('actions.remarks_placeholder')}
+            placeholder={t('actions.feedback_placeholder', 'Add feedback (optional)')}
           />
         </div>
       )}

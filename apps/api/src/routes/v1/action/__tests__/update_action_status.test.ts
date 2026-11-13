@@ -58,8 +58,8 @@ vi.mock('@/routes/auth/create_auth', () => ({
 
 // --- mock the auth middleware itself so the auth path is a no-op in tests ---
 vi.mock('@api/plugins/auth/auth_middleware', () => ({
-  auth_middleware_if_enabled: vi.fn(async () => {}),
-  auth_middleware: vi.fn(async () => {}),
+  auth_middleware_if_enabled: vi.fn(async () => { }),
+  auth_middleware: vi.fn(async () => { }),
 }));
 
 // --- mock drizzle: the handler does TWO selects on the db:
@@ -102,57 +102,57 @@ vi.mock('@/services/guardian_action_gate', () => ({
 
 vi.mock('@api/db/postgres/drizzle_config', () => {
   const dbMock: Record<string, unknown> = {
-      // Discriminate by the shape of select's projection:
-      //   - existingAction lookup uses `db.select()` (no args)        → returns existingAction row
-      //   - resolve_acting_actor uses `db.select({ onboardedByOrgId })` → returns userRows
-      //
-      // For the mixed-batch test: dbState.resolvedIds tracks which action_ids have
-      // been queried so far. On each no-projection select call, pop the next id from
-      // dbState.resolvedIds. If the id matches EXISTING_ACTION.action_id, return the
-      // existing action; otherwise return [].
-      select: vi.fn((projection?: Record<string, unknown>) => {
-        const isUserLookup =
-          projection !== undefined && 'onboardedByOrgId' in projection;
-        return {
-          from: vi.fn(() => ({
-            where: vi.fn(() => ({
-              limit: vi.fn(() => {
-                if (isUserLookup) return Promise.resolve(dbState.userRows);
-                // Pop the next queried action_id from the queue if present.
-                const nextId = dbState.actionIdQueue?.shift();
-                if (nextId !== undefined) {
-                  return Promise.resolve(
-                    nextId === KNOWN_ACTION_ID && dbState.existingAction
-                      ? [dbState.existingAction]
-                      : [],
-                  );
-                }
-                return Promise.resolve(
-                  dbState.existingAction ? [dbState.existingAction] : [],
-                );
-              }),
-            })),
-          })),
-        };
-      }),
-      update: vi.fn(() => ({
-        set: vi.fn((values: Record<string, unknown>) => ({
+    // Discriminate by the shape of select's projection:
+    //   - existingAction lookup uses `db.select()` (no args)        → returns existingAction row
+    //   - resolve_acting_actor uses `db.select({ onboardedByOrgId })` → returns userRows
+    //
+    // For the mixed-batch test: dbState.resolvedIds tracks which action_ids have
+    // been queried so far. On each no-projection select call, pop the next id from
+    // dbState.resolvedIds. If the id matches EXISTING_ACTION.action_id, return the
+    // existing action; otherwise return [].
+    select: vi.fn((projection?: Record<string, unknown>) => {
+      const isUserLookup =
+        projection !== undefined && 'onboardedByOrgId' in projection;
+      return {
+        from: vi.fn(() => ({
           where: vi.fn(() => ({
-            returning: vi.fn(() => {
-              dbState.updates.push(values);
-              return Promise.resolve([
-                {
-                  ...(dbState.existingAction ?? {}),
-                  ...values,
-                  action_id: (dbState.existingAction as { action_id: string })
-                    .action_id,
-                },
-              ]);
+            limit: vi.fn(() => {
+              if (isUserLookup) return Promise.resolve(dbState.userRows);
+              // Pop the next queried action_id from the queue if present.
+              const nextId = dbState.actionIdQueue?.shift();
+              if (nextId !== undefined) {
+                return Promise.resolve(
+                  nextId === KNOWN_ACTION_ID && dbState.existingAction
+                    ? [dbState.existingAction]
+                    : [],
+                );
+              }
+              return Promise.resolve(
+                dbState.existingAction ? [dbState.existingAction] : [],
+              );
             }),
           })),
         })),
+      };
+    }),
+    update: vi.fn(() => ({
+      set: vi.fn((values: Record<string, unknown>) => ({
+        where: vi.fn(() => ({
+          returning: vi.fn(() => {
+            dbState.updates.push(values);
+            return Promise.resolve([
+              {
+                ...(dbState.existingAction ?? {}),
+                ...values,
+                action_id: (dbState.existingAction as { action_id: string })
+                  .action_id,
+              },
+            ]);
+          }),
+        })),
       })),
-      insert: vi.fn(() => ({ values: vi.fn(() => Promise.resolve(undefined)) })),
+    })),
+    insert: vi.fn(() => ({ values: vi.fn(() => Promise.resolve(undefined)) })),
   };
   // The handler wraps the status update + accept-consent insert in a
   // transaction; run the callback with the same mock as `tx`.
@@ -284,6 +284,86 @@ describe('POST /api/v1/action/update-status (bulk, self-acted only)', () => {
     });
     expect(res.statusCode).toBe(422);
     expect(res.json().results[0]).toMatchObject({ error: 'NOT_TARGET_ITEM_OWNER' });
+    expect(dbState.updates).toHaveLength(0);
+  });
+
+  it('200 allows source owner to submit feedback after completion', async () => {
+    dbState.existingAction = {
+      ...EXISTING_ACTION,
+      action_status: 'completed',
+      update_count: 1,
+      target_item_owner: 'usr_provider',
+      source_item_owner: 'usr_seeker',
+    };
+    const res = await buildApp(undefined, { id: 'usr_seeker' }).inject({
+      method: 'POST',
+      url: '/update-status',
+      payload: [
+        {
+          action_id: EXISTING_ACTION.action_id,
+          action_status: 'completed',
+          remarks: 'Work done well, thanks.',
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json().summary).toEqual({ total: 1, succeeded: 1, failed: 0 });
+    expect(dbState.updates).toHaveLength(1);
+    expect(dbState.updates[0]).toMatchObject({
+      action_status: 'completed',
+      remarks: 'Seeker feedback: Work done well, thanks.',
+    });
+  });
+
+  it('200 preserves provider feedback and appends seeker feedback after completion', async () => {
+    dbState.existingAction = {
+      ...EXISTING_ACTION,
+      action_status: 'completed',
+      update_count: 1,
+      target_item_owner: 'usr_provider',
+      source_item_owner: 'usr_seeker',
+      remarks: 'Finished quickly and politely.',
+    };
+    const res = await buildApp(undefined, { id: 'usr_seeker' }).inject({
+      method: 'POST',
+      url: '/update-status',
+      payload: [
+        {
+          action_id: EXISTING_ACTION.action_id,
+          action_status: 'completed',
+          remarks: 'Very good service from my side too.',
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(200);
+    expect(dbState.updates).toHaveLength(1);
+    expect(dbState.updates[0]).toMatchObject({
+      action_status: 'completed',
+      remarks:
+        'Provider feedback: Finished quickly and politely.\nSeeker feedback: Very good service from my side too.',
+    });
+  });
+
+  it('422 FEEDBACK_REQUIRED when source owner submits post-completion feedback without remarks', async () => {
+    dbState.existingAction = {
+      ...EXISTING_ACTION,
+      action_status: 'completed',
+      update_count: 1,
+      target_item_owner: 'usr_provider',
+      source_item_owner: 'usr_seeker',
+    };
+    const res = await buildApp(undefined, { id: 'usr_seeker' }).inject({
+      method: 'POST',
+      url: '/update-status',
+      payload: [
+        {
+          action_id: EXISTING_ACTION.action_id,
+          action_status: 'completed',
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(422);
+    expect(res.json().results[0]).toMatchObject({ error: 'FEEDBACK_REQUIRED' });
     expect(dbState.updates).toHaveLength(0);
   });
 

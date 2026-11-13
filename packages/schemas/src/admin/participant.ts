@@ -117,6 +117,7 @@ export const ParticipantItemSnapshot = z.object({
   item_network: z.string(),
   item_domain: z.string(),
   item_type: z.string(),
+  created_by: z.string().optional(),
   // Present on the upsert response so callers can tell live vs draft. Optional
   // because it's shared with the upsert response; both the upsert and GET
   // readers populate it.

@@ -45,9 +45,10 @@ const ACTION_DISPLAY: Record<string, ActionDisplay> = {
   accepted: {
     icon: CheckCircle2,
     label: 'Accept',
-    gradient: 'from-emerald-600 to-green-600',
-    buttonClass: 'bg-emerald-600 hover:bg-emerald-700 text-white',
-    toneText: 'text-emerald-50',
+    gradient: 'from-violet-600 to-indigo-600',
+    buttonClass: 'bg-brand-cta hover:brightness-110 text-white',
+    toneText: 'text-white/85',
+    themed: true,
   },
   reject: {
     icon: XCircle,
@@ -87,9 +88,10 @@ const ACTION_DISPLAY: Record<string, ActionDisplay> = {
   completed: {
     icon: BadgeCheck,
     label: 'Complete',
-    gradient: 'from-sky-600 to-blue-600',
-    buttonClass: 'bg-sky-600 hover:bg-sky-700 text-white',
-    toneText: 'text-sky-50',
+    gradient: 'from-violet-600 to-indigo-600',
+    buttonClass: 'bg-brand-cta hover:brightness-110 text-white',
+    toneText: 'text-white/85',
+    themed: true,
   },
   pending: {
     icon: Clock,
